@@ -14,7 +14,7 @@ const wss = new WebSocketServer({
 
 const PORT = process.env.PORT || 8080;
 let players = {}, queue = [];
-const MATCH_SIZE = 2;
+const MATCH_SIZE = 1;
 
 server.on('upgrade', (request, socket, head) => {
     wss.handleUpgrade(request, socket, head, (ws) => {
