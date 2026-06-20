@@ -1,72 +1,55 @@
-const { WebSocketServer } = require('ws');
+const WebSocket = require('ws');
 const http = require('http');
 
-const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Game Server OK');
-});
+const server = http.createServer();
+const wss = new WebSocket.Server({ server });
 
-const wss = new WebSocketServer({ 
-    server,
-    perMessageDeflate: false,
-    clientTracking: true
-});
-
-const PORT = process.env.PORT || 8080;
-let players = {}, queue = [];
-const MATCH_SIZE = 1;
-
-server.on('upgrade', (request, socket, head) => {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit('connection', ws, request);
-    });
-});
-
-server.listen(PORT, '0.0.0.0', () => {
-    console.log('Server on port ' + PORT);
-});
+let players = {};
+let nextId = 1;
 
 wss.on('connection', (ws) => {
-    let my_id = null;
-    console.log('New connection!');
+    const playerId = nextId++;
+    players[playerId] = ws;
 
-    ws.on('message', (raw) => {
-        let msg; 
-        try { msg = JSON.parse(raw); } catch { return; }
+    console.log(`Player ${playerId} joined. Total: ${Object.keys(players).length}`);
 
-        if (msg.type === 'register') {
-            my_id = msg.player_id;
-            players[my_id] = { ws, name: msg.name };
-            console.log('Joined: ' + msg.name + ' [' + my_id + ']');
-        }
+    ws.send(JSON.stringify({ type: "welcome", id: playerId }));
 
-        if (msg.type === 'find_match') {
-            if (!queue.includes(my_id)) queue.push(my_id);
-            console.log('Queue: ' + queue.length + '/' + MATCH_SIZE);
-            if (queue.length >= MATCH_SIZE) {
-                const room = queue.splice(0, MATCH_SIZE);
-                const room_id = Date.now().toString(36).toUpperCase();
-                room.forEach(pid => {
-                    players[pid]?.ws.send(JSON.stringify({
-                        type: 'match_found',
-                        room_id: room_id,
-                        players: room
-                    }));
-                });
-                console.log('Match! Room: ' + room_id);
-            }
-        }
+    // sabai lai naya total count pathaune
+    broadcastPlayerCount();
+    broadcast({ type: "player_joined", id: playerId }, playerId);
+
+    ws.on('message', (msg) => {
+        const data = JSON.parse(msg);
+        broadcast({ type: "data", from: playerId, payload: data }, playerId);
     });
 
     ws.on('close', () => {
-        if (my_id) {
-            delete players[my_id];
-            queue = queue.filter(id => id !== my_id);
-            console.log('Left: ' + my_id);
-        }
-    });
-
-    ws.on('error', (err) => {
-        console.log('WS Error: ' + err.message);
+        delete players[playerId];
+        broadcast({ type: "player_left", id: playerId }, playerId);
+        broadcastPlayerCount();
+        console.log(`Player ${playerId} left. Total: ${Object.keys(players).length}`);
     });
 });
+
+function broadcast(data, excludeId = null) {
+    const msg = JSON.stringify(data);
+    for (const id in players) {
+        if (id != excludeId && players[id].readyState === WebSocket.OPEN) {
+            players[id].send(msg);
+        }
+    }
+}
+
+function broadcastPlayerCount() {
+    const count = Object.keys(players).length;
+    const msg = JSON.stringify({ type: "player_count", count: count });
+    for (const id in players) {
+        if (players[id].readyState === WebSocket.OPEN) {
+            players[id].send(msg);
+        }
+    }
+}
+
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, () => console.log(`Server on port ${PORT}`));
