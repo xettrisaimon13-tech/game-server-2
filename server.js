@@ -8,24 +8,22 @@ let players = {};
 let nextId = 1;
 
 wss.on("connection", (ws) => {
+    const id = nextId++;
+    players[id] = ws;
 
-    const playerId = nextId++;
-    players[playerId] = ws;
+    console.log("Player joined:", id);
 
-    console.log("Player connected:", playerId);
-
-    // send welcome + all existing players
+    // send welcome + existing players
     ws.send(JSON.stringify({
         type: "welcome",
-        id: playerId,
-        players: Object.keys(players).map(id => parseInt(id))
+        id: id,
+        players: Object.keys(players).map(x => parseInt(x))
     }));
 
-    // notify others
     broadcast({
         type: "player_joined",
-        id: playerId
-    }, playerId);
+        id: id
+    }, id);
 
     ws.on("message", (msg) => {
         try {
@@ -33,41 +31,35 @@ wss.on("connection", (ws) => {
 
             broadcast({
                 type: "data",
-                from: playerId,
+                from: id,
                 payload: data
-            }, playerId);
+            }, id);
 
-        } catch (e) {
-            console.log("bad message");
-        }
+        } catch (e) {}
     });
 
     ws.on("close", () => {
-        delete players[playerId];
+        delete players[id];
 
         broadcast({
             type: "player_left",
-            id: playerId
+            id: id
         });
-
-        console.log("Player left:", playerId);
     });
 });
 
-function broadcast(data, excludeId = null) {
+function broadcast(data, exclude = null) {
     const msg = JSON.stringify(data);
 
     for (const id in players) {
-        if (excludeId && id == excludeId) continue;
+        if (exclude && id == exclude) continue;
 
-        const client = players[id];
-        if (client && client.readyState === WebSocket.OPEN) {
-            client.send(msg);
+        const c = players[id];
+        if (c && c.readyState === WebSocket.OPEN) {
+            c.send(msg);
         }
     }
 }
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => {
-    console.log("SERVER ON PORT", PORT);
-});
+server.listen(PORT, () => console.log("Server running"));
