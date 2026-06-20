@@ -11,42 +11,76 @@ wss.on('connection', (ws) => {
     const playerId = nextId++;
     players[playerId] = ws;
 
-    console.log(`Player ${playerId} joined. Total: ${Object.keys(players).length}`);
+    console.log(`Player ${playerId} joined`);
 
-    // naya player lai uska ID + PAHILE DEKHI CONNECTED sabai player ko list pathaune
-    const existingIds = Object.keys(players)
-        .map(id => parseInt(id))
-        .filter(id => id !== playerId);
-
+    // send welcome + existing players snapshot
     ws.send(JSON.stringify({
         type: "welcome",
         id: playerId,
-        existing_players: existingIds
+        existing_players: Object.keys(players)
+            .map(id => parseInt(id))
+            .filter(id => id !== playerId)
     }));
 
-    // baki sabai lai bhanau "naya player aayo"
-    broadcast({ type: "player_joined", id: playerId }, playerId);
+    // notify others
+    broadcast({
+        type: "player_joined",
+        id: playerId
+    }, playerId);
+
+    broadcastPlayerCount();
 
     ws.on('message', (msg) => {
-        const data = JSON.parse(msg);
-        broadcast({ type: "data", from: playerId, payload: data }, playerId);
+        try {
+            const data = JSON.parse(msg);
+
+            broadcast({
+                type: "data",
+                from: playerId,
+                payload: data
+            }, playerId);
+
+        } catch (e) {
+            console.log("Invalid message:", msg);
+        }
     });
 
     ws.on('close', () => {
         delete players[playerId];
-        broadcast({ type: "player_left", id: playerId }, playerId);
-        console.log(`Player ${playerId} left. Total: ${Object.keys(players).length}`);
+
+        broadcast({
+            type: "player_left",
+            id: playerId
+        });
+
+        broadcastPlayerCount();
+        console.log(`Player ${playerId} left`);
     });
 });
 
 function broadcast(data, excludeId = null) {
     const msg = JSON.stringify(data);
+
     for (const id in players) {
-        if (id != excludeId && players[id].readyState === WebSocket.OPEN) {
-            players[id].send(msg);
+        if (excludeId && id == excludeId) continue;
+
+        const client = players[id];
+        if (client && client.readyState === WebSocket.OPEN) {
+            client.send(msg);
         }
     }
 }
 
+function broadcastPlayerCount() {
+    const count = Object.keys(players).length;
+
+    broadcast({
+        type: "player_count",
+        count
+    });
+}
+
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => console.log(`Server on port ${PORT}`));
+server.listen(PORT, () => {
+    console.log("Server running on port", PORT);
+});
