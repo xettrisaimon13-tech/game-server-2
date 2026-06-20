@@ -8,18 +8,17 @@ let players = {};
 let nextId = 1;
 
 wss.on("connection", (ws) => {
+
     const playerId = nextId++;
     players[playerId] = ws;
 
-    console.log("Player joined:", playerId);
+    console.log("Player connected:", playerId);
 
-    // SEND WELCOME + SNAPSHOT
+    // send welcome + all existing players
     ws.send(JSON.stringify({
         type: "welcome",
         id: playerId,
-        existing_players: Object.keys(players)
-            .map(id => parseInt(id))
-            .filter(id => id !== playerId)
+        players: Object.keys(players).map(id => parseInt(id))
     }));
 
     // notify others
@@ -27,8 +26,6 @@ wss.on("connection", (ws) => {
         type: "player_joined",
         id: playerId
     }, playerId);
-
-    broadcastPlayerCount();
 
     ws.on("message", (msg) => {
         try {
@@ -41,7 +38,7 @@ wss.on("connection", (ws) => {
             }, playerId);
 
         } catch (e) {
-            console.log("Bad message");
+            console.log("bad message");
         }
     });
 
@@ -53,7 +50,7 @@ wss.on("connection", (ws) => {
             id: playerId
         });
 
-        broadcastPlayerCount();
+        console.log("Player left:", playerId);
     });
 });
 
@@ -70,14 +67,7 @@ function broadcast(data, excludeId = null) {
     }
 }
 
-function broadcastPlayerCount() {
-    broadcast({
-        type: "player_count",
-        count: Object.keys(players).length
-    });
-}
-
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-    console.log("Server running on", PORT);
+    console.log("SERVER ON PORT", PORT);
 });
