@@ -1,5 +1,5 @@
-const WebSocket = require('ws');
-const http = require('http');
+const WebSocket = require("ws");
+const http = require("http");
 
 const server = http.createServer();
 const wss = new WebSocket.Server({ server });
@@ -7,13 +7,13 @@ const wss = new WebSocket.Server({ server });
 let players = {};
 let nextId = 1;
 
-wss.on('connection', (ws) => {
+wss.on("connection", (ws) => {
     const playerId = nextId++;
     players[playerId] = ws;
 
-    console.log(`Player ${playerId} joined`);
+    console.log("Player joined:", playerId);
 
-    // send welcome + existing players snapshot
+    // SEND WELCOME + SNAPSHOT
     ws.send(JSON.stringify({
         type: "welcome",
         id: playerId,
@@ -30,7 +30,7 @@ wss.on('connection', (ws) => {
 
     broadcastPlayerCount();
 
-    ws.on('message', (msg) => {
+    ws.on("message", (msg) => {
         try {
             const data = JSON.parse(msg);
 
@@ -41,11 +41,11 @@ wss.on('connection', (ws) => {
             }, playerId);
 
         } catch (e) {
-            console.log("Invalid message:", msg);
+            console.log("Bad message");
         }
     });
 
-    ws.on('close', () => {
+    ws.on("close", () => {
         delete players[playerId];
 
         broadcast({
@@ -54,7 +54,6 @@ wss.on('connection', (ws) => {
         });
 
         broadcastPlayerCount();
-        console.log(`Player ${playerId} left`);
     });
 });
 
@@ -72,15 +71,13 @@ function broadcast(data, excludeId = null) {
 }
 
 function broadcastPlayerCount() {
-    const count = Object.keys(players).length;
-
     broadcast({
         type: "player_count",
-        count
+        count: Object.keys(players).length
     });
 }
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-    console.log("Server running on port", PORT);
+    console.log("Server running on", PORT);
 });
