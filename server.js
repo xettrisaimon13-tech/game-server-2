@@ -13,10 +13,18 @@ wss.on('connection', (ws) => {
 
     console.log(`Player ${playerId} joined. Total: ${Object.keys(players).length}`);
 
-    ws.send(JSON.stringify({ type: "welcome", id: playerId }));
+    // naya player lai uska ID + PAHILE DEKHI CONNECTED sabai player ko list pathaune
+    const existingIds = Object.keys(players)
+        .map(id => parseInt(id))
+        .filter(id => id !== playerId);
 
-    // sabai lai naya total count pathaune
-    broadcastPlayerCount();
+    ws.send(JSON.stringify({
+        type: "welcome",
+        id: playerId,
+        existing_players: existingIds
+    }));
+
+    // baki sabai lai bhanau "naya player aayo"
     broadcast({ type: "player_joined", id: playerId }, playerId);
 
     ws.on('message', (msg) => {
@@ -27,7 +35,6 @@ wss.on('connection', (ws) => {
     ws.on('close', () => {
         delete players[playerId];
         broadcast({ type: "player_left", id: playerId }, playerId);
-        broadcastPlayerCount();
         console.log(`Player ${playerId} left. Total: ${Object.keys(players).length}`);
     });
 });
@@ -36,16 +43,6 @@ function broadcast(data, excludeId = null) {
     const msg = JSON.stringify(data);
     for (const id in players) {
         if (id != excludeId && players[id].readyState === WebSocket.OPEN) {
-            players[id].send(msg);
-        }
-    }
-}
-
-function broadcastPlayerCount() {
-    const count = Object.keys(players).length;
-    const msg = JSON.stringify({ type: "player_count", count: count });
-    for (const id in players) {
-        if (players[id].readyState === WebSocket.OPEN) {
             players[id].send(msg);
         }
     }
