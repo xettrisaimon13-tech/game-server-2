@@ -4,36 +4,76 @@ const http = require('http');
 const server = http.createServer();
 const wss = new WebSocket.Server({ server });
 
-let players = {};
+let players = {};       // id -> { ws, gameId }
+let bannedIds = new Set();  // banned gameId haru
 let nextId = 1;
+
+function generateGameId() {
+    const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+    let id = "";
+    for (let i = 0; i < 4; i++) {
+        id += chars[Math.floor(Math.random() * chars.length)];
+    }
+    return id;
+}
 
 wss.on('connection', (ws) => {
     const playerId = nextId++;
-    players[playerId] = ws;
+    const gameId = generateGameId();
 
-    const existingIds = Object.keys(players)
+    players[playerId] = { ws, gameId };
+
+    console.log(`Player ${playerId} (${gameId}) joined. Total: ${Object.keys(players).length}`);
+
+    const existingPlayers = Object.keys(players)
         .map(id => parseInt(id))
-        .filter(id => id !== playerId);
+        .filter(id => id !== playerId)
+        .map(id => ({ id: id, gameId: players[id].gameId }));
 
-    ws.send(JSON.stringify({ type: "welcome", id: playerId, existing_players: existingIds }));
-    broadcast({ type: "player_joined", id: playerId }, playerId);
+    ws.send(JSON.stringify({
+        type: "welcome",
+        id: playerId,
+        gameId: gameId,
+        existing_players: existingPlayers
+    }));
+
+    broadcast({ type: "player_joined", id: playerId, gameId: gameId }, playerId);
 
     ws.on('message', (msg) => {
         const data = JSON.parse(msg);
+
+        if (data.type === "ban_request") {
+            const targetGameId = data.target_game_id;
+            const targetEntry = Object.entries(players).find(([id, p]) => p.gameId === targetGameId);
+
+            if (targetEntry) {
+                const [targetId, targetPlayer] = targetEntry;
+                bannedIds.add(targetGameId);
+                console.log(`Player ${targetGameId} banned by ${gameId}`);
+
+                targetPlayer.ws.send(JSON.stringify({ type: "you_were_banned" }));
+                targetPlayer.ws.close();
+
+                broadcast({ type: "player_banned", id: parseInt(targetId), gameId: targetGameId });
+            }
+            return;
+        }
+
         broadcast({ type: "data", from: playerId, payload: data }, playerId);
     });
 
     ws.on('close', () => {
         delete players[playerId];
         broadcast({ type: "player_left", id: playerId }, playerId);
+        console.log(`Player ${playerId} left. Total: ${Object.keys(players).length}`);
     });
 });
 
 function broadcast(data, excludeId = null) {
     const msg = JSON.stringify(data);
     for (const id in players) {
-        if (id != excludeId && players[id].readyState === WebSocket.OPEN) {
-            players[id].send(msg);
+        if (id != excludeId && players[id].ws.readyState === WebSocket.OPEN) {
+            players[id].ws.send(msg);
         }
     }
 }
