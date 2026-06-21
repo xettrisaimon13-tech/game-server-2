@@ -5,7 +5,7 @@ const server = http.createServer();
 const wss = new WebSocket.Server({ server });
 
 let players = {};       // id -> { ws, gameId }
-let bannedIds = new Set();  // banned gameId haru
+let bannedIds = new Set();
 let nextId = 1;
 
 function generateGameId() {
@@ -21,7 +21,7 @@ wss.on('connection', (ws) => {
     const playerId = nextId++;
     const gameId = generateGameId();
 
-    players[playerId] = { ws, gameId };
+    players[playerId] = { ws: ws, gameId: gameId };
 
     console.log(`Player ${playerId} (${gameId}) joined. Total: ${Object.keys(players).length}`);
 
@@ -40,14 +40,20 @@ wss.on('connection', (ws) => {
     broadcast({ type: "player_joined", id: playerId, gameId: gameId }, playerId);
 
     ws.on('message', (msg) => {
-        const data = JSON.parse(msg);
+        let data;
+        try {
+            data = JSON.parse(msg);
+        } catch (e) {
+            return;
+        }
 
         if (data.type === "ban_request") {
             const targetGameId = data.target_game_id;
             const targetEntry = Object.entries(players).find(([id, p]) => p.gameId === targetGameId);
 
             if (targetEntry) {
-                const [targetId, targetPlayer] = targetEntry;
+                const targetId = targetEntry[0];
+                const targetPlayer = targetEntry[1];
                 bannedIds.add(targetGameId);
                 console.log(`Player ${targetGameId} banned by ${gameId}`);
 
