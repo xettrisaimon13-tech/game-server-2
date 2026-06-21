@@ -86,3 +86,22 @@ function broadcast(data, excludeId = null) {
 
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => console.log(`Server on port ${PORT}`));
+
+func handle_message(data):
+	match data["type"]:
+		"welcome":
+			my_id = data.get("id", -1)
+			my_game_id = data.get("gameId", "----")
+			existing_players = data.get("existing_players", [])
+			print("My Game ID: ", my_game_id)
+			connected_to_server.emit()
+		"player_joined":
+			player_joined.emit(data.get("id", -1), data.get("gameId", "----"))
+		"player_left":
+			player_left.emit(data.get("id", -1))
+		"player_banned":
+			player_banned.emit(data.get("id", -1), data.get("gameId", "----"))
+		"you_were_banned":
+			you_were_banned.emit()
+		"data":
+			data_received.emit(data.get("from", -1), data.get("payload", {}))
