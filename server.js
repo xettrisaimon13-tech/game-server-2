@@ -145,6 +145,9 @@ function joinRoom(player, room, roomId) {
     player.roomId = roomId;
     player.ready = false;
     room.players.push(player);
+    if (!player.name || player.name.trim() === '') {
+        player.name = 'Player ' + room.players.length;
+    }
 
     sendTo(player.ws, {
         type: 'room_joined',
@@ -233,6 +236,7 @@ wss.on('connection', (ws) => {
                     removePlayerFromRoom(player);
                 }
                 console.log('[CREATE] Player ' + playerId + ' (' + player.name + ') creating room "' + (msg.roomName || 'Room') + '"');
+
                 const roomId = generateRoomId();
                 const room = {
                     id: roomId,
@@ -244,12 +248,15 @@ wss.on('connection', (ws) => {
                     map: msg.map || 'Hospital',
                     teamSize: msg.teamSize || 2,
                     inGame: false,
+                    doorStates: {},
                     createdAt: Date.now()
                 };
-
                 player.roomId = roomId;
                 player.ready = false;
                 room.players.push(player);
+                if (!player.name || player.name.trim() === '') {
+                    player.name = 'Player ' + room.players.length;
+                }
                 rooms.set(roomId, room);
 
                 sendTo(ws, {
@@ -284,16 +291,24 @@ wss.on('connection', (ws) => {
                 console.log('[JOIN] Player ' + playerId + ' (' + player.name + ') attempting to join roomId=' + targetRoomId + ' name="' + roomName + '"');
                 let targetRoom = null;
                 let foundRoomId = null;
+                let existingRoomInGame = false;
 
                 if (targetRoomId && rooms.has(targetRoomId)) {
                     const candidate = rooms.get(targetRoomId);
                     if (!candidate.inGame) {
                         targetRoom = candidate;
                         foundRoomId = targetRoomId;
+                    } else {
+                        existingRoomInGame = true;
                     }
-                } else {
+                }
+                if (!targetRoom) {
                     rooms.forEach((room, rid) => {
-                        if (!targetRoom && !room.inGame && room.name === roomName) {
+                        if (room.name === roomName) {
+                            if (room.inGame) {
+                                existingRoomInGame = true;
+                                return;
+                            }
                             if (room.password && room.password !== password) return;
                             if (room.players.length >= room.teamSize) return;
                             targetRoom = room;
@@ -302,8 +317,12 @@ wss.on('connection', (ws) => {
                     });
                 }
 
+                if (existingRoomInGame && !targetRoom) {
+                    sendError(ws, 'Room is already in a match');
+                    break;
+                }
                 if (!targetRoom) {
-                    sendError(ws, 'Room not found or game already started');
+                    sendError(ws, 'Room does not exist');
                     break;
                 }
 
@@ -344,6 +363,7 @@ wss.on('connection', (ws) => {
                         map: 'Hospital',
                         teamSize: 2,
                         inGame: false,
+                        doorStates: {},
                         createdAt: Date.now()
                     };
 
@@ -387,7 +407,7 @@ wss.on('connection', (ws) => {
                 if (msg.flashlight !== undefined) player.flashlight = msg.flashlight;
                 if (msg.health !== undefined) player.health = msg.health;
 
-                broadcastToRoom(player.roomId, {
+                var syncMsg = {
                     type: 'player_sync',
                     playerId: playerId,
                     name: player.name,
@@ -397,7 +417,11 @@ wss.on('connection', (ws) => {
                     crouching: player.crouching,
                     flashlight: player.flashlight,
                     health: player.health
-                }, ws);
+                };
+                if (msg.doorEvent) {
+                    syncMsg.doorEvent = msg.doorEvent;
+                }
+                broadcastToRoom(player.roomId, syncMsg, ws);
                 break;
             }
 
@@ -409,6 +433,20 @@ wss.on('connection', (ws) => {
                     damage: msg.damage,
                     sourceId: playerId
                 });
+                break;
+            }
+
+            case 'door_sync': {
+                if (!player.roomId) break;
+                const dRoom = rooms.get(player.roomId);
+                if (!dRoom) break;
+                if (!dRoom.doorStates) dRoom.doorStates = {};
+                dRoom.doorStates[msg.doorPath] = msg.isOpen;
+                broadcastToRoom(player.roomId, {
+                    type: 'door_sync',
+                    doorPath: msg.doorPath,
+                    isOpen: msg.isOpen
+                }, ws);
                 break;
             }
 
@@ -448,7 +486,7 @@ wss.on('connection', (ws) => {
                     break;
                 }
                 room.inGame = true;
-                console.log('[START] Host ' + playerId + ' (' + player.name + ') started match in room ' + room.id + '. Players: ' + room.players.map(p => p.name).join(', '));
+                room.doorStates = {};
                 broadcastToRoom(player.roomId, {
                     type: 'game_start',
                     players: room.players.map(p => ({
