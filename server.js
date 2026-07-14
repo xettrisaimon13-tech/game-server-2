@@ -1,3 +1,5 @@
+$ cat /Users/saimonchauhan/dark-ward-/server/server.js
+
 const WebSocket = require('ws');
 const http = require('http');
 
@@ -174,7 +176,7 @@ wss.on('connection', (ws) => {
                 broadcastToRoom(player.roomId, { type: 'item_drop', id: id, itemType: item.type, position: item.position }, ws);
                 break;
             }
-            case 'item_pickup': { if (!player.roomId) break; const pr = rooms.get(player.roomId); if (!pr || !pr.items) break; const id = String(msg.id); if (pr.items[id]) { delete pr.items[id]; broadcastToRoom(player.roomId, { type: 'item_pickup', id: id }, ws); } break; }
+            case 'item_pickup': { if (!player.roomId) break; const pr = rooms.get(player.roomId); if (pr && pr.items) { const id = String(msg.id); delete pr.items[id]; } broadcastToRoom(player.roomId, { type: 'item_pickup', id: String(msg.id) }, ws); break; }
 
             case 'toggle_ready': { if (!player.roomId) { sendError(ws, 'You are not in a room'); break; } const room = rooms.get(player.roomId); if (!room || room.inGame) { sendError(ws, 'Cannot ready now'); break; } player.ready = !player.ready; log('GAME', player.name + (player.ready ? ' READY' : ' NOT READY')); broadcastToRoom(player.roomId, { type: 'player_ready_changed', playerId, ready: player.ready }); break; }
 
