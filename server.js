@@ -1,5 +1,3 @@
-$ cat /Users/saimonchauhan/dark-ward-/server/server.js
-
 const WebSocket = require('ws');
 const http = require('http');
 
