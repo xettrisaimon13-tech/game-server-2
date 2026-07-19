@@ -268,6 +268,12 @@ wss.on('connection', (ws) => {
                 break;
             }
 
+            case 'player_lives': {
+                if (!player.roomId) break;
+                broadcastToRoom(player.roomId, { type: 'player_lives', playerId: playerId, lives: msg.lives, health: msg.health }, ws);
+                break;
+            }
+
             case 'door_sync': {
                 if (!player.roomId) break;
                 const dr = rooms.get(player.roomId);
