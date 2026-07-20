@@ -2,6 +2,8 @@ const WebSocket = require('ws');
 const http = require('http');
 
 const PORT = process.env.PORT || 7001;
+const GHOST_TICK_RATE = 20;
+const GHOST_TICK_INTERVAL = 1000 / GHOST_TICK_RATE;
 
 function log(tag, msg) {
     const t = new Date().toISOString().slice(11, 19);
@@ -87,6 +89,7 @@ function removePlayerFromRoom(player) {
     player.roomId = null; player.ready = false;
     if (room.players.length === 0) {
         log('ROOM', 'Room ' + leftRoomId + ' destroyed (empty)');
+        if (room.ghostTimer) clearInterval(room.ghostTimer);
         rooms.delete(leftRoomId); usedRoomIds.delete(leftRoomId); return null;
     }
     if (wasHost) {
@@ -113,6 +116,292 @@ function joinRoom(player, room, roomId) {
     });
     broadcastToRoom(roomId, { type: 'player_joined', playerId: player.id, name: player.name }, player.ws);
 }
+
+// ==================== GHOST AI ENGINE ====================
+
+class Ghost {
+    constructor(id, type, spawnPos) {
+        this.id = id;
+        this.type = type;
+        this.position = { x: spawnPos.x, y: spawnPos.y, z: spawnPos.z };
+        this.spawnPos = { x: spawnPos.x, y: spawnPos.y, z: spawnPos.z };
+        this.rotation = Math.random() * Math.PI * 2;
+        this.state = 'patrol';
+        this.targetPlayerId = null;
+        this.patrolDest = null;
+        this.lastKnownPos = null;
+        this.attackCooldown = 0;
+        this.searchTimer = 0;
+        this.idleTimer = 0;
+        this.attackAnimTimer = 0;
+        this.attackDamageDealt = false;
+        this.lastPos = { x: spawnPos.x, z: spawnPos.z };
+        this.stuckTimer = 0;
+        this.animation = 'idle';
+
+        switch (type) {
+            case 'ghost1':
+                this.patrolSpeed = 3.0; this.chaseSpeed = 5.5; this.detectionRadius = 22;
+                this.attackRange = 2.5; this.attackDamage = 100; this.attackCooldownTime = 3.0;
+                this.patrolRange = 35.0; this.patrolWaitTime = 3.0; this.searchTime = 5.0;
+                break;
+            case 'ghost4':
+                this.patrolSpeed = 1.8; this.chaseSpeed = 4.0; this.detectionRadius = 18;
+                this.attackRange = 10.0; this.attackDamage = 50; this.attackCooldownTime = 3.0;
+                this.patrolRange = 35.0; this.patrolWaitTime = 4.0; this.searchTime = 8.0;
+                break;
+            default:
+                this.patrolSpeed = 3.5; this.chaseSpeed = 7.0; this.detectionRadius = 22;
+                this.attackRange = 2.5; this.attackDamage = 50; this.attackCooldownTime = 2.5;
+                this.patrolRange = 35.0; this.patrolWaitTime = 3.0; this.searchTime = 6.0;
+                break;
+        }
+    }
+
+    update(dt, room) {
+        this.attackCooldown = Math.max(0, this.attackCooldown - dt);
+
+        switch (this.state) {
+            case 'idle':
+                this.idleTimer -= dt;
+                if (this.idleTimer <= 0) {
+                    this.pickPatrolPoint();
+                    this.state = 'patrol';
+                }
+                this.detectPlayers(room);
+                break;
+            case 'patrol':
+                this.doPatrol(dt, room);
+                break;
+            case 'chase':
+                this.doChase(dt, room);
+                break;
+            case 'attack':
+                this.doAttack(dt, room);
+                break;
+            case 'search':
+                this.doSearch(dt, room);
+                break;
+        }
+    }
+
+    detectPlayers(room) {
+        let best = null, bestDist = this.detectionRadius;
+        for (const p of room.players) {
+            if (!p.position) continue;
+            const d = this.xzDist(this.position, p.position);
+            if (d < bestDist) {
+                bestDist = d;
+                best = p;
+            }
+        }
+        return best;
+    }
+
+    doPatrol(dt, room) {
+        const p = this.detectPlayers(room);
+        if (p) {
+            this.targetPlayerId = p.id;
+            this.lastKnownPos = { ...p.position };
+            this.state = 'chase';
+            return;
+        }
+        if (!this.patrolDest) {
+            this.pickPatrolPoint();
+        }
+        const dist = this.xzDist(this.position, this.patrolDest);
+        if (dist < 2.0) {
+            this.idleTimer = this.patrolWaitTime;
+            this.state = 'idle';
+            this.velocity = { x: 0, z: 0 };
+            this.animation = 'idle';
+            return;
+        }
+        this.moveToward(this.patrolDest, this.patrolSpeed, dt);
+        this.animation = 'walk';
+    }
+
+    doChase(dt, room) {
+        const target = room.players.find(p => p.id === this.targetPlayerId && p.position);
+        if (!target) {
+            this.state = 'search';
+            this.searchTimer = this.searchTime;
+            return;
+        }
+        const dist = this.xzDist(this.position, target.position);
+        if (dist > this.detectionRadius * 1.5) {
+            this.lastKnownPos = { ...target.position };
+            this.targetPlayerId = null;
+            this.state = 'search';
+            this.searchTimer = this.searchTime;
+            return;
+        }
+        if (dist <= this.attackRange && this.attackCooldown <= 0) {
+            this.state = 'attack';
+            this.attackAnimTimer = 1.0;
+            this.attackDamageDealt = false;
+            this.velocity = { x: 0, z: 0 };
+            this.animation = 'attack';
+            return;
+        }
+        this.moveToward(target.position, this.chaseSpeed, dt);
+        this.lastKnownPos = { ...target.position };
+        this.animation = 'run';
+    }
+
+    doAttack(dt, room) {
+        this.attackAnimTimer -= dt;
+        if (this.attackAnimTimer <= 0.5 && !this.attackDamageDealt) {
+            const target = room.players.find(p => p.id === this.targetPlayerId && p.position);
+            if (target) {
+                const dist = this.xzDist(this.position, target.position);
+                if (dist <= this.attackRange * 1.5) {
+                    this.attackDamageDealt = true;
+                    broadcastToRoom(room.id, {
+                        type: 'ghost_damage',
+                        ghostId: this.id,
+                        targetId: target.id,
+                        damage: this.attackDamage
+                    });
+                    const player = players.get(target.id);
+                    if (player) {
+                        player.health = Math.max(0, (player.health || 100) - this.attackDamage);
+                    }
+                }
+            }
+        }
+        if (this.attackAnimTimer <= 0) {
+            this.attackCooldown = this.attackCooldownTime;
+            const target = room.players.find(p => p.id === this.targetPlayerId && p.position);
+            if (target && this.xzDist(this.position, target.position) <= this.detectionRadius) {
+                this.state = 'chase';
+            } else {
+                this.idleTimer = 2.0;
+                this.state = 'idle';
+            }
+        }
+    }
+
+    doSearch(dt, room) {
+        this.searchTimer -= dt;
+        const p = this.detectPlayers(room);
+        if (p) {
+            this.targetPlayerId = p.id;
+            this.lastKnownPos = { ...p.position };
+            this.state = 'chase';
+            return;
+        }
+        if (this.searchTimer <= 0) {
+            this.targetPlayerId = null;
+            this.pickPatrolPoint();
+            this.state = 'patrol';
+        } else if (this.lastKnownPos) {
+            this.moveToward(this.lastKnownPos, this.patrolSpeed, dt);
+            this.animation = 'walk';
+            if (this.xzDist(this.position, this.lastKnownPos) < 2.0) {
+                this.lastKnownPos = null;
+            }
+        }
+    }
+
+    moveToward(target, speed, dt) {
+        const dx = target.x - this.position.x;
+        const dz = target.z - this.position.z;
+        const dist = Math.sqrt(dx * dx + dz * dz);
+        if (dist < 0.1) {
+            this.velocity = { x: 0, z: 0 };
+            return;
+        }
+        const nx = dx / dist;
+        const nz = dz / dist;
+        this.position.x += nx * speed * dt;
+        this.position.z += nz * speed * dt;
+        this.position.x = Math.max(-48, Math.min(-32, this.position.x));
+        this.position.z = Math.max(0, Math.min(18, this.position.z));
+        this.rotation = Math.atan2(nx, nz);
+        this.velocity = { x: nx * speed, z: nz * speed };
+        this.checkStuck(dt);
+    }
+
+    checkStuck(dt) {
+        const moved = Math.sqrt(
+            (this.position.x - this.lastPos.x) ** 2 +
+            (this.position.z - this.lastPos.z) ** 2
+        );
+        if (moved < 0.3) {
+            this.stuckTimer += dt;
+            if (this.stuckTimer >= 0.8) {
+                this.pickPatrolPoint();
+                this.stuckTimer = 0;
+            }
+        } else {
+            this.stuckTimer = 0;
+        }
+        this.lastPos = { x: this.position.x, z: this.position.z };
+    }
+
+    pickPatrolPoint() {
+        const angle = Math.random() * Math.PI * 2;
+        const dist = Math.random() * this.patrolRange;
+        this.patrolDest = {
+            x: Math.max(-48, Math.min(-32, this.spawnPos.x + Math.cos(angle) * dist)),
+            y: this.spawnPos.y,
+            z: Math.max(0, Math.min(18, this.spawnPos.z + Math.sin(angle) * dist))
+        };
+    }
+
+    xzDist(a, b) {
+        return Math.sqrt((a.x - b.x) ** 2 + (a.z - b.z) ** 2);
+    }
+
+    toJSON() {
+        return {
+            id: this.id, type: this.type,
+            position: this.position, rotation: this.rotation,
+            animation: this.animation, state: this.state,
+            target: this.targetPlayerId
+        };
+    }
+}
+
+function spawnGhosts(room) {
+    const useGhost1 = Math.random() > 0.5;
+    const heavyType = useGhost1 ? 'ghost1' : 'ghost4';
+    const spawnPositions = [
+        { x: -44, y: 4.5, z: 5 },
+        { x: -36, y: 4.5, z: 11 }
+    ];
+    room.ghosts = [
+        new Ghost(0, heavyType, spawnPositions[0]),
+        new Ghost(1, 'ghost2', spawnPositions[1])
+    ];
+    log('GHOSTS', 'Spawned 2 ghosts in room ' + room.id + ': ' + heavyType + ' + ghost2');
+    broadcastToRoom(room.id, {
+        type: 'ghost_spawn',
+        ghosts: room.ghosts.map(g => g.toJSON())
+    });
+}
+
+function startGhostLoop(room) {
+    if (room.ghostTimer) clearInterval(room.ghostTimer);
+    room.ghostTimer = setInterval(() => {
+        if (!room.inGame || room.players.length === 0) {
+            clearInterval(room.ghostTimer);
+            room.ghostTimer = null;
+            return;
+        }
+        const dt = GHOST_TICK_INTERVAL / 1000;
+        for (const ghost of room.ghosts) {
+            ghost.update(dt, room);
+        }
+        broadcastToRoom(room.id, {
+            type: 'ghost_update',
+            ghosts: room.ghosts.map(g => g.toJSON())
+        });
+    }, GHOST_TICK_INTERVAL);
+}
+
+// ==================== END GHOST AI ENGINE ====================
 
 wss.on('connection', (ws) => {
     const playerId = nextPlayerId++;
@@ -155,7 +444,8 @@ wss.on('connection', (ws) => {
                     teamSize: msg.teamSize || 2, inGame: false,
                     doorStates: {}, items: {},
                     isNightMode: isNightMode,
-                    createdAt: Date.now()
+                    createdAt: Date.now(),
+                    ghosts: [], ghostTimer: null
                 };
                 player.roomId = rid; player.ready = false;
                 room.players.push(player);
@@ -215,7 +505,8 @@ wss.on('connection', (ws) => {
                         password: '', isPrivate: false, players: [],
                         map: 'Hospital', teamSize: 2, inGame: false,
                         doorStates: {}, items: {}, isNightMode: true,
-                        createdAt: Date.now()
+                        createdAt: Date.now(),
+                        ghosts: [], ghostTimer: null
                     };
                     player.roomId = rid; player.ready = false;
                     room.players.push(player); rooms.set(rid, room);
@@ -334,6 +625,8 @@ wss.on('connection', (ws) => {
                     map: room.map, teamSize: room.teamSize,
                     isNightMode: isNightMode
                 });
+                spawnGhosts(room);
+                startGhostLoop(room);
                 break;
             }
 
@@ -366,6 +659,10 @@ wss.on('connection', (ws) => {
             case 'audio_data': {
                 if (!player.roomId) break;
                 broadcastToRoom(player.roomId, { type: 'audio_data', playerId: playerId, data: msg.data }, ws);
+                break;
+            }
+
+            case 'ghost_sync': {
                 break;
             }
 
@@ -402,5 +699,6 @@ server.listen(PORT, () => {
     log('SERVER', 'Port: ' + PORT);
     log('SERVER', 'Game WS: ws://0.0.0.0:' + PORT);
     log('SERVER', 'Status: http://0.0.0.0:' + PORT + '/status');
+    log('SERVER', 'Ghost AI: ' + GHOST_TICK_RATE + ' tick/sec');
     log('SERVER', '=========================================');
 });
