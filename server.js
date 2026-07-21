@@ -2,7 +2,7 @@ const WebSocket = require('ws');
 const http = require('http');
 
 const PORT = process.env.PORT || 7001;
-const GHOST_TICK_RATE = 20;
+const GHOST_TICK_RATE = 10;
 const GHOST_TICK_INTERVAL = 1000 / GHOST_TICK_RATE;
 
 function log(tag, msg) {
@@ -56,9 +56,10 @@ function sendTo(ws, message) { if (ws && ws.readyState === WebSocket.OPEN) ws.se
 function sendError(ws, message) { sendTo(ws, { type: 'error', message }); }
 function sendStatus(ws, text) { sendTo(ws, { type: 'status', text }); }
 
-function getRoomList() {
+function getRoomList(region) {
     const list = [];
     rooms.forEach((room, id) => {
+        if (region && room.region !== region) return;
         const host = room.players.find(p => p.id === room.hostPlayerId);
         list.push({
             id: id, roomId: id, name: room.name,
@@ -365,17 +366,17 @@ class Ghost {
 }
 
 function spawnGhosts(room) {
-    const useGhost1 = Math.random() > 0.5;
-    const heavyType = useGhost1 ? 'ghost1' : 'ghost4';
     const spawnPositions = [
         { x: -44, y: 4.5, z: 5 },
-        { x: -36, y: 4.5, z: 11 }
+        { x: -36, y: 4.5, z: 11 },
+        { x: -40, y: 4.5, z: 2 }
     ];
     room.ghosts = [
-        new Ghost(0, heavyType, spawnPositions[0]),
-        new Ghost(1, 'ghost2', spawnPositions[1])
+        new Ghost(0, 'ghost1', spawnPositions[0]),
+        new Ghost(1, 'ghost2', spawnPositions[1]),
+        new Ghost(2, 'ghost4', spawnPositions[2])
     ];
-    log('GHOSTS', 'Spawned 2 ghosts in room ' + room.id + ': ' + heavyType + ' + ghost2');
+    log('GHOSTS', 'Spawned 3 ghosts in room ' + room.id + ': ghost1 + ghost2 + ghost4');
     broadcastToRoom(room.id, {
         type: 'ghost_spawn',
         ghosts: room.ghosts.map(g => g.toJSON())
@@ -405,7 +406,7 @@ function startGhostLoop(room) {
 
 wss.on('connection', (ws) => {
     const playerId = nextPlayerId++;
-    players.set(playerId, { ws, id: playerId, name: 'Player' + playerId, roomId: null, ready: false, position: null, rotation: null, animation: null, crouching: false, flashlight: false, health: 100, inventory: {} });
+    players.set(playerId, { ws, id: playerId, name: 'Player' + playerId, roomId: null, ready: false, position: null, rotation: null, animation: null, crouching: false, flashlight: false, health: 100, inventory: {}, region: 'Asia' });
     log('CONNECT', 'Player connected -> ' + 'Player' + playerId + ' (id=' + playerId + ')');
     sendTo(ws, { type: 'welcome', playerId: playerId });
 
@@ -430,7 +431,16 @@ wss.on('connection', (ws) => {
                 log('NAME', 'Player ' + playerId + ' set name to "' + player.name + '"');
                 break;
             }
-            case 'get_rooms': sendTo(ws, { type: 'room_list', rooms: getRoomList() }); break;
+            case 'get_rooms': sendTo(ws, { type: 'room_list', rooms: getRoomList(player.region || 'Asia') }); break;
+
+            case 'set_region': {
+                const validRegions = ['Asia', 'Europe', 'North America', 'South America', 'Middle East', 'Africa', 'Oceania'];
+                if (validRegions.includes(msg.region)) {
+                    player.region = msg.region;
+                    log('REGION', player.name + ' set region to ' + msg.region);
+                }
+                break;
+            }
 
             case 'create_room': {
                 if (player.roomId) removePlayerFromRoom(player);
@@ -443,7 +453,7 @@ wss.on('connection', (ws) => {
                     players: [], map: msg.map || 'Hospital',
                     teamSize: msg.teamSize || 2, inGame: false,
                     doorStates: {}, items: {},
-                    isNightMode: isNightMode,
+                    isNightMode: isNightMode, region: msg.region || player.region || 'Asia',
                     createdAt: Date.now(),
                     ghosts: [], ghostTimer: null
                 };
@@ -487,6 +497,7 @@ wss.on('connection', (ws) => {
                 if (!targetRoom) { sendError(ws, 'Room does not exist'); break; }
                 if (targetRoom.password && targetRoom.password !== pwd) { sendError(ws, 'Wrong password'); break; }
                 if (targetRoom.players.length >= targetRoom.teamSize) { sendError(ws, 'Room is full'); break; }
+                if (targetRoom.region !== (player.region || 'Asia')) { sendError(ws, 'Room is in a different server region. Change your region to ' + targetRoom.region); break; }
                 joinRoom(player, targetRoom, foundRoomId);
                 break;
             }
@@ -494,6 +505,7 @@ wss.on('connection', (ws) => {
             case 'quick_match': {
                 let found = false;
                 rooms.forEach((room, rid) => {
+                    if (room.region !== player.region) return;
                     if (!found && !room.inGame && !room.isPrivate && !room.password && room.players.length < room.teamSize) {
                         joinRoom(player, room, rid); found = true;
                     }
@@ -505,6 +517,7 @@ wss.on('connection', (ws) => {
                         password: '', isPrivate: false, players: [],
                         map: 'Hospital', teamSize: 2, inGame: false,
                         doorStates: {}, items: {}, isNightMode: true,
+                        region: player.region || 'Asia',
                         createdAt: Date.now(),
                         ghosts: [], ghostTimer: null
                     };
@@ -625,8 +638,15 @@ wss.on('connection', (ws) => {
                     map: room.map, teamSize: room.teamSize,
                     isNightMode: isNightMode
                 });
-                spawnGhosts(room);
-                startGhostLoop(room);
+                setTimeout(() => {
+                    spawnGhosts(room);
+                    startGhostLoop(room);
+                }, 2000);
+                break;
+            }
+
+            case 'ping': {
+                sendTo(ws, { type: 'pong', time: msg.time });
                 break;
             }
 
@@ -637,7 +657,7 @@ wss.on('connection', (ws) => {
                 const tp = players.get(msg.targetId);
                 if (tp && tp.roomId === player.roomId) {
                     log('KICK', player.name + ' kicked ' + tp.name + ' from room ' + player.roomId);
-                    broadcastToRoom(player.roomId, { type: 'player_kicked', playerId: msg.targetId });
+                    broadcastToRoom(player.roomId, { type: 'player_kicked', playerId: msg.targetId, kickedByName: player.name });
                     removePlayerFromRoom(tp);
                 }
                 break;
