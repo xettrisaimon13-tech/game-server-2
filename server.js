@@ -653,7 +653,7 @@ wss.on('connection', (ws) => {
             case 'kick_player': {
                 if (!player.roomId) break;
                 const room = rooms.get(player.roomId);
-                if (!room || room.hostPlayerId !== playerId) break;
+                if (!room) break;
                 const tp = players.get(msg.targetId);
                 if (tp && tp.roomId === player.roomId) {
                     log('KICK', player.name + ' kicked ' + tp.name + ' from room ' + player.roomId);
@@ -722,3 +722,4 @@ server.listen(PORT, () => {
     log('SERVER', 'Ghost AI: ' + GHOST_TICK_RATE + ' tick/sec');
     log('SERVER', '=========================================');
 });
+```
