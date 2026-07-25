@@ -108,12 +108,14 @@ function joinRoom(player, room, roomId) {
     room.players.push(player);
     if (!player.name || player.name.trim() === '') player.name = 'Player ' + room.players.length;
     log('JOIN', player.name + ' joined room ' + roomId + ' (' + room.players.length + '/' + room.teamSize + ')');
+    const now = Date.now();
     sendTo(player.ws, {
         type: 'room_joined', roomId: roomId, roomName: room.name,
         teamSize: room.teamSize, map: room.map,
         isNightMode: room.isNightMode !== undefined ? room.isNightMode : true,
         players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready || false })),
-        hostId: room.hostPlayerId, items: Object.values(room.items || {})
+        hostId: room.hostPlayerId, items: Object.values(room.items || {}),
+        elapsed: now - room.createdAt
     });
     broadcastToRoom(roomId, { type: 'player_joined', playerId: player.id, name: player.name }, player.ws);
 }
@@ -468,7 +470,8 @@ wss.on('connection', (ws) => {
                     teamSize: room.teamSize, map: room.map,
                     isNightMode: isNightMode,
                     players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready || false })),
-                    hostId: room.hostPlayerId, items: Object.values(room.items || {})
+                    hostId: room.hostPlayerId, items: Object.values(room.items || {}),
+                    elapsed: 0
                 });
                 break;
             }
@@ -528,7 +531,8 @@ wss.on('connection', (ws) => {
                         teamSize: room.teamSize, map: room.map,
                         isNightMode: true,
                         players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready || false })),
-                        hostId: room.hostPlayerId, items: Object.values(room.items || {})
+                        hostId: room.hostPlayerId, items: Object.values(room.items || {}),
+                        elapsed: 0
                     });
                     sendStatus(ws, 'Waiting for players...');
                 }
@@ -653,7 +657,7 @@ wss.on('connection', (ws) => {
             case 'kick_player': {
                 if (!player.roomId) break;
                 const room = rooms.get(player.roomId);
-                if (!room) break;
+                if (!room || room.hostPlayerId !== playerId) break;
                 const tp = players.get(msg.targetId);
                 if (tp && tp.roomId === player.roomId) {
                     log('KICK', player.name + ' kicked ' + tp.name + ' from room ' + player.roomId);
@@ -689,6 +693,20 @@ wss.on('connection', (ws) => {
             case 'mic_state': {
                 if (!player.roomId) break;
                 broadcastToRoom(player.roomId, { type: 'mic_state', playerId: playerId, on: msg.on }, ws);
+                break;
+            }
+
+            case 'chat_message': {
+                if (!player.roomId) break;
+                const text = (msg.text || '').trim();
+                if (text.length === 0) break;
+                broadcastToRoom(player.roomId, {
+                    type: 'chat_message',
+                    playerId: playerId,
+                    name: player.name,
+                    text: text
+                }, ws);
+                log('CHAT', '[' + player.roomId + '] ' + player.name + ': ' + text);
                 break;
             }
         }
