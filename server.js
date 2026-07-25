@@ -453,7 +453,7 @@ wss.on('connection', (ws) => {
                     id: rid, name: roomName, hostPlayerId: playerId,
                     password: msg.password || '', isPrivate: !!msg.isPrivate,
                     players: [], map: msg.map || 'Hospital',
-                    teamSize: msg.teamSize || 2, inGame: false,
+                    teamSize: msg.teamSize || 6, inGame: false,
                     doorStates: {}, items: {},
                     isNightMode: isNightMode, region: msg.region || player.region || 'Asia',
                     createdAt: Date.now(),
@@ -518,7 +518,7 @@ wss.on('connection', (ws) => {
                     const room = {
                         id: rid, name: 'Quick Match', hostPlayerId: playerId,
                         password: '', isPrivate: false, players: [],
-                        map: 'Hospital', teamSize: 2, inGame: false,
+                        map: 'Hospital', teamSize: 6, inGame: false,
                         doorStates: {}, items: {}, isNightMode: true,
                         region: player.region || 'Asia',
                         createdAt: Date.now(),
