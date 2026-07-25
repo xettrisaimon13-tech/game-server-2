@@ -722,4 +722,3 @@ server.listen(PORT, () => {
     log('SERVER', 'Ghost AI: ' + GHOST_TICK_RATE + ' tick/sec');
     log('SERVER', '=========================================');
 });
-```
