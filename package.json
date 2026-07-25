@@ -1,11 +1,14 @@
 {
-  "name": "dark-ward-server",
+  "name": "game-server",
   "version": "1.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": "18.x"
+  },
   "dependencies": {
-    "ws": "^8.21.1"
+    "ws": "^8.16.0"
   }
 }
