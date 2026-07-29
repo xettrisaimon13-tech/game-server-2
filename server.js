@@ -2,7 +2,7 @@ const WebSocket = require('ws');
 const http = require('http');
 
 const PORT = process.env.PORT || 7001;
-const GHOST_TICK_RATE = 10;
+const GHOST_TICK_RATE = 20;
 const GHOST_TICK_INTERVAL = 1000 / GHOST_TICK_RATE;
 
 function log(tag, msg) {
@@ -143,14 +143,9 @@ class Ghost {
         this.animation = 'idle';
 
         switch (type) {
-            case 'ghost1':
-                this.patrolSpeed = 3.0; this.chaseSpeed = 5.5; this.detectionRadius = 22;
-                this.attackRange = 2.5; this.attackDamage = 100; this.attackCooldownTime = 3.0;
-                this.patrolRange = 35.0; this.patrolWaitTime = 3.0; this.searchTime = 5.0;
-                break;
-            case 'ghost4':
-                this.patrolSpeed = 1.8; this.chaseSpeed = 4.0; this.detectionRadius = 18;
-                this.attackRange = 10.0; this.attackDamage = 50; this.attackCooldownTime = 3.0;
+            case 'ghost20':
+                this.patrolSpeed = 2.5; this.chaseSpeed = 5.0; this.detectionRadius = 18;
+                this.attackRange = 3.0; this.attackDamage = 50; this.attackCooldownTime = 3.0;
                 this.patrolRange = 35.0; this.patrolWaitTime = 4.0; this.searchTime = 8.0;
                 break;
             default:
@@ -374,11 +369,11 @@ function spawnGhosts(room) {
         { x: -40, y: 4.5, z: 2 }
     ];
     room.ghosts = [
-        new Ghost(0, 'ghost1', spawnPositions[0]),
+        new Ghost(0, 'ghost20', spawnPositions[0]),
         new Ghost(1, 'ghost2', spawnPositions[1]),
-        new Ghost(2, 'ghost4', spawnPositions[2])
+        new Ghost(2, 'ghost20', spawnPositions[2])
     ];
-    log('GHOSTS', 'Spawned 3 ghosts in room ' + room.id + ': ghost1 + ghost2 + ghost4');
+    log('GHOSTS', 'Spawned 3 ghosts in room ' + room.id + ': ghost20 + ghost2 + ghost20');
     broadcastToRoom(room.id, {
         type: 'ghost_spawn',
         ghosts: room.ghosts.map(g => g.toJSON())
