@@ -8,13 +8,166 @@ function log(tag, msg) {
     console.log('[' + t + '] [' + tag + '] ' + msg);
 }
 
+const STATUS_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DARK WARD - Server Status</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a12;color:#e0e0e0;font-family:'Segoe UI',Tahoma,sans-serif;min-height:100vh}
+.header{background:linear-gradient(135deg,#1a0a2e,#0d1b2a);padding:30px 40px;border-bottom:2px solid #7b2ff2}
+.header h1{font-size:28px;color:#fff;letter-spacing:3px}
+.header h1 span{color:#7b2ff2}
+.header p{color:#8888aa;margin-top:6px;font-size:14px}
+.container{max-width:900px;margin:30px auto;padding:0 20px}
+.status-box{background:#12121e;border:1px solid #2a2a3a;border-radius:12px;padding:24px;margin-bottom:20px}
+.status-box h2{font-size:16px;color:#7b2ff2;margin-bottom:16px;text-transform:uppercase;letter-spacing:2px}
+.stat-row{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid #1a1a2a}
+.stat-row:last-child{border-bottom:none}
+.stat-label{color:#8888aa;font-size:14px}
+.stat-value{font-size:18px;font-weight:700;color:#fff}
+.green-dot{display:inline-block;width:10px;height:10px;background:#00e676;border-radius:50%;margin-right:8px;box-shadow:0 0 8px #00e67680;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+.region-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;margin-top:12px}
+.region-card{background:#1a1a2a;border:1px solid #2a2a3a;border-radius:8px;padding:16px;text-align:center}
+.region-card.active{border-color:#00e676}
+.region-card .name{font-size:13px;color:#8888aa;text-transform:uppercase;letter-spacing:1px}
+.region-card .count{font-size:28px;font-weight:700;color:#fff;margin:8px 0}
+.region-card .dot{font-size:12px}
+.region-card .dot .green-dot{width:8px;height:8px}
+.room-list{margin-top:12px}
+.room-item{background:#1a1a2a;border:1px solid #2a2a3a;border-radius:8px;padding:14px 18px;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
+.room-item .left{display:flex;flex-direction:column;gap:4px}
+.room-item .room-name{color:#fff;font-weight:600;font-size:15px}
+.room-item .room-info{color:#666;font-size:12px}
+.room-item .right{display:flex;align-items:center;gap:12px}
+.room-item .players-badge{background:#2a2a3a;padding:4px 12px;border-radius:20px;font-size:13px;color:#e0e0e0}
+.room-item .map-badge{color:#7b2ff2;font-size:12px;text-transform:uppercase}
+.room-item .status-badge{padding:4px 10px;border-radius:12px;font-size:11px;font-weight:600;text-transform:uppercase}
+.room-item .status-badge.lobby{background:#1a3a1a;color:#00e676}
+.room-item .status-badge.ingame{background:#3a1a1a;color:#ff5252}
+.no-rooms{color:#444;font-size:14px;text-align:center;padding:20px}
+.online-total{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.online-total .big{font-size:36px;font-weight:700;color:#00e676}
+.online-total .label{color:#8888aa;font-size:14px}
+.footer{text-align:center;padding:20px;color:#333;font-size:12px;margin-top:20px}
+</style>
+</head>
+<body>
+<div class="header">
+<h1><span>DARK</span> WARD</h1>
+<p>Multiplayer Game Server Status</p>
+</div>
+<div class="container">
+<div class="status-box">
+<h2>Server Status</h2>
+<div class="online-total">
+<span class="green-dot"></span>
+<span class="big">__TOTAL_ONLINE__</span>
+<span class="label">Players Online</span>
+</div>
+<div class="stat-row">
+<span class="stat-label">Active Rooms</span>
+<span class="stat-value">__TOTAL_ROOMS__</span>
+</div>
+<div class="stat-row">
+<span class="stat-label">In-Match Players</span>
+<span class="stat-value">__IN_MATCH__</span>
+</div>
+</div>
+<div class="status-box">
+<h2>Regions</h2>
+<div class="region-grid">
+__REGIONS__
+</div>
+</div>
+<div class="status-box">
+<h2>Active Rooms</h2>
+<div class="room-list">
+__ROOMS__
+</div>
+</div>
+</div>
+<div class="footer">DARK WARD Server v2.0</div>
+</body>
+</html>`;
+
 const server = http.createServer((req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-    if (req.url === '/status') {
+    if (req.url === '/status' || req.url === '/') {
+        let activePlayers = 0;
+        let inMatchPlayers = 0;
+        let roomInfo = [];
+        rooms.forEach((room, id) => {
+            activePlayers += room.players.length;
+            if (room.inGame) inMatchPlayers += room.players.length;
+            const host = room.players.find(p => p.id === room.hostPlayerId);
+            roomInfo.push({
+                roomId: id, name: room.name,
+                players: room.players.length + '/' + room.teamSize,
+                inGame: room.inGame, isNightMode: room.isNightMode,
+                playerNames: room.players.map(p => p.name),
+                hostName: host ? host.name : 'Unknown',
+                map: room.map
+            });
+        });
+
+        const regionCounts = {};
+        ['Asia','Europe','North America','South America','Middle East','Africa','Oceania'].forEach(r => regionCounts[r] = 0);
+        players.forEach(p => {
+            const r = p.region || 'Asia';
+            if (regionCounts[r] !== undefined) regionCounts[r]++;
+        });
+
+        let regionsHtml = '';
+        ['Asia','Europe','North America','South America','Middle East','Africa','Oceania'].forEach(r => {
+            const count = regionCounts[r];
+            const isActive = count > 0;
+            regionsHtml += '<div class="region-card' + (isActive ? ' active' : '') + '">' +
+                '<div class="name">' + r + '</div>' +
+                '<div class="count">' + count + '</div>' +
+                '<div class="dot"><span class="green-dot"></span>Online</div>' +
+                '</div>';
+        });
+
+        let roomsHtml = '';
+        if (roomInfo.length === 0) {
+            roomsHtml = '<div class="no-rooms">No active rooms</div>';
+        } else {
+            roomInfo.forEach(r => {
+                roomsHtml += '<div class="room-item">' +
+                    '<div class="left">' +
+                    '<div class="room-name">' + r.name + ' (#' + r.roomId + ')</div>' +
+                    '<div class="room-info">Host: ' + r.hostName + ' | ' + r.playerNames.join(', ') + '</div>' +
+                    '</div>' +
+                    '<div class="right">' +
+                    '<span class="map-badge">' + r.map + '</span>' +
+                    '<span class="players-badge">' + r.players + '</span>' +
+                    '<span class="status-badge ' + (r.inGame ? 'ingame' : 'lobby') + '">' + (r.inGame ? 'In Match' : 'Lobby') + '</span>' +
+                    '</div>' +
+                    '</div>';
+            });
+        }
+
+        let html = STATUS_HTML
+            .replace('__TOTAL_ONLINE__', players.size)
+            .replace('__TOTAL_ROOMS__', rooms.size)
+            .replace('__IN_MATCH__', inMatchPlayers)
+            .replace('__REGIONS__', regionsHtml)
+            .replace('__ROOMS__', roomsHtml);
+
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(html);
+        return;
+    }
+
+    if (req.url === '/api/status') {
         let activePlayers = 0;
         let roomInfo = [];
         rooms.forEach((room, id) => {
@@ -26,18 +179,26 @@ const server = http.createServer((req, res) => {
                 playerNames: room.players.map(p => p.name)
             });
         });
+        const regionCounts = {};
+        ['Asia','Europe','North America','South America','Middle East','Africa','Oceania'].forEach(r => regionCounts[r] = 0);
+        players.forEach(p => {
+            const r = p.region || 'Asia';
+            if (regionCounts[r] !== undefined) regionCounts[r]++;
+        });
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
             status: 'OK',
             totalConnectedPlayers: players.size,
             totalActiveInRooms: activePlayers,
             totalRooms: rooms.size,
+            regions: regionCounts,
             rooms: roomInfo
         }, null, 2));
         return;
     }
+
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('DARK WARD GAME Server\n/status');
+    res.end('DARK WARD Server\n/status - HTML\n/api/status - JSON');
 });
 
 const wss = new WebSocket.Server({ server });
@@ -91,6 +252,14 @@ function getRoomList(region) {
     return list;
 }
 
+function getOnlineByRegion(region) {
+    let count = 0;
+    players.forEach(p => {
+        if ((p.region || 'Asia') === region) count++;
+    });
+    return count;
+}
+
 function removePlayerFromRoom(player) {
     if (!player.roomId) return null;
     const room = rooms.get(player.roomId);
@@ -128,12 +297,12 @@ function joinRoom(player, room, roomId) {
         type: 'room_joined', roomId: roomId, roomName: room.name,
         teamSize: room.teamSize, map: room.map,
         isNightMode: room.isNightMode !== undefined ? room.isNightMode : true,
-        players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready || false })),
+        players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready || false, characterId: p.characterId || '' })),
         hostId: room.hostPlayerId,
         items: Object.values(room.items || {}),
         elapsed: now - room.createdAt
     });
-    broadcastToRoom(roomId, { type: 'player_joined', playerId: player.id, name: player.name }, player.ws);
+    broadcastToRoom(roomId, { type: 'player_joined', playerId: player.id, name: player.name, characterId: player.characterId || '' }, player.ws);
 }
 
 wss.on('connection', (ws) => {
@@ -171,9 +340,27 @@ wss.on('connection', (ws) => {
                 break;
             }
 
-            case 'get_rooms':
-                sendTo(ws, { type: 'room_list', rooms: getRoomList(player.region || 'Asia') });
+            case 'get_rooms': {
+                const region = player.region || 'Asia';
+                sendTo(ws, {
+                    type: 'room_list',
+                    rooms: getRoomList(region),
+                    onlineCount: getOnlineByRegion(region),
+                    region: region
+                });
                 break;
+            }
+
+            case 'get_online': {
+                const region = msg.region || player.region || 'Asia';
+                sendTo(ws, {
+                    type: 'online_count',
+                    region: region,
+                    count: getOnlineByRegion(region),
+                    total: players.size
+                });
+                break;
+            }
 
             case 'set_region': {
                 const validRegions = ['Asia', 'Europe', 'North America', 'South America', 'Middle East', 'Africa', 'Oceania'];
@@ -208,7 +395,7 @@ wss.on('connection', (ws) => {
                     type: 'room_joined', roomId: rid, roomName: room.name,
                     teamSize: room.teamSize, map: room.map,
                     isNightMode: isNightMode,
-                    players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready || false })),
+                    players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready || false, characterId: p.characterId || '' })),
                     hostId: room.hostPlayerId,
                     items: Object.values(room.items || {}),
                     elapsed: 0
@@ -269,7 +456,7 @@ wss.on('connection', (ws) => {
                         type: 'room_joined', roomId: rid, roomName: room.name,
                         teamSize: room.teamSize, map: room.map,
                         isNightMode: true,
-                        players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready || false })),
+                        players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready || false, characterId: p.characterId || '' })),
                         hostId: room.hostPlayerId,
                         items: Object.values(room.items || {}),
                         elapsed: 0
@@ -297,12 +484,16 @@ wss.on('connection', (ws) => {
                 if (msg.health !== undefined) player.health = msg.health;
                 if (msg.heldItem !== undefined) player.heldItem = msg.heldItem;
                 if (msg.inventory !== undefined) player.inventory = msg.inventory;
+                if (msg.characterId !== undefined) player.characterId = msg.characterId;
+                if (msg.hidden !== undefined) player.hidden = msg.hidden;
                 const syncMsg = {
                     type: 'player_sync', playerId, name: player.name,
                     position: player.position, rotation: player.rotation,
                     animation: player.animation, crouching: player.crouching,
                     flashlight: player.flashlight, health: player.health,
-                    heldItem: player.heldItem || ''
+                    heldItem: player.heldItem || '',
+                    characterId: player.characterId || '',
+                    hidden: player.hidden || false
                 };
                 if (msg.doorEvent) syncMsg.doorEvent = msg.doorEvent;
                 broadcastToRoom(player.roomId, syncMsg, ws);
@@ -332,9 +523,6 @@ wss.on('connection', (ws) => {
                 break;
             }
 
-            // ==================== ITEM DROP ====================
-            // Player drops item -> server stores it -> broadcasts to ALL others
-            // Any player can pick up dropped items
             case 'item_drop': {
                 if (!player.roomId) break;
                 const ir = rooms.get(player.roomId);
@@ -358,8 +546,6 @@ wss.on('connection', (ws) => {
                 break;
             }
 
-            // ==================== ITEM PICKUP ====================
-            // ANY player can pick up -> server removes from room -> broadcasts to ALL
             case 'item_pickup': {
                 if (!player.roomId) break;
                 const pr = rooms.get(player.roomId);
@@ -402,11 +588,11 @@ wss.on('connection', (ws) => {
                 room.isNightMode = isNightMode;
                 log('MATCH', '=== MATCH START === Room ' + player.roomId + ' (' + room.name + ') | Players: ' + room.players.length + '/' + room.teamSize + ' | Night: ' + isNightMode + ' | Map: ' + room.map);
                 room.players.forEach(p => {
-                    log('PLAYER', '  -> ' + p.name + ' (id=' + p.id + ') IN MATCH');
+                    log('PLAYER', '  -> ' + p.name + ' (id=' + p.id + ') character=' + (p.characterId || 'none'));
                 });
                 broadcastToRoom(player.roomId, {
                     type: 'game_start',
-                    players: room.players.map(p => ({ id: p.id, name: p.name })),
+                    players: room.players.map(p => ({ id: p.id, name: p.name, characterId: p.characterId || '' })),
                     map: room.map, teamSize: room.teamSize,
                     isNightMode: isNightMode
                 });
@@ -450,8 +636,6 @@ wss.on('connection', (ws) => {
                 break;
             }
 
-            // ==================== GHOST SYNC ====================
-            // Host sends ghost positions -> server broadcasts to ALL remote players
             case 'ghost_sync': {
                 if (!player.roomId) break;
                 broadcastToRoom(player.roomId, {
@@ -461,9 +645,6 @@ wss.on('connection', (ws) => {
                 break;
             }
 
-            // ==================== WEAPON SYNC ====================
-            // Equip/Unequip/Fire/Reload/Throw -> server broadcasts to ALL remote players
-            // Friends see world weapon on your hand, pickups when you throw
             case 'weapon_sync': {
                 if (!player.roomId) break;
                 const wsData = msg.data || {};
@@ -556,7 +737,7 @@ server.listen(PORT, () => {
     log('SERVER', '=========================================');
     log('SERVER', 'DARK WARD GAME Server running');
     log('SERVER', 'Port: ' + PORT);
-    log('SERVER', 'Game WS: ws://0.0.0.0:' + PORT);
-    log('SERVER', 'Status: http://0.0.0.0:' + PORT + '/status');
+    log('SERVER', 'Status UI: http://0.0.0.0:' + PORT + '/status');
+    log('SERVER', 'Status API: http://0.0.0.0:' + PORT + '/api/status');
     log('SERVER', '=========================================');
 });
