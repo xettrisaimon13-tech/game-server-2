@@ -267,6 +267,9 @@ function handleMessage(ws, player, msg) {
     case "unban_player":
       handleUnbanPlayer(ws, player, msg);
       break;
+    case "select_skin":
+      handleSelectSkin(ws, player, msg);
+      break;
 
     // ── Sync ──────────────────────────────────────
     case "player_sync":
@@ -796,6 +799,31 @@ function handleUnbanPlayer(ws, player, msg) {
   bannedProfiles.delete(profileId);
   sendStatus(ws, `Unbanned profile ${profileId}`);
   console.log(`[Ban] ${profileId} unbanned by ${player.name}`);
+}
+
+// ── Select Skin (remote skin sync) ──────────────────────────────────
+// 8 slots supported (1-8). Player picks a skin → everyone else in the
+// room sees that skin on that player's remote model.
+function handleSelectSkin(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  const skinId = msg.skinId;
+  if (skinId === undefined || skinId === null) return;
+
+  // Optional slot validation (8 slots: 1-8). Skip check if you pass
+  // string skin IDs instead of numeric slots — this only guards numbers.
+  if (typeof skinId === "number" && (skinId < 1 || skinId > 8)) {
+    return sendError(ws, "Invalid skin slot (must be 1-8)");
+  }
+
+  player.characterId = skinId;
+
+  room.broadcast({
+    type: "skin_changed",
+    playerId: player.id,
+    skinId: skinId,
+  }, ws);
 }
 
 // ── Player Sync ────────────────────────────────────────────────────
