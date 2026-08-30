@@ -1002,7 +1002,7 @@ app.get("/health", (req, res) => {
 });
 
 // ── Start ──────────────────────────────────────────────────────────
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`====================================`);
   console.log(`  Dark Ward Server`);
   console.log(`  Port: ${PORT}`);
