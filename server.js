@@ -145,17 +145,12 @@ function broadcastOnlineCounts() {
 }
 
 // ── Heartbeat (prevent idle disconnect on Render free tier) ────────
-// FIX: was using `return` inside the for-loop, which aborted the ENTIRE
-// heartbeat tick as soon as it hit the first dead client — every client
-// after that one in iteration order never got pinged / never had isAlive
-// reset that round. That left stale/ghost connections around, which is
-// what was causing the weird join/host/door/sync "chaos" under load.
 const heartbeatInterval = setInterval(() => {
   for (const ws of wss.clients) {
     try {
       if (ws.isAlive === false) {
         ws.terminate();
-        continue; // was: return
+        continue; // was: return (aborted the whole tick on first dead client)
       }
       ws.isAlive = false;
       ws.ping();
@@ -169,11 +164,6 @@ wss.on("connection", (ws) => {
   ws.isAlive = true;
   ws.on("pong", () => { ws.isAlive = true; });
 
-  // FIX: without this, a network hiccup on ANY client's socket emits an
-  // 'error' event with no listener attached — Node throws that as an
-  // uncaught exception and kills the ENTIRE server process (all rooms,
-  // all players, everyone). This is almost certainly why your server
-  // was randomly dying after running fine post-deploy.
   ws.on("error", (err) => {
     console.error(`[ws error] player socket error:`, err.message);
   });
@@ -336,13 +326,6 @@ function handleMessage(ws, player, msg) {
 }
 
 // ── Ping / Pong ────────────────────────────────────────────────────
-// FIX: now also tracks last-seen time server-side (useful if you ever
-// want to detect/kick laggy clients from the server, not just the client
-// display). The actual 0↔999ms "wraparound" you're seeing on screen is a
-// CLIENT-side display bug (almost certainly something like
-// `Date.now() % 1000` or `rtt % 1000` used when rendering the ping number).
-// This server just echoes msg.time back untouched, which is correct —
-// paste your client-side ping display code and I'll fix that part too.
 function handlePing(ws, player, msg) {
   player.lastPing = Date.now();
   sendTo(ws, { type: "pong", time: msg.time, serverTime: Date.now() });
@@ -354,7 +337,6 @@ function handleIdentify(ws, player, msg) {
   const accountType = msg.accountType || "";
   if (!profileId) return;
 
-  // Server-wide ban check — reject immediately if this profile is banned
   if (bannedProfiles.has(profileId)) {
     const ban = bannedProfiles.get(profileId);
     sendTo(ws, {
@@ -475,7 +457,6 @@ function handleJoinRoom(ws, player, msg) {
   const roomIdentifier = msg.roomId || msg.roomName || "";
   let room = getRoomById(roomIdentifier);
 
-  // Try by name if not found by id
   if (!room) {
     for (const [, r] of rooms) {
       if (r.name === roomIdentifier) {
@@ -507,7 +488,6 @@ function handleJoinRoom(ws, player, msg) {
   player.isHost = false;
   room.players.set(player.id, ws);
 
-  // Notify existing players
   room.broadcast({
     type: "player_joined",
     playerId: player.id,
@@ -516,7 +496,6 @@ function handleJoinRoom(ws, player, msg) {
     isHost: player.isHost,
   }, ws);
 
-  // Send room state to joiner
   sendTo(ws, {
     type: "room_joined",
     roomId: room.id,
@@ -540,7 +519,6 @@ function handleQuickMatch(ws, player) {
     return sendError(ws, "Already in a room");
   }
 
-  // Find an open room in same region
   for (const [, room] of rooms) {
     if (room.region !== player.region) continue;
     if (room.gameStarted) continue;
@@ -580,7 +558,6 @@ function handleQuickMatch(ws, player) {
     return;
   }
 
-  // No room found → create one
   handleCreateRoom(ws, player, {
     roomName: player.name + "'s Room",
     teamSize: 4,
@@ -606,7 +583,6 @@ function handleLeaveRoom(ws, player) {
     name: player.name,
   });
 
-  // Transfer host if needed
   if (room.players.size > 0 && room.hostId === player.id) {
     const [newHostWs] = room.players.values();
     const newHost = getPlayerByWs(newHostWs);
@@ -748,7 +724,6 @@ function handleBanPlayer(ws, player, msg) {
     return sendError(ws, "Cannot ban: target has no identified profile");
   }
 
-  // Add to server-wide ban list
   bannedProfiles.set(target.profileId, {
     name: target.name,
     bannedAt: Date.now(),
@@ -761,7 +736,6 @@ function handleBanPlayer(ws, player, msg) {
     name: target.name,
   });
 
-  // Remove from room immediately
   room.players.delete(target.id);
   target.roomId = null;
   target.isHost = false;
@@ -783,8 +757,6 @@ function handleBanPlayer(ws, player, msg) {
 }
 
 // ── Unban Player (server-wide) ─────────────────────────────────────
-// Call this without a room requirement — pass profileId directly.
-// Wire this to a host/admin-only command in your client as needed.
 function handleUnbanPlayer(ws, player, msg) {
   const profileId = msg.profileId;
   if (!profileId) return sendError(ws, "profileId required to unban");
@@ -891,7 +863,6 @@ function handleGameOverAll(ws, player) {
   room.gameStarted = false;
   room.broadcast({ type: "game_over_all" });
 
-  // Reset ready states
   for (const [pid] of room.players) {
     const p = getPlayerByWs(room.players.get(pid));
     if (p) p.isReady = false;
@@ -1113,8 +1084,6 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`====================================`);
 });
 
-// FIX: catch server/wss-level errors (e.g. malformed handshake, EADDRINUSE)
-// so they get logged instead of silently/violently crashing the process.
 server.on("error", (err) => {
   console.error("[http server error]", err);
 });
@@ -1123,13 +1092,6 @@ wss.on("error", (err) => {
   console.error("[wss error]", err);
 });
 
-// FIX: last-resort safety net. Without these, ANY uncaught error anywhere
-// in the app (a bad message, a null reference, a third-party lib throwing)
-// kills the whole Node process instantly — every player disconnected,
-// every room wiped. Logging and staying alive is far better for a game
-// server than a hard crash. (Ideally you also fix the root cause using
-// these logs, but this stops one bad player/message from taking down
-// everyone else.)
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException] Server stayed alive, but fix this:", err);
 });
