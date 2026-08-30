@@ -87,6 +87,16 @@ class Room {
           isHost: p.isHost,
           isReady: p.isReady,
           isSpectating: p.isSpectating,
+          // FIX: include current transform/state so a newly-joining
+          // client can actually spawn every existing player's 3D model
+          // in the right place. Without this, the lobby had no idea
+          // where to put remote players and they just didn't appear.
+          position: p.position,
+          rotation: p.rotation,
+          animation: p.animation,
+          crouching: p.crouching,
+          flashlight: p.flashlight,
+          hidden: p.hidden,
         });
       }
     }
@@ -517,6 +527,8 @@ function handleJoinRoom(ws, player, msg) {
     name: player.name,
     characterId: player.characterId,
     isHost: player.isHost,
+    position: player.position,
+    rotation: player.rotation,
   }, ws);
 
   // Send room state to joiner
@@ -563,6 +575,8 @@ function handleQuickMatch(ws, player) {
       name: player.name,
       characterId: player.characterId,
       isHost: false,
+      position: player.position,
+      rotation: player.rotation,
     }, ws);
 
     sendTo(ws, {
