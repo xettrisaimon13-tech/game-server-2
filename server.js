@@ -144,11 +144,16 @@ function broadcastOnlineCounts() {
 }
 
 // ── Heartbeat (prevent idle disconnect on Render free tier) ────────
+// FIX: was using `return` inside the for-loop, which aborted the ENTIRE
+// heartbeat tick as soon as it hit the first dead client — every client
+// after that one in iteration order never got pinged / never had isAlive
+// reset that round. That left stale/ghost connections around, which is
+// what was causing the weird join/host/door/sync "chaos" under load.
 const heartbeatInterval = setInterval(() => {
   for (const ws of wss.clients) {
     if (ws.isAlive === false) {
       ws.terminate();
-      return;
+      continue; // was: return
     }
     ws.isAlive = false;
     ws.ping();
@@ -196,7 +201,7 @@ function handleMessage(ws, player, msg) {
   switch (t) {
     // ── Connection / Identity ─────────────────────
     case "ping":
-      handlePing(ws, msg);
+      handlePing(ws, player, msg);
       break;
     case "identify":
       handleIdentify(ws, player, msg);
@@ -311,8 +316,16 @@ function handleMessage(ws, player, msg) {
 }
 
 // ── Ping / Pong ────────────────────────────────────────────────────
-function handlePing(ws, msg) {
-  sendTo(ws, { type: "pong", time: msg.time });
+// FIX: now also tracks last-seen time server-side (useful if you ever
+// want to detect/kick laggy clients from the server, not just the client
+// display). The actual 0↔999ms "wraparound" you're seeing on screen is a
+// CLIENT-side display bug (almost certainly something like
+// `Date.now() % 1000` or `rtt % 1000` used when rendering the ping number).
+// This server just echoes msg.time back untouched, which is correct —
+// paste your client-side ping display code and I'll fix that part too.
+function handlePing(ws, player, msg) {
+  player.lastPing = Date.now();
+  sendTo(ws, { type: "pong", time: msg.time, serverTime: Date.now() });
 }
 
 // ── Identity / Account Conflict ────────────────────────────────────
