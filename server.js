@@ -14,6 +14,7 @@ const REGION_NAMES = ["Asia", "Europe", "NA", "SA", "Africa", "Oceania"];
 const players = new Map();       // ws → PlayerInfo
 const rooms = new Map();         // roomId → Room
 const accountSessions = new Map(); // profileId → ws (for conflict detection)
+const bannedProfiles = new Map();  // profileId → { name, bannedAt, reason }
 let nextPlayerId = 1;
 let nextRoomId = 1;
 
@@ -151,18 +152,31 @@ function broadcastOnlineCounts() {
 // what was causing the weird join/host/door/sync "chaos" under load.
 const heartbeatInterval = setInterval(() => {
   for (const ws of wss.clients) {
-    if (ws.isAlive === false) {
-      ws.terminate();
-      continue; // was: return
+    try {
+      if (ws.isAlive === false) {
+        ws.terminate();
+        continue; // was: return
+      }
+      ws.isAlive = false;
+      ws.ping();
+    } catch (err) {
+      console.error("[heartbeat] error pinging client:", err.message);
     }
-    ws.isAlive = false;
-    ws.ping();
   }
 }, 30000);
 
 wss.on("connection", (ws) => {
   ws.isAlive = true;
   ws.on("pong", () => { ws.isAlive = true; });
+
+  // FIX: without this, a network hiccup on ANY client's socket emits an
+  // 'error' event with no listener attached — Node throws that as an
+  // uncaught exception and kills the ENTIRE server process (all rooms,
+  // all players, everyone). This is almost certainly why your server
+  // was randomly dying after running fine post-deploy.
+  ws.on("error", (err) => {
+    console.error(`[ws error] player socket error:`, err.message);
+  });
 
   const playerId = nextPlayerId++;
   const player = new Player(ws, playerId);
@@ -246,6 +260,12 @@ function handleMessage(ws, player, msg) {
       break;
     case "kick_player":
       handleKickPlayer(ws, player, msg);
+      break;
+    case "ban_player":
+      handleBanPlayer(ws, player, msg);
+      break;
+    case "unban_player":
+      handleUnbanPlayer(ws, player, msg);
       break;
 
     // ── Sync ──────────────────────────────────────
@@ -333,6 +353,18 @@ function handleIdentify(ws, player, msg) {
   const profileId = msg.playerId || null;
   const accountType = msg.accountType || "";
   if (!profileId) return;
+
+  // Server-wide ban check — reject immediately if this profile is banned
+  if (bannedProfiles.has(profileId)) {
+    const ban = bannedProfiles.get(profileId);
+    sendTo(ws, {
+      type: "banned",
+      message: `You are banned from this server.${ban.reason ? " Reason: " + ban.reason : ""}`,
+    });
+    sendError(ws, "You are banned from this server.");
+    ws.close(4003, "Banned");
+    return;
+  }
 
   player.profileId = profileId;
   player.accountType = accountType;
@@ -425,20 +457,9 @@ function handleCreateRoom(ws, player, msg) {
     teamSize: room.teamSize,
     map: room.map,
     region: room.region,
-    players: room.playerList(),
-  });
-
-  sendTo(ws, {
-    type: "room_joined",
-    roomId: roomId,
-    roomName: room.name,
-    hostId: player.id,
-    teamSize: room.teamSize,
-    map: room.map,
-    region: room.region,
     items: room.items,
-    players: room.playerList(),
     doors: room.doors,
+    players: room.playerList(),
   });
 
   broadcastOnlineCounts();
@@ -706,6 +727,75 @@ function handleKickPlayer(ws, player, msg) {
 
   broadcastOnlineCounts();
   console.log(`[Room] ${target.name} kicked from room ${room.id}`);
+}
+
+// ── Ban Player (server-wide) ───────────────────────────────────────
+function handleBanPlayer(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+  if (room.hostId !== player.id) {
+    return sendError(ws, "Only the host can ban players");
+  }
+
+  const targetId = msg.targetId;
+  const targetWs = room.players.get(targetId);
+  if (!targetWs) return;
+
+  const target = getPlayerByWs(targetWs);
+  if (!target) return;
+
+  if (!target.profileId) {
+    return sendError(ws, "Cannot ban: target has no identified profile");
+  }
+
+  // Add to server-wide ban list
+  bannedProfiles.set(target.profileId, {
+    name: target.name,
+    bannedAt: Date.now(),
+    reason: msg.reason || "",
+  });
+
+  room.broadcast({
+    type: "player_banned",
+    playerId: target.id,
+    name: target.name,
+  });
+
+  // Remove from room immediately
+  room.players.delete(target.id);
+  target.roomId = null;
+  target.isHost = false;
+  target.isReady = false;
+
+  sendTo(targetWs, {
+    type: "player_banned",
+    playerId: target.id,
+    name: target.name,
+  });
+  sendTo(targetWs, {
+    type: "banned",
+    message: `You have been banned from this server.${msg.reason ? " Reason: " + msg.reason : ""}`,
+  });
+  targetWs.close(4003, "Banned");
+
+  broadcastOnlineCounts();
+  console.log(`[Ban] ${target.name} (${target.profileId}) banned by ${player.name} in room ${room.id}`);
+}
+
+// ── Unban Player (server-wide) ─────────────────────────────────────
+// Call this without a room requirement — pass profileId directly.
+// Wire this to a host/admin-only command in your client as needed.
+function handleUnbanPlayer(ws, player, msg) {
+  const profileId = msg.profileId;
+  if (!profileId) return sendError(ws, "profileId required to unban");
+
+  if (!bannedProfiles.has(profileId)) {
+    return sendError(ws, "That profile is not banned");
+  }
+
+  bannedProfiles.delete(profileId);
+  sendStatus(ws, `Unbanned profile ${profileId}`);
+  console.log(`[Ban] ${profileId} unbanned by ${player.name}`);
 }
 
 // ── Player Sync ────────────────────────────────────────────────────
@@ -1021,6 +1111,31 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`  Port: ${PORT}`);
   console.log(`  WebSocket: ws://localhost:${PORT}`);
   console.log(`====================================`);
+});
+
+// FIX: catch server/wss-level errors (e.g. malformed handshake, EADDRINUSE)
+// so they get logged instead of silently/violently crashing the process.
+server.on("error", (err) => {
+  console.error("[http server error]", err);
+});
+
+wss.on("error", (err) => {
+  console.error("[wss error]", err);
+});
+
+// FIX: last-resort safety net. Without these, ANY uncaught error anywhere
+// in the app (a bad message, a null reference, a third-party lib throwing)
+// kills the whole Node process instantly — every player disconnected,
+// every room wiped. Logging and staying alive is far better for a game
+// server than a hard crash. (Ideally you also fix the root cause using
+// these logs, but this stops one bad player/message from taking down
+// everyone else.)
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException] Server stayed alive, but fix this:", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection] Server stayed alive, but fix this:", reason);
 });
 
 // ── Cleanup on exit ────────────────────────────────────────────────
