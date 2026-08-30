@@ -1,417 +1,1019 @@
-const WebSocket = require('ws');
-const http = require('http');
+const express = require("express");
+const http = require("http");
+const { WebSocketServer } = require("ws");
+const crypto = require("crypto");
 
-const PORT = process.env.PORT || 7001;
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
-function log(tag, msg) {
-    const t = new Date().toISOString().slice(11, 19);
-    console.log('[' + t + '] [' + tag + '] ' + msg);
-}
+const PORT = process.env.PORT || 3000;
+const REGION_NAMES = ["Asia", "Europe", "NA", "SA", "Africa", "Oceania"];
 
-const server = http.createServer((req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
-
-    if (req.url === '/status') {
-        let activePlayers = 0;
-        let roomInfo = [];
-        rooms.forEach((room, id) => {
-            activePlayers += room.players.length;
-            roomInfo.push({ roomId: id, name: room.name, players: room.players.length + '/' + room.teamSize, inGame: room.inGame, isNightMode: room.isNightMode, playerNames: room.players.map(p => p.name) });
-        });
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'OK', totalConnectedPlayers: players.size, totalActiveInRooms: activePlayers, totalRooms: rooms.size, rooms: roomInfo }, null, 2));
-        return;
-    }
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('DARK WARD GAME Server\n/status');
-});
-
-const wss = new WebSocket.Server({ server });
-
-const rooms = new Map();
-const players = new Map();
-const usedRoomIds = new Set();
+// ── State ──────────────────────────────────────────────────────────
+const players = new Map();       // ws → PlayerInfo
+const rooms = new Map();         // roomId → Room
+const accountSessions = new Map(); // profileId → ws (for conflict detection)
 let nextPlayerId = 1;
+let nextRoomId = 1;
 
-function generateRoomId() {
-    let id;
-    do { id = 1000 + Math.floor(Math.random() * 9000); } while (usedRoomIds.has(id));
-    usedRoomIds.add(id);
-    return id;
+// ── Player ─────────────────────────────────────────────────────────
+class Player {
+  constructor(ws, id) {
+    this.ws = ws;
+    this.id = id;
+    this.name = "Player";
+    this.region = "Asia";
+    this.profileId = null;
+    this.accountType = "";
+    this.roomId = null;
+    this.characterId = "player";
+    this.isReady = false;
+    this.isHost = false;
+    this.isSpectating = false;
+    this.position = { x: 0, y: 0, z: 0 };
+    this.rotation = 0;
+    this.animation = "Idle";
+    this.crouching = false;
+    this.flashlight = false;
+    this.health = 100;
+    this.lives = 3;
+    this.heldItem = "";
+    this.inventory = {};
+    this.hidden = false;
+    this.lastPing = 0;
+    this.pingOutstanding = -1;
+  }
 }
 
-function broadcastToRoom(roomId, message, excludeWs) {
-    const room = rooms.get(roomId);
-    if (!room) return;
-    const data = JSON.stringify(message);
-    room.players.forEach(p => { if (p.ws !== excludeWs && p.ws.readyState === WebSocket.OPEN) p.ws.send(data); });
-}
+// ── Room ───────────────────────────────────────────────────────────
+class Room {
+  constructor(id, name, password, teamSize, mapName, isPrivate, region, hostId) {
+    this.id = id;
+    this.name = name;
+    this.password = password;
+    this.teamSize = teamSize;
+    this.map = mapName;
+    this.isPrivate = isPrivate;
+    this.region = region;
+    this.hostId = hostId;
+    this.players = new Map();    // playerId → ws
+    this.items = [];             // dropped items
+    this.doors = {};             // doorPath → isOpen
+    this.ghosts = [];            // ghost sync data
+    this.gameStarted = false;
+    this.createdAt = Date.now();
+  }
 
-function sendTo(ws, message) { if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message)); }
-function sendError(ws, message) { sendTo(ws, { type: 'error', message }); }
-function sendStatus(ws, text) { sendTo(ws, { type: 'status', text }); }
+  broadcast(msg, excludeWs = null) {
+    const data = JSON.stringify(msg);
+    for (const [pid, ws] of this.players) {
+      if (ws !== excludeWs && ws.readyState === 1) {
+        ws.send(data);
+      }
+    }
+  }
 
-function getRoomList() {
+  playerList() {
     const list = [];
-    rooms.forEach((room, id) => {
-        const host = room.players.find(p => p.id === room.hostPlayerId);
+    for (const [pid] of this.players) {
+      const p = getPlayerByWs(this.players.get(pid));
+      if (p) {
         list.push({
-            id: id, roomId: id, name: room.name,
-            hostName: host ? host.name : 'Unknown',
-            players: room.players.length, maxPlayers: room.teamSize,
-            map: room.map, inGame: room.inGame,
-            hasPassword: !!(room.password && room.password !== ''),
-            isPrivate: !!room.isPrivate,
-            isNightMode: room.isNightMode !== undefined ? room.isNightMode : true,
-            playerNames: room.players.map(p => p.name),
-            playerCount: room.players.length
+          playerId: p.id,
+          name: p.name,
+          characterId: p.characterId,
+          isHost: p.isHost,
+          isReady: p.isReady,
+          isSpectating: p.isSpectating,
         });
-    });
+      }
+    }
     return list;
+  }
 }
 
-function removePlayerFromRoom(player) {
-    if (!player.roomId) return null;
-    const room = rooms.get(player.roomId);
-    if (!room) { player.roomId = null; player.ready = false; return null; }
-    room.players = room.players.filter(p => p.id !== player.id);
-    const leftRoomId = player.roomId;
-    const wasHost = room.hostPlayerId === player.id;
-    const dropItems = player.inventory || {};
-    const dropPos = player.position || null;
-    log('LEAVE', player.name + ' left room ' + leftRoomId + ' (' + room.players.length + '/' + room.teamSize + ' remaining)');
-    broadcastToRoom(leftRoomId, { type: 'player_left', playerId: player.id, name: player.name, inventory: dropItems, position: dropPos }, player.ws);
-    player.roomId = null; player.ready = false;
-    if (room.players.length === 0) {
-        log('ROOM', 'Room ' + leftRoomId + ' destroyed (empty)');
-        rooms.delete(leftRoomId); usedRoomIds.delete(leftRoomId); return null;
+function getPlayerByWs(ws) {
+  return players.get(ws) || null;
+}
+
+function getRoomById(id) {
+  return rooms.get(id) || null;
+}
+
+function getRoomForPlayer(player) {
+  if (!player || !player.roomId) return null;
+  return getRoomById(player.roomId);
+}
+
+function sendTo(ws, msg) {
+  if (ws && ws.readyState === 1) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+function sendError(ws, message) {
+  sendTo(ws, { type: "error", message });
+}
+
+function sendStatus(ws, text) {
+  sendTo(ws, { type: "status", text });
+}
+
+// ── Online counts ──────────────────────────────────────────────────
+function broadcastOnlineCounts() {
+  const regionCounts = {};
+  let total = 0;
+  for (const [, p] of players) {
+    const r = p.region || "Asia";
+    regionCounts[r] = (regionCounts[r] || 0) + 1;
+    total++;
+  }
+  const msg = {
+    type: "online_count",
+    region: "",
+    count: 0,
+    total,
+    regions: regionCounts,
+  };
+  for (const [, p] of players) {
+    msg.region = p.region;
+    msg.count = regionCounts[p.region] || 0;
+    sendTo(p.ws, msg);
+  }
+}
+
+// ── Heartbeat (prevent idle disconnect on Render free tier) ────────
+const heartbeatInterval = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      ws.terminate();
+      return;
     }
-    if (wasHost) {
-        const nh = room.players[0];
-        room.hostPlayerId = nh.id;
-        log('HOST', 'Host transferred to ' + nh.name + ' (id=' + nh.id + ') in room ' + leftRoomId);
-        broadcastToRoom(leftRoomId, { type: 'host_changed', newHostId: nh.id, newHostName: nh.name });
+    ws.isAlive = false;
+    ws.ping();
+  }
+}, 30000);
+
+wss.on("connection", (ws) => {
+  ws.isAlive = true;
+  ws.on("pong", () => { ws.isAlive = true; });
+
+  const playerId = nextPlayerId++;
+  const player = new Player(ws, playerId);
+  players.set(ws, player);
+
+  sendTo(ws, {
+    type: "welcome",
+    playerId: playerId,
+    serverTime: Date.now(),
+  });
+
+  sendStatus(ws, "Connected to server");
+  broadcastOnlineCounts();
+
+  console.log(`[+] Player ${playerId} connected (${players.size} total)`);
+
+  ws.on("message", (raw) => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      handleMessage(ws, player, msg);
+    } catch (e) {
+      console.error("Parse error:", e.message);
     }
-    return leftRoomId;
-}
+  });
 
-function joinRoom(player, room, roomId) {
-    if (player.roomId) removePlayerFromRoom(player);
-    player.roomId = roomId; player.ready = false;
-    room.players.push(player);
-    if (!player.name || player.name.trim() === '') player.name = 'Player ' + room.players.length;
-    log('JOIN', player.name + ' joined room ' + roomId + ' (' + room.players.length + '/' + room.teamSize + ')');
-    sendTo(player.ws, {
-        type: 'room_joined', roomId: roomId, roomName: room.name,
-        teamSize: room.teamSize, map: room.map,
-        isNightMode: room.isNightMode !== undefined ? room.isNightMode : true,
-        players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready || false, characterId: p.characterId || '' })),
-        hostId: room.hostPlayerId, items: Object.values(room.items || {})
-    });
-    broadcastToRoom(roomId, { type: 'player_joined', playerId: player.id, name: player.name, characterId: player.characterId || '' }, player.ws);
-}
-
-wss.on('connection', (ws) => {
-    const playerId = nextPlayerId++;
-    players.set(playerId, { ws, id: playerId, name: 'Player' + playerId, roomId: null, ready: false, position: null, rotation: null, animation: null, crouching: false, flashlight: false, health: 100, inventory: {}, characterId: null });
-    log('CONNECT', 'Player connected -> ' + 'Player' + playerId + ' (id=' + playerId + ')');
-    sendTo(ws, { type: 'welcome', playerId: playerId });
-
-    ws.on('message', (raw) => {
-        let msg;
-        try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
-        const player = players.get(playerId);
-        if (!player) return;
-
-        switch (msg.type) {
-            case 'set_name': {
-                const nn = (msg.name || '').trim() || 'Player' + playerId;
-                if (player.roomId) {
-                    const room = rooms.get(player.roomId);
-                    if (room) {
-                        const taken = room.players.some(op => op.id !== playerId && op.name === nn);
-                        player.name = taken ? nn + '_' + Math.floor(Math.random() * 100) : nn;
-                    }
-                } else {
-                    player.name = nn;
-                }
-                log('NAME', 'Player ' + playerId + ' set name to "' + player.name + '"');
-                break;
-            }
-            case 'get_rooms': sendTo(ws, { type: 'room_list', rooms: getRoomList() }); break;
-
-            case 'create_room': {
-                if (player.roomId) removePlayerFromRoom(player);
-                if (msg.characterId !== undefined) player.characterId = msg.characterId;
-                const roomName = msg.roomName || 'Room';
-                const rid = generateRoomId();
-                const isNightMode = msg.isNightMode !== undefined ? msg.isNightMode : true;
-                const room = {
-                    id: rid, name: roomName, hostPlayerId: playerId,
-                    password: msg.password || '', isPrivate: !!msg.isPrivate,
-                    players: [], map: msg.map || 'Hospital',
-                    teamSize: msg.teamSize || 2, inGame: false,
-                    doorStates: {}, items: {},
-                    isNightMode: isNightMode,
-                    createdAt: Date.now()
-                };
-                player.roomId = rid; player.ready = false;
-                room.players.push(player);
-                if (!player.name || player.name.trim() === '') player.name = 'Player ' + room.players.length;
-                rooms.set(rid, room);
-                log('CREATE', player.name + ' created room "' + roomName + '" (id=' + rid + ', night=' + isNightMode + ', max=' + room.teamSize + ')');
-                sendTo(ws, { type: 'room_created', roomId: rid, roomName: room.name, teamSize: room.teamSize, map: room.map, hasPassword: room.password !== '' });
-                sendTo(ws, {
-                    type: 'room_joined', roomId: rid, roomName: room.name,
-                    teamSize: room.teamSize, map: room.map,
-                    isNightMode: isNightMode,
-                    players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready || false, characterId: p.characterId || '' })),
-                    hostId: room.hostPlayerId, items: Object.values(room.items || {})
-                });
-                break;
-            }
-
-            case 'join_room': {
-                const targetRoomId = msg.roomId ? Number(msg.roomId) : null;
-                const roomName = msg.roomName || '';
-                const pwd = msg.password || '';
-                let targetRoom = null, foundRoomId = null, existingRoomInGame = false;
-                if (targetRoomId && rooms.has(targetRoomId)) {
-                    const cand = rooms.get(targetRoomId);
-                    if (!cand.inGame) { targetRoom = cand; foundRoomId = targetRoomId; }
-                    else existingRoomInGame = true;
-                }
-                if (!targetRoom) {
-                    rooms.forEach((room, rid) => {
-                        if (room.name === roomName) {
-                            if (room.inGame) { existingRoomInGame = true; return; }
-                            if (room.password && room.password !== pwd) return;
-                            if (room.players.length >= room.teamSize) return;
-                            targetRoom = room; foundRoomId = rid;
-                        }
-                    });
-                }
-                if (existingRoomInGame && !targetRoom) { sendError(ws, 'Room is already in a match'); break; }
-                if (!targetRoom) { sendError(ws, 'Room does not exist'); break; }
-                if (targetRoom.password && targetRoom.password !== pwd) { sendError(ws, 'Wrong password'); break; }
-                if (targetRoom.players.length >= targetRoom.teamSize) { sendError(ws, 'Room is full'); break; }
-                if (msg.characterId !== undefined) player.characterId = msg.characterId;
-                joinRoom(player, targetRoom, foundRoomId);
-                break;
-            }
-
-            case 'quick_match': {
-                if (msg.characterId !== undefined) player.characterId = msg.characterId;
-                let found = false;
-                rooms.forEach((room, rid) => {
-                    if (!found && !room.inGame && !room.isPrivate && !room.password && room.players.length < room.teamSize) {
-                        joinRoom(player, room, rid); found = true;
-                    }
-                });
-                if (!found) {
-                    const rid = generateRoomId();
-                    const room = {
-                        id: rid, name: 'Quick Match', hostPlayerId: playerId,
-                        password: '', isPrivate: false, players: [],
-                        map: 'Hospital', teamSize: 2, inGame: false,
-                        doorStates: {}, items: {}, isNightMode: true,
-                        createdAt: Date.now()
-                    };
-                    player.roomId = rid; player.ready = false;
-                    room.players.push(player); rooms.set(rid, room);
-                    sendTo(player.ws, {
-                        type: 'room_joined', roomId: rid, roomName: room.name,
-                        teamSize: room.teamSize, map: room.map,
-                        isNightMode: true,
-                        players: room.players.map(p => ({ id: p.id, name: p.name, ready: p.ready || false, characterId: p.characterId || '' })),
-                        hostId: room.hostPlayerId, items: Object.values(room.items || {})
-                    });
-                    sendStatus(ws, 'Waiting for players...');
-                }
-                log('QUICK', player.name + ' quick match');
-                break;
-            }
-
-            case 'leave_room': {
-                if (player.roomId) {
-                    removePlayerFromRoom(player);
-                }
-                break;
-            }
-
-            case 'player_sync': {
-                if (!player.roomId) break;
-                player.position = msg.position || player.position;
-                player.rotation = msg.rotation || player.rotation;
-                player.animation = msg.animation || player.animation;
-                if (msg.crouching !== undefined) player.crouching = msg.crouching;
-                if (msg.flashlight !== undefined) player.flashlight = msg.flashlight;
-                if (msg.health !== undefined) player.health = msg.health;
-                if (msg.heldItem !== undefined) player.heldItem = msg.heldItem;
-                if (msg.inventory !== undefined) player.inventory = msg.inventory;
-                if (msg.characterId !== undefined) player.characterId = msg.characterId;
-                const syncMsg = {
-                    type: 'player_sync', playerId, name: player.name,
-                    position: player.position, rotation: player.rotation,
-                    animation: player.animation, crouching: player.crouching,
-                    flashlight: player.flashlight, health: player.health,
-                    heldItem: player.heldItem || '',
-                    characterId: player.characterId || ''
-                };
-                if (msg.doorEvent) syncMsg.doorEvent = msg.doorEvent;
-                broadcastToRoom(player.roomId, syncMsg, ws);
-                break;
-            }
-
-            case 'player_damage': {
-                if (!player.roomId) break;
-                log('COMBAT', player.name + ' dealt ' + msg.damage + ' damage to target ' + msg.targetId);
-                broadcastToRoom(player.roomId, { type: 'player_damage', playerId: msg.targetId, damage: msg.damage, sourceId: playerId }, ws);
-                break;
-            }
-
-            case 'player_lives': {
-                if (!player.roomId) break;
-                broadcastToRoom(player.roomId, { type: 'player_lives', playerId: playerId, lives: msg.lives, health: msg.health }, ws);
-                break;
-            }
-
-            case 'door_sync': {
-                if (!player.roomId) break;
-                const dr = rooms.get(player.roomId);
-                if (!dr) break;
-                if (!dr.doorStates) dr.doorStates = {};
-                dr.doorStates[msg.doorPath] = msg.isOpen;
-                broadcastToRoom(player.roomId, { type: 'door_sync', doorPath: msg.doorPath, isOpen: msg.isOpen }, ws);
-                break;
-            }
-
-            case 'item_drop': {
-                if (!player.roomId) break;
-                const ir = rooms.get(player.roomId);
-                if (!ir) break;
-                const id = (msg.id != null) ? String(msg.id) : ('' + Date.now());
-                const item = { id: id, type: msg.itemType || 'flashlight', position: msg.position || { x: 0, y: 0, z: 0 } };
-                if (!ir.items) ir.items = {};
-                ir.items[id] = item;
-                broadcastToRoom(player.roomId, { type: 'item_drop', id: id, itemType: item.type, position: item.position }, ws);
-                break;
-            }
-
-            case 'item_pickup': {
-                if (!player.roomId) break;
-                const pr = rooms.get(player.roomId);
-                if (pr && pr.items) { delete pr.items[String(msg.id)]; }
-                broadcastToRoom(player.roomId, { type: 'item_pickup', id: String(msg.id) }, ws);
-                break;
-            }
-
-            case 'toggle_ready': {
-                if (!player.roomId) { sendError(ws, 'You are not in a room'); break; }
-                const room = rooms.get(player.roomId);
-                if (!room || room.inGame) { sendError(ws, 'Cannot ready now'); break; }
-                player.ready = !player.ready;
-                log('READY', player.name + (player.ready ? ' READY' : ' CANCELLED READY'));
-                broadcastToRoom(player.roomId, { type: 'player_ready_changed', playerId, ready: player.ready });
-                break;
-            }
-
-            case 'start_match': {
-                if (!player.roomId) { sendError(ws, 'You are not in a room'); break; }
-                const room = rooms.get(player.roomId);
-                if (!room) break;
-                if (room.hostPlayerId !== playerId) { sendError(ws, 'Only host can start'); break; }
-                if (room.inGame) { sendError(ws, 'Game already started'); break; }
-                room.inGame = true;
-                room.doorStates = {};
-                const isNightMode = msg.isNightMode !== undefined ? msg.isNightMode : room.isNightMode;
-                room.isNightMode = isNightMode;
-                log('MATCH', '=== MATCH START === Room ' + player.roomId + ' (' + room.name + ') | Players: ' + room.players.length + '/' + room.teamSize + ' | Night: ' + isNightMode + ' | Map: ' + room.map);
-                room.players.forEach(p => {
-                    log('PLAYER', '  -> ' + p.name + ' (id=' + p.id + ') IN MATCH');
-                });
-                broadcastToRoom(player.roomId, {
-                    type: 'game_start',
-                    players: room.players.map(p => ({ id: p.id, name: p.name, characterId: p.characterId || '' })),
-                    map: room.map, teamSize: room.teamSize,
-                    isNightMode: isNightMode
-                });
-                break;
-            }
-
-            case 'kick_player': {
-                if (!player.roomId) break;
-                const room = rooms.get(player.roomId);
-                if (!room || room.hostPlayerId !== playerId) break;
-                const tp = players.get(msg.targetId);
-                if (tp && tp.roomId === player.roomId) {
-                    log('KICK', player.name + ' kicked ' + tp.name + ' from room ' + player.roomId);
-                    broadcastToRoom(player.roomId, { type: 'player_kicked', playerId: msg.targetId });
-                    removePlayerFromRoom(tp);
-                }
-                break;
-            }
-
-            case 'transfer_host': {
-                if (!player.roomId) break;
-                const room = rooms.get(player.roomId);
-                if (!room || room.hostPlayerId !== playerId) break;
-                const nh = players.get(msg.targetId);
-                if (nh && nh.roomId === player.roomId) {
-                    room.hostPlayerId = nh.id;
-                    log('HOST', player.name + ' transferred host to ' + nh.name + ' in room ' + player.roomId);
-                    broadcastToRoom(player.roomId, { type: 'host_changed', newHostId: nh.id, newHostName: nh.name });
-                }
-                break;
-            }
-
-            case 'audio_data': {
-                if (!player.roomId) break;
-                broadcastToRoom(player.roomId, { type: 'audio_data', playerId: playerId, data: msg.data }, ws);
-                break;
-            }
-
-            case 'ghost_sync': {
-                if (!player.roomId) break;
-                broadcastToRoom(player.roomId, { type: 'ghost_sync', ghosts: msg.ghosts }, ws);
-                break;
-            }
-
-            case 'mic_state': {
-                if (!player.roomId) break;
-                broadcastToRoom(player.roomId, { type: 'mic_state', playerId: playerId, on: msg.on }, ws);
-                break;
-            }
-        }
-    });
-
-    ws.on('close', () => {
-        const pl = players.get(playerId);
-        if (pl) {
-            log('DISCONNECT', pl.name + ' disconnected (id=' + playerId + ')' + (pl.roomId ? ' from room ' + pl.roomId : ''));
-            if (pl.roomId) removePlayerFromRoom(pl);
-            players.delete(playerId);
-        }
-    });
-
-    ws.on('error', (err) => {
-        log('ERROR', 'WS error id=' + playerId + ': ' + err.message);
-        const pl = players.get(playerId);
-        if (pl) {
-            if (pl.roomId) removePlayerFromRoom(pl);
-            players.delete(playerId);
-        }
-    });
+  ws.on("close", () => {
+    handleDisconnect(player);
+    console.log(`[-] Player ${playerId} disconnected (${players.size} total)`);
+  });
 });
 
+// ── Message Router ─────────────────────────────────────────────────
+function handleMessage(ws, player, msg) {
+  const t = msg.type || "";
+
+  switch (t) {
+    // ── Connection / Identity ─────────────────────
+    case "ping":
+      handlePing(ws, msg);
+      break;
+    case "identify":
+      handleIdentify(ws, player, msg);
+      break;
+    case "set_name":
+      player.name = msg.name || "Player";
+      break;
+    case "set_region":
+      player.region = msg.region || "Asia";
+      broadcastOnlineCounts();
+      break;
+
+    // ── Room Management ───────────────────────────
+    case "get_rooms":
+      handleGetRooms(ws, player);
+      break;
+    case "get_online":
+      handleGetOnline(ws, player);
+      break;
+    case "create_room":
+      handleCreateRoom(ws, player, msg);
+      break;
+    case "join_room":
+      handleJoinRoom(ws, player, msg);
+      break;
+    case "quick_match":
+      handleQuickMatch(ws, player);
+      break;
+    case "leave_room":
+      handleLeaveRoom(ws, player);
+      break;
+
+    // ── Lobby ─────────────────────────────────────
+    case "toggle_ready":
+      handleToggleReady(ws, player);
+      break;
+    case "start_match":
+      handleStartMatch(ws, player);
+      break;
+    case "transfer_host":
+      handleTransferHost(ws, player, msg);
+      break;
+    case "kick_player":
+      handleKickPlayer(ws, player, msg);
+      break;
+
+    // ── Sync ──────────────────────────────────────
+    case "player_sync":
+      handlePlayerSync(ws, player, msg);
+      break;
+    case "player_damage":
+      handlePlayerDamage(ws, player, msg);
+      break;
+    case "player_lives":
+      handlePlayerLives(ws, player, msg);
+      break;
+    case "player_died":
+      handlePlayerDied(ws, player, msg);
+      break;
+    case "game_over_all":
+      handleGameOverAll(ws, player);
+      break;
+
+    // ── World ─────────────────────────────────────
+    case "door_sync":
+      handleDoorSync(ws, player, msg);
+      break;
+    case "item_drop":
+      handleItemDrop(ws, player, msg);
+      break;
+    case "item_pickup":
+      handleItemPickup(ws, player, msg);
+      break;
+    case "held_item":
+      handleHeldItem(ws, player, msg);
+      break;
+
+    // ── Ghosts ────────────────────────────────────
+    case "ghost_sync":
+      handleGhostSync(ws, player, msg);
+      break;
+    case "ghost_damage_relay":
+      handleGhostDamageRelay(ws, player, msg);
+      break;
+
+    // ── Weapons ───────────────────────────────────
+    case "weapon_sync":
+      handleWeaponSync(ws, player, msg);
+      break;
+
+    // ── Social ────────────────────────────────────
+    case "chat_message":
+      handleChatMessage(ws, player, msg);
+      break;
+    case "mic_state":
+      handleMicState(ws, player, msg);
+      break;
+    case "spectator_status":
+      handleSpectatorStatus(ws, player, msg);
+      break;
+
+    // ── Voice ─────────────────────────────────────
+    case "voice_join":
+    case "voice_leave":
+    case "voice_audio":
+      handleVoice(ws, player, msg);
+      break;
+
+    default:
+      break;
+  }
+}
+
+// ── Ping / Pong ────────────────────────────────────────────────────
+function handlePing(ws, msg) {
+  sendTo(ws, { type: "pong", time: msg.time });
+}
+
+// ── Identity / Account Conflict ────────────────────────────────────
+function handleIdentify(ws, player, msg) {
+  const profileId = msg.playerId || null;
+  const accountType = msg.accountType || "";
+  if (!profileId) return;
+
+  player.profileId = profileId;
+  player.accountType = accountType;
+
+  const existingWs = accountSessions.get(profileId);
+  if (existingWs && existingWs !== ws && existingWs.readyState === 1) {
+    sendTo(existingWs, {
+      type: "account_conflict",
+      message: "Your account has been logged in from another device.",
+    });
+    sendTo(existingWs, {
+      type: "error",
+      message: "Logged in from another device. Disconnecting.",
+    });
+    existingWs.close(4001, "Account conflict");
+  }
+  accountSessions.set(profileId, ws);
+}
+
+// ── Room Queries ───────────────────────────────────────────────────
+function handleGetRooms(ws, player) {
+  const region = player.region || "Asia";
+  const list = [];
+  for (const [, room] of rooms) {
+    if (room.isPrivate) continue;
+    if (room.region !== region && room.region !== "") continue;
+    list.push({
+      roomId: String(room.id),
+      roomName: room.name,
+      hostId: room.hostId,
+      playerCount: room.players.size,
+      teamSize: room.teamSize,
+      map: room.map,
+      region: room.region,
+      hasPassword: room.password !== "",
+      gameStarted: room.gameStarted,
+    });
+  }
+  sendTo(ws, { type: "room_list", rooms: list });
+}
+
+function handleGetOnline(ws, player) {
+  const region = player.region || "Asia";
+  const regionCounts = {};
+  let total = 0;
+  for (const [, p] of players) {
+    const r = p.region || "Asia";
+    regionCounts[r] = (regionCounts[r] || 0) + 1;
+    total++;
+  }
+  sendTo(ws, {
+    type: "online_count",
+    region,
+    count: regionCounts[region] || 0,
+    total,
+    regions: regionCounts,
+  });
+}
+
+// ── Create Room ────────────────────────────────────────────────────
+function handleCreateRoom(ws, player, msg) {
+  if (player.roomId !== null) {
+    return sendError(ws, "Already in a room");
+  }
+
+  const roomId = String(nextRoomId++);
+  const room = new Room(
+    roomId,
+    msg.roomName || "Room",
+    msg.password || "",
+    msg.teamSize || 4,
+    msg.map || "map",
+    msg.isPrivate || false,
+    msg.region || player.region || "Asia",
+    player.id
+  );
+
+  player.isHost = true;
+  player.roomId = roomId;
+  player.characterId = msg.characterId || player.characterId;
+  player.isReady = false;
+  room.players.set(player.id, ws);
+  rooms.set(roomId, room);
+
+  sendTo(ws, {
+    type: "room_created",
+    roomId: roomId,
+    roomName: room.name,
+    hostId: player.id,
+    teamSize: room.teamSize,
+    map: room.map,
+    region: room.region,
+    players: room.playerList(),
+  });
+
+  sendTo(ws, {
+    type: "room_joined",
+    roomId: roomId,
+    roomName: room.name,
+    hostId: player.id,
+    teamSize: room.teamSize,
+    map: room.map,
+    region: room.region,
+    items: room.items,
+    players: room.playerList(),
+    doors: room.doors,
+  });
+
+  broadcastOnlineCounts();
+  console.log(`[Room] ${player.name} created room ${roomId} (${room.name})`);
+}
+
+// ── Join Room ──────────────────────────────────────────────────────
+function handleJoinRoom(ws, player, msg) {
+  if (player.roomId !== null) {
+    return sendError(ws, "Already in a room");
+  }
+
+  const roomIdentifier = msg.roomId || msg.roomName || "";
+  let room = getRoomById(roomIdentifier);
+
+  // Try by name if not found by id
+  if (!room) {
+    for (const [, r] of rooms) {
+      if (r.name === roomIdentifier) {
+        room = r;
+        break;
+      }
+    }
+  }
+
+  if (!room) {
+    return sendError(ws, "Room not found");
+  }
+
+  if (room.gameStarted) {
+    return sendError(ws, "Game already started");
+  }
+
+  if (room.players.size >= (room.teamSize || 4)) {
+    return sendError(ws, "Room is full");
+  }
+
+  if (room.password && room.password !== (msg.password || "")) {
+    return sendError(ws, "Wrong password");
+  }
+
+  player.roomId = room.id;
+  player.characterId = msg.characterId || player.characterId;
+  player.isReady = false;
+  player.isHost = false;
+  room.players.set(player.id, ws);
+
+  // Notify existing players
+  room.broadcast({
+    type: "player_joined",
+    playerId: player.id,
+    name: player.name,
+    characterId: player.characterId,
+    isHost: player.isHost,
+  }, ws);
+
+  // Send room state to joiner
+  sendTo(ws, {
+    type: "room_joined",
+    roomId: room.id,
+    roomName: room.name,
+    hostId: room.hostId,
+    teamSize: room.teamSize,
+    map: room.map,
+    region: room.region,
+    items: room.items,
+    players: room.playerList(),
+    doors: room.doors,
+  });
+
+  broadcastOnlineCounts();
+  console.log(`[Room] ${player.name} joined room ${room.id}`);
+}
+
+// ── Quick Match ────────────────────────────────────────────────────
+function handleQuickMatch(ws, player) {
+  if (player.roomId !== null) {
+    return sendError(ws, "Already in a room");
+  }
+
+  // Find an open room in same region
+  for (const [, room] of rooms) {
+    if (room.region !== player.region) continue;
+    if (room.gameStarted) continue;
+    if (room.isPrivate) continue;
+    if (room.players.size >= (room.teamSize || 4)) continue;
+    if (room.password) continue;
+
+    player.roomId = room.id;
+    player.characterId = "player";
+    player.isReady = false;
+    player.isHost = false;
+    room.players.set(player.id, ws);
+
+    room.broadcast({
+      type: "player_joined",
+      playerId: player.id,
+      name: player.name,
+      characterId: player.characterId,
+      isHost: false,
+    }, ws);
+
+    sendTo(ws, {
+      type: "room_joined",
+      roomId: room.id,
+      roomName: room.name,
+      hostId: room.hostId,
+      teamSize: room.teamSize,
+      map: room.map,
+      region: room.region,
+      items: room.items,
+      players: room.playerList(),
+      doors: room.doors,
+    });
+
+    broadcastOnlineCounts();
+    console.log(`[Room] ${player.name} quick-matched into room ${room.id}`);
+    return;
+  }
+
+  // No room found → create one
+  handleCreateRoom(ws, player, {
+    roomName: player.name + "'s Room",
+    teamSize: 4,
+    map: "map",
+    region: player.region,
+    characterId: "player",
+  });
+}
+
+// ── Leave Room ─────────────────────────────────────────────────────
+function handleLeaveRoom(ws, player) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  room.players.delete(player.id);
+  player.roomId = null;
+  player.isHost = false;
+  player.isReady = false;
+
+  room.broadcast({
+    type: "player_left",
+    playerId: player.id,
+    name: player.name,
+  });
+
+  // Transfer host if needed
+  if (room.players.size > 0 && room.hostId === player.id) {
+    const [newHostWs] = room.players.values();
+    const newHost = getPlayerByWs(newHostWs);
+    if (newHost) {
+      newHost.isHost = true;
+      room.hostId = newHost.id;
+      room.broadcast({
+        type: "host_changed",
+        hostId: newHost.id,
+        name: newHost.name,
+      });
+    }
+  } else if (room.players.size === 0) {
+    rooms.delete(room.id);
+    console.log(`[Room] Room ${room.id} deleted (empty)`);
+  }
+
+  broadcastOnlineCounts();
+  console.log(`[Room] ${player.name} left room ${room.id}`);
+}
+
+// ── Toggle Ready ───────────────────────────────────────────────────
+function handleToggleReady(ws, player) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  player.isReady = !player.isReady;
+  room.broadcast({
+    type: "player_ready_changed",
+    playerId: player.id,
+    isReady: player.isReady,
+  });
+}
+
+// ── Start Match ────────────────────────────────────────────────────
+function handleStartMatch(ws, player) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+  if (room.hostId !== player.id) {
+    return sendError(ws, "Only the host can start the match");
+  }
+
+  room.gameStarted = true;
+  room.broadcast({
+    type: "game_start",
+    map: room.map,
+    hostId: room.hostId,
+    players: room.playerList(),
+    teamSize: room.teamSize,
+  });
+
+  console.log(`[Room] Match started in room ${room.id}`);
+}
+
+// ── Transfer Host ──────────────────────────────────────────────────
+function handleTransferHost(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+  if (room.hostId !== player.id) {
+    return sendError(ws, "Only the host can transfer host");
+  }
+
+  const targetId = msg.targetId;
+  const targetWs = room.players.get(targetId);
+  if (!targetWs) {
+    return sendError(ws, "Target player not in room");
+  }
+
+  const target = getPlayerByWs(targetWs);
+  if (!target) return;
+
+  player.isHost = false;
+  target.isHost = true;
+  room.hostId = target.id;
+
+  room.broadcast({
+    type: "host_changed",
+    hostId: target.id,
+    name: target.name,
+  });
+
+  console.log(`[Room] Host transferred to ${target.name} in room ${room.id}`);
+}
+
+// ── Kick Player ────────────────────────────────────────────────────
+function handleKickPlayer(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+  if (room.hostId !== player.id) {
+    return sendError(ws, "Only the host can kick players");
+  }
+
+  const targetId = msg.targetId;
+  const targetWs = room.players.get(targetId);
+  if (!targetWs) return;
+
+  const target = getPlayerByWs(targetWs);
+  if (!target) return;
+
+  room.broadcast({
+    type: "player_kicked",
+    playerId: target.id,
+    name: target.name,
+  });
+
+  room.players.delete(target.id);
+  target.roomId = null;
+  target.isHost = false;
+  target.isReady = false;
+
+  sendTo(targetWs, {
+    type: "player_kicked",
+    playerId: target.id,
+    name: target.name,
+  });
+
+  sendError(targetWs, "You have been kicked from the room");
+
+  broadcastOnlineCounts();
+  console.log(`[Room] ${target.name} kicked from room ${room.id}`);
+}
+
+// ── Player Sync ────────────────────────────────────────────────────
+function handlePlayerSync(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  if (msg.position) player.position = msg.position;
+  if (msg.rotation !== undefined) player.rotation = msg.rotation;
+  if (msg.animation) player.animation = msg.animation;
+  if (msg.crouching !== undefined) player.crouching = msg.crouching;
+  if (msg.flashlight !== undefined) player.flashlight = msg.flashlight;
+  if (msg.health !== undefined) player.health = msg.health;
+  if (msg.heldItem !== undefined) player.heldItem = msg.heldItem;
+  if (msg.inventory) player.inventory = msg.inventory;
+  if (msg.hidden !== undefined) player.hidden = msg.hidden;
+  if (msg.characterId) player.characterId = msg.characterId;
+
+  const sync = {
+    type: "player_sync",
+    playerId: player.id,
+    name: player.name,
+    position: player.position,
+    rotation: player.rotation,
+    animation: player.animation,
+    crouching: player.crouching,
+    flashlight: player.flashlight,
+    health: player.health,
+    heldItem: player.heldItem,
+    inventory: player.inventory,
+    hidden: player.hidden,
+    characterId: player.characterId,
+  };
+
+  if (msg.doorEvent && Object.keys(msg.doorEvent).length > 0) {
+    sync.doorEvent = msg.doorEvent;
+    room.doors[msg.doorEvent.doorPath] = msg.doorEvent.isOpen;
+  }
+
+  room.broadcast(sync, ws);
+}
+
+// ── Player Damage ──────────────────────────────────────────────────
+function handlePlayerDamage(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  const targetWs = room.players.get(msg.targetId);
+  if (!targetWs) return;
+
+  sendTo(targetWs, {
+    type: "player_damage",
+    playerId: player.id,
+    damage: msg.damage || 0,
+  });
+}
+
+// ── Player Lives ───────────────────────────────────────────────────
+function handlePlayerLives(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  player.lives = msg.lives || 0;
+  player.health = msg.health || 0;
+
+  room.broadcast({
+    type: "player_lives",
+    playerId: player.id,
+    lives: player.lives,
+    health: player.health,
+  }, ws);
+}
+
+// ── Player Died ────────────────────────────────────────────────────
+function handlePlayerDied(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  room.broadcast({
+    type: "player_death",
+    playerId: player.id,
+    deadId: msg.deadId || player.id,
+    deadName: msg.deadName || player.name,
+  }, ws);
+}
+
+// ── Game Over ──────────────────────────────────────────────────────
+function handleGameOverAll(ws, player) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+  if (room.hostId !== player.id) return;
+
+  room.gameStarted = false;
+  room.broadcast({ type: "game_over_all" });
+
+  // Reset ready states
+  for (const [pid] of room.players) {
+    const p = getPlayerByWs(room.players.get(pid));
+    if (p) p.isReady = false;
+  }
+}
+
+// ── Door Sync ──────────────────────────────────────────────────────
+function handleDoorSync(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  const doorPath = msg.doorPath || "";
+  const isOpen = msg.isOpen || false;
+  room.doors[doorPath] = isOpen;
+
+  room.broadcast({
+    type: "door_sync",
+    playerId: player.id,
+    doorPath: doorPath,
+    isOpen: isOpen,
+  }, ws);
+}
+
+// ── Item Drop ──────────────────────────────────────────────────────
+function handleItemDrop(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  const item = {
+    id: msg.id || crypto.randomUUID(),
+    itemType: msg.itemType || "unknown",
+    position: msg.position || { x: 0, y: 0, z: 0 },
+    droppedBy: player.id,
+  };
+  room.items.push(item);
+
+  room.broadcast({
+    type: "item_drop",
+    playerId: player.id,
+    id: item.id,
+    itemType: item.itemType,
+    position: item.position,
+  }, ws);
+}
+
+// ── Item Pickup ────────────────────────────────────────────────────
+function handleItemPickup(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  const itemId = msg.id || "";
+  room.items = room.items.filter((i) => i.id !== itemId);
+
+  room.broadcast({
+    type: "item_pickup",
+    playerId: player.id,
+    id: itemId,
+  }, ws);
+}
+
+// ── Held Item ──────────────────────────────────────────────────────
+function handleHeldItem(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  player.heldItem = msg.item || "";
+  room.broadcast({
+    type: "player_sync",
+    playerId: player.id,
+    heldItem: player.heldItem,
+  }, ws);
+}
+
+// ── Ghost Sync ─────────────────────────────────────────────────────
+function handleGhostSync(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  room.ghosts = msg.ghosts || [];
+  room.broadcast({
+    type: "ghost_sync",
+    playerId: player.id,
+    ghosts: room.ghosts,
+  }, ws);
+}
+
+function handleGhostDamageRelay(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  room.broadcast({
+    type: "ghost_damage",
+    playerId: player.id,
+    targetId: msg.targetId,
+    damage: msg.damage || 0,
+  }, ws);
+}
+
+// ── Weapon Sync ────────────────────────────────────────────────────
+function handleWeaponSync(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  room.broadcast({
+    type: "weapon_sync",
+    playerId: player.id,
+    data: msg.data || {},
+  }, ws);
+}
+
+// ── Chat ───────────────────────────────────────────────────────────
+function handleChatMessage(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  const text = (msg.text || "").substring(0, 200);
+  if (!text) return;
+
+  room.broadcast({
+    type: "chat_message",
+    playerId: player.id,
+    name: player.name,
+    text: text,
+  });
+}
+
+// ── Mic State ──────────────────────────────────────────────────────
+function handleMicState(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  room.broadcast({
+    type: "mic_state",
+    playerId: player.id,
+    on: msg.on || false,
+  }, ws);
+}
+
+// ── Spectator ──────────────────────────────────────────────────────
+function handleSpectatorStatus(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  player.isSpectating = msg.spectating || false;
+  room.broadcast({
+    type: "spectator_status",
+    playerId: player.id,
+    spectating: player.isSpectating,
+  }, ws);
+}
+
+// ── Voice (relay to room) ─────────────────────────────────────────
+function handleVoice(ws, player, msg) {
+  const room = getRoomForPlayer(player);
+  if (!room) return;
+
+  msg.playerId = player.id;
+  room.broadcast(msg, ws);
+}
+
+// ── Disconnect ─────────────────────────────────────────────────────
+function handleDisconnect(player) {
+  if (player.profileId && accountSessions.get(player.profileId) === player.ws) {
+    accountSessions.delete(player.profileId);
+  }
+
+  const room = getRoomForPlayer(player);
+  if (room) {
+    room.players.delete(player.id);
+
+    room.broadcast({
+      type: "player_left",
+      playerId: player.id,
+      name: player.name,
+    });
+
+    if (room.players.size > 0 && room.hostId === player.id) {
+      const [newHostWs] = room.players.values();
+      const newHost = getPlayerByWs(newHostWs);
+      if (newHost) {
+        newHost.isHost = true;
+        room.hostId = newHost.id;
+        room.broadcast({
+          type: "host_changed",
+          hostId: newHost.id,
+          name: newHost.name,
+        });
+      }
+    } else if (room.players.size === 0) {
+      rooms.delete(room.id);
+    }
+  }
+
+  players.delete(player.ws);
+  broadcastOnlineCounts();
+}
+
+// ── HTTP Health ────────────────────────────────────────────────────
+app.get("/", (req, res) => {
+  res.json({
+    status: "ok",
+    game: "Dark Ward",
+    players: players.size,
+    rooms: rooms.size,
+    uptime: process.uptime(),
+  });
+});
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+// ── Start ──────────────────────────────────────────────────────────
 server.listen(PORT, () => {
-    log('SERVER', '=========================================');
-    log('SERVER', 'DARK WARD GAME Server running');
-    log('SERVER', 'Port: ' + PORT);
-    log('SERVER', 'Game WS: ws://0.0.0.0:' + PORT);
-    log('SERVER', 'Status: http://0.0.0.0:' + PORT + '/status');
-    log('SERVER', '=========================================');
+  console.log(`====================================`);
+  console.log(`  Dark Ward Server`);
+  console.log(`  Port: ${PORT}`);
+  console.log(`  WebSocket: ws://localhost:${PORT}`);
+  console.log(`====================================`);
+});
+
+// ── Cleanup on exit ────────────────────────────────────────────────
+process.on("SIGTERM", () => {
+  clearInterval(heartbeatInterval);
+  wss.close();
+  server.close();
+  process.exit(0);
 });
