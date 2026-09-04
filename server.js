@@ -3,7 +3,6 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 7777;
 
-// ── HTTP ────────────────────────────────────────────
 const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
@@ -19,13 +18,8 @@ const server = http.createServer((req, res) => {
     const list = Object.entries(rooms)
       .filter(([, r]) => r.players.length < r.maxPlayers)
       .map(([code, room]) => ({
-        code,
-        name: room.roomName,
-        players: room.players.length,
-        maxPlayers: room.maxPlayers,
-        region: room.region,
-        mode: room.mode,
-        host: room.hostName,
+        code, name: room.roomName, players: room.players.length,
+        maxPlayers: room.maxPlayers, region: room.region, mode: room.mode, host: room.hostName,
       }));
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ rooms: list }));
@@ -35,8 +29,7 @@ const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
-      status: "ok",
-      rooms: Object.keys(rooms).length,
+      status: "ok", rooms: Object.keys(rooms).length,
       players: Object.values(rooms).reduce((a, r) => a + r.players.length, 0),
     }));
     return;
@@ -46,7 +39,6 @@ const server = http.createServer((req, res) => {
   res.end("Night Ward Server v3.0 - Running");
 });
 
-// ── WEBSOCKET ──────────────────────────────────────
 const wss = new WebSocketServer({ server });
 const rooms = {};
 
@@ -61,9 +53,19 @@ function broadcast(code, data, exclude) {
   if (!rooms[code]) return;
   const msg = JSON.stringify(data);
   rooms[code].players.forEach((p) => {
-    if (p.ws !== exclude && p.ws.readyState === 1) {
+    if (p.ws !== exclude && p.ws.readyState === 1) p.ws.send(msg);
+  });
+}
+
+function sendToAll(code, data) {
+  if (!rooms[code]) return;
+  const msg = JSON.stringify(data);
+  rooms[code].players.forEach((p) => {
+    if (p.ws.readyState === 1) {
       p.ws.send(msg);
-      console.log(`[BROADCAST] Sent '${data.type}' to Player ${p.id} '${p.name}'`);
+      console.log(`[SEND] Sent '${data.type}' to Player ${p.id} '${p.name}'`);
+    } else {
+      console.log(`[SEND] SKIP Player ${p.id} (readyState=${p.ws.readyState})`);
     }
   });
 }
@@ -73,15 +75,7 @@ function send(ws, data) {
 }
 
 function playerPublic(p) {
-  return {
-    id: p.id,
-    name: p.name,
-    characterId: p.characterId,
-    ready: p.ready,
-    slot: p.slot,
-    position: p.position,
-    rotation: p.rotation,
-  };
+  return { id: p.id, name: p.name, characterId: p.characterId, ready: p.ready, slot: p.slot, position: p.position, rotation: p.rotation };
 }
 
 function roomPlayers(code) {
@@ -92,7 +86,6 @@ function findPlayer(code, ws) {
   return rooms[code]?.players.find((p) => p.ws === ws);
 }
 
-// ── HANDLER ────────────────────────────────────────
 wss.on("connection", (ws) => {
   let currentRoom = null;
 
@@ -100,19 +93,16 @@ wss.on("connection", (ws) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
-    // ── CREATE ROOM ─────────────────────────────────
     if (msg.type === "create_room") {
       const code = genCode();
       rooms[code] = {
-        host: ws,
-        hostName: msg.playerName || "Host",
+        host: ws, hostName: msg.playerName || "Host",
         roomName: msg.roomName || "Night Ward",
         region: msg.region || "ASIA",
         mode: msg.mode || "SURVIVAL",
         maxPlayers: msg.maxPlayers || 4,
         players: [{
-          ws, id: 1,
-          name: msg.playerName || "Host",
+          ws, id: 1, name: msg.playerName || "Host",
           characterId: msg.characterId || 0,
           ready: false, slot: 1,
           position: { x: 0, y: 0, z: 0 },
@@ -121,18 +111,13 @@ wss.on("connection", (ws) => {
       };
       currentRoom = code;
       send(ws, {
-        type: "room_created",
-        roomCode: code,
-        roomName: rooms[code].roomName,
-        region: rooms[code].region,
-        mode: rooms[code].mode,
-        playerId: 1,
-        maxPlayers: rooms[code].maxPlayers,
+        type: "room_created", roomCode: code,
+        roomName: rooms[code].roomName, region: rooms[code].region,
+        mode: rooms[code].mode, playerId: 1, maxPlayers: rooms[code].maxPlayers,
       });
-      console.log(`[CREATE] ${msg.playerName} → ${code} (${rooms[code].roomName})`);
+      console.log(`[CREATE] ${msg.playerName} → ${code}`);
     }
 
-    // ── JOIN ROOM ───────────────────────────────────
     if (msg.type === "join_room") {
       const code = (msg.roomCode || "").toUpperCase().trim();
       if (!rooms[code]) { send(ws, { type: "error", message: "Room not found." }); return; }
@@ -141,8 +126,7 @@ wss.on("connection", (ws) => {
 
       const pid = room.players.length + 1;
       const player = {
-        ws, id: pid,
-        name: msg.playerName || "Player",
+        ws, id: pid, name: msg.playerName || "Player",
         characterId: msg.characterId || 0,
         ready: false, slot: pid,
         position: { x: 0, y: 0, z: 0 },
@@ -152,20 +136,14 @@ wss.on("connection", (ws) => {
       currentRoom = code;
 
       send(ws, {
-        type: "room_joined",
-        roomCode: code,
-        roomName: room.roomName,
-        region: room.region,
-        mode: room.mode,
-        playerId: pid,
-        maxPlayers: room.maxPlayers,
-        players: roomPlayers(code),
+        type: "room_joined", roomCode: code,
+        roomName: room.roomName, region: room.region,
+        mode: room.mode, playerId: pid,
+        maxPlayers: room.maxPlayers, players: roomPlayers(code),
       });
 
       broadcast(code, {
-        type: "player_joined",
-        player: playerPublic(player),
-        players: roomPlayers(code),
+        type: "player_joined", player: playerPublic(player), players: roomPlayers(code),
       }, ws);
 
       console.log(`[JOIN] ${player.name} → ${code} as #${pid}`);
@@ -175,7 +153,6 @@ wss.on("connection", (ws) => {
     const room = rooms[currentRoom];
     const player = findPlayer(currentRoom, ws);
 
-    // ── SET CHARACTER ───────────────────────────────
     if (msg.type === "set_character") {
       if (player) {
         player.characterId = msg.characterId;
@@ -183,7 +160,6 @@ wss.on("connection", (ws) => {
       }
     }
 
-    // ── SET READY ───────────────────────────────────
     if (msg.type === "set_ready") {
       if (player) {
         player.ready = !!msg.ready;
@@ -191,7 +167,6 @@ wss.on("connection", (ws) => {
       }
     }
 
-    // ── SET MODE ────────────────────────────────────
     if (msg.type === "set_mode") {
       if (ws === room.host?.ws) {
         room.mode = msg.mode || room.mode;
@@ -199,50 +174,34 @@ wss.on("connection", (ws) => {
       }
     }
 
-    // ── START GAME ──────────────────────────────────
     if (msg.type === "start_game") {
       if (ws === room.host?.ws) {
-        const gameData = {
-          type: "game_start",
-          mode: room.mode,
-          players: roomPlayers(currentRoom),
-        };
-        console.log(`[START] ${currentRoom} by ${player?.name}`);
-        console.log(`[START] Players in room: ${room.players.length}`);
-        room.players.forEach((p) => {
-          console.log(`[START] → Player ${p.id} '${p.name}' ws.readyState=${p.ws.readyState}`);
-        });
-        broadcast(currentRoom, gameData);
-        console.log(`[START] game_start broadcast sent to ALL ${room.players.length} players!`);
+        const gameData = { type: "game_start", mode: room.mode, players: roomPlayers(currentRoom) };
+        console.log(`[START] ${currentRoom} mode=${room.mode} players=${room.players.length}`);
+        sendToAll(currentRoom, gameData);
+        console.log(`[START] Done!`);
       }
     }
 
-    // ── PLAYER MOVEMENT ─────────────────────────────
     if (msg.type === "player_move") {
       if (player) {
         player.position = msg.position || player.position;
         player.rotation = msg.rotation || player.rotation;
         broadcast(currentRoom, {
-          type: "player_moved",
-          id: player.id,
-          position: player.position,
-          rotation: player.rotation,
+          type: "player_moved", id: player.id,
+          position: player.position, rotation: player.rotation,
         }, ws);
       }
     }
 
-    // ── DOOR SYNC ───────────────────────────────────
     if (msg.type === "door_sync") {
       broadcast(currentRoom, {
-        type: "door_update",
-        doorId: msg.doorId,
-        isOpen: msg.isOpen,
-        playerId: player?.id,
+        type: "door_update", doorId: msg.doorId,
+        isOpen: msg.isOpen, playerId: player?.id,
       }, ws);
     }
   });
 
-  // ── DISCONNECT ──────────────────────────────────
   ws.on("close", () => {
     if (!currentRoom || !rooms[currentRoom]) return;
     const room = rooms[currentRoom];
@@ -252,17 +211,12 @@ wss.on("connection", (ws) => {
       delete rooms[currentRoom];
       console.log(`[DELETE] Room ${currentRoom} empty.`);
     } else {
-      broadcast(currentRoom, {
-        type: "player_left",
-        playerId: null,
-        players: roomPlayers(currentRoom),
-      });
+      broadcast(currentRoom, { type: "player_left", playerId: null, players: roomPlayers(currentRoom) });
       console.log(`[LEFT] Player from ${currentRoom}`);
     }
   });
 });
 
-// ── CLEANUP STALE ROOMS ───────────────────────────
 setInterval(() => {
   Object.keys(rooms).forEach((code) => {
     const alive = rooms[code].players.filter((p) => p.ws.readyState === 1);
