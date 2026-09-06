@@ -8,11 +8,7 @@ const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
   if (req.url === "/rooms") {
     const list = Object.entries(rooms)
@@ -36,7 +32,7 @@ const server = http.createServer((req, res) => {
   }
 
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Night Ward Server v3.1 - Running");
+  res.end("Night Ward Server v3.2 - Running");
 });
 
 const wss = new WebSocketServer({ server });
@@ -93,21 +89,23 @@ wss.on("connection", (ws) => {
   let currentRoom = null;
   allClients.add(ws);
 
-  ws.on("message", (raw) => {
-    // Binary = voice data, relay to room
-    if (Buffer.isBuffer(raw)) {
+  ws.on("message", (raw, isBinary) => {
+    // ── BINARY = VOICE DATA ──
+    if (isBinary) {
       if (currentRoom && rooms[currentRoom]) {
+        const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
         rooms[currentRoom].players.forEach((p) => {
-          if (p.ws !== ws && p.ws.readyState === 1) p.ws.send(raw);
+          if (p.ws !== ws && p.ws.readyState === 1) p.ws.send(buf);
         });
       }
       return;
     }
 
+    // ── TEXT = JSON MESSAGES ──
     let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    // ── CREATE ROOM ─────────────────────────────
+    // ── CREATE ROOM ───────────────────────────
     if (msg.type === "create_room") {
       const code = genCode();
       rooms[code] = {
@@ -134,9 +132,10 @@ wss.on("connection", (ws) => {
         mode: rooms[code].mode, playerId: 1, maxPlayers: rooms[code].maxPlayers,
       });
       console.log(`[CREATE] ${msg.playerName} (${msg.loginType || "guest"}) → ${code}`);
+      return;
     }
 
-    // ── JOIN ROOM ───────────────────────────────
+    // ── JOIN ROOM ────────────────────────────
     if (msg.type === "join_room") {
       const code = (msg.roomCode || "").toUpperCase().trim();
       if (!rooms[code]) { send(ws, { type: "error", message: "Room not found." }); return; }
@@ -145,26 +144,19 @@ wss.on("connection", (ws) => {
 
       const joinLoginType = msg.loginType || "guest";
       const hostLoginType = room.loginType || "guest";
-      const joinIsGuest = (joinLoginType === "guest");
-      const hostIsGuest = (hostLoginType === "guest");
-      if (joinIsGuest !== hostIsGuest) {
-        send(ws, { type: "error", message: joinIsGuest ? "Guests can only play with other guests." : "This room only accepts logged-in players." });
-        console.log(`[JOIN] REJECTED ${msg.playerName} (${joinLoginType}) — room requires ${hostLoginType}`);
+      if ((joinLoginType === "guest") !== (hostLoginType === "guest")) {
+        send(ws, { type: "error", message: joinLoginType === "guest" ? "Guests can only play with other guests." : "This room only accepts logged-in players." });
         return;
       }
 
       const joinUserId = msg.userId || "";
       if (joinUserId && room.players.some((p) => p.userId === joinUserId)) {
-        send(ws, { type: "error", message: "This account is already in the room." });
-        console.log(`[JOIN] REJECTED ${msg.playerName} — duplicate account in room`);
-        return;
+        send(ws, { type: "error", message: "This account is already in the room." }); return;
       }
       if (joinUserId) {
         for (const [rCode, r] of Object.entries(rooms)) {
           if (rCode !== code && r.players.some((p) => p.userId === joinUserId)) {
-            send(ws, { type: "error", message: "This account is already in another room." });
-            console.log(`[JOIN] REJECTED ${msg.playerName} — account in room ${rCode}`);
-            return;
+            send(ws, { type: "error", message: "This account is already in another room." }); return;
           }
         }
       }
@@ -173,8 +165,7 @@ wss.on("connection", (ws) => {
       const player = {
         ws, id: pid, name: msg.playerName || "Player",
         characterId: msg.characterId || 0,
-        loginType: joinLoginType,
-        userId: joinUserId,
+        loginType: joinLoginType, userId: joinUserId,
         ready: false, slot: pid,
         position: { x: 0, y: 0, z: 0 },
         rotation: { x: 0, y: 0, z: 0, w: 1 },
@@ -190,30 +181,29 @@ wss.on("connection", (ws) => {
       });
       broadcast(code, { type: "player_joined", player: playerPublic(player), players: roomPlayers(code) }, ws);
       console.log(`[JOIN] ${player.name} (${joinLoginType}) → ${code} as #${pid}`);
+      return;
     }
 
+    // ── PING ──────────────────────────────────
     if (msg.type === "ping") { send(ws, { type: "pong", room: currentRoom }); return; }
 
-    // ── GLOBAL CHAT (no room needed) ────────────
+    // ── GLOBAL CHAT ───────────────────────────
     if (msg.type === "chat_global") {
-      const senderName = msg.sender || "Player";
       const text = (msg.text || "").substring(0, 200);
       if (text.length === 0) return;
-      sendGlobal({ type: "chat_global", sender: senderName, text: text, ts: Date.now() });
-      console.log(`[CHAT-GLOBAL] ${senderName}: ${text}`);
+      sendGlobal({ type: "chat_global", sender: msg.sender || "Player", text, ts: Date.now() });
       return;
     }
 
-    // ── ROOM CHAT ───────────────────────────────
+    // ── ROOM CHAT ─────────────────────────────
     if (msg.type === "chat_room") {
-      const senderName = msg.sender || "Player";
       const text = (msg.text || "").substring(0, 200);
       if (text.length === 0 || !currentRoom) return;
-      broadcast(currentRoom, { type: "chat_room", sender: senderName, text: text, ts: Date.now() });
-      console.log(`[CHAT-ROOM] ${currentRoom} ${senderName}: ${text}`);
+      broadcast(currentRoom, { type: "chat_room", sender: msg.sender || "Player", text, ts: Date.now() });
       return;
     }
 
+    // ── BELOW THIS POINT: MUST BE IN A ROOM ──
     if (!currentRoom || !rooms[currentRoom]) return;
     const room = rooms[currentRoom];
     const player = findPlayer(currentRoom, ws);
@@ -225,29 +215,31 @@ wss.on("connection", (ws) => {
 
     if (msg.type === "set_character") {
       if (player) { player.characterId = msg.characterId; broadcast(currentRoom, { type: "lobby_update", players: roomPlayers(currentRoom) }); }
+      return;
     }
 
     if (msg.type === "set_ready") {
       if (player) { player.ready = !!msg.ready; broadcast(currentRoom, { type: "lobby_update", players: roomPlayers(currentRoom) }); }
+      return;
     }
 
-    // ── KICK (host only) ────────────────────────
     if (msg.type === "kick_player") {
       if (ws === room.host) {
-        const targetId = msg.targetId;
-        const target = room.players.find((p) => p.id === targetId);
+        const target = room.players.find((p) => p.id === msg.targetId);
         if (target && target.ws !== room.host) {
           send(target.ws, { type: "kicked", reason: "Kicked by host" });
           target.ws.close();
-          room.players = room.players.filter((p) => p.id !== targetId);
+          room.players = room.players.filter((p) => p.id !== msg.targetId);
           broadcast(currentRoom, { type: "lobby_update", players: roomPlayers(currentRoom) });
           console.log(`[KICK] ${target.name} kicked from ${currentRoom}`);
         }
       }
+      return;
     }
 
     if (msg.type === "set_mode") {
       if (ws === room.host) { room.mode = msg.mode || room.mode; broadcast(currentRoom, { type: "mode_changed", mode: room.mode, players: roomPlayers(currentRoom) }); }
+      return;
     }
 
     if (msg.type === "start_game") {
@@ -256,18 +248,22 @@ wss.on("connection", (ws) => {
         console.log(`[START] ${currentRoom} mode=${room.mode} players=${room.players.length}`);
         sendToAll(currentRoom, { type: "game_start", mode: room.mode, players: roomPlayers(currentRoom) });
       }
+      return;
     }
 
     if (msg.type === "player_move") {
       if (player) { player.position = msg.position || player.position; player.rotation = msg.rotation || player.rotation; broadcast(currentRoom, { type: "player_moved", id: player.id, position: player.position, rotation: player.rotation }, ws); }
+      return;
     }
 
     if (msg.type === "emote") {
       if (player) broadcast(currentRoom, { type: "emote", playerId: player.id, anim: msg.anim }, ws);
+      return;
     }
 
     if (msg.type === "door_sync") {
       broadcast(currentRoom, { type: "door_update", doorId: msg.doorId, isOpen: msg.isOpen, playerId: player?.id }, ws);
+      return;
     }
   });
 
@@ -276,19 +272,19 @@ wss.on("connection", (ws) => {
     if (!currentRoom || !rooms[currentRoom]) return;
     const room = rooms[currentRoom];
     room.players = room.players.filter((p) => p.ws !== ws);
-    if (room.players.length === 0) { delete rooms[currentRoom]; console.log(`[DELETE] Room ${currentRoom} empty.`); }
-    else { broadcast(currentRoom, { type: "player_left", playerId: null, players: roomPlayers(currentRoom) }); console.log(`[LEFT] Player from ${currentRoom}`); }
+    if (room.players.length === 0) { delete rooms[currentRoom]; console.log(`[DELETE] Room ${currentRoom}`); }
+    else { broadcast(currentRoom, { type: "player_left", playerId: null, players: roomPlayers(currentRoom) }); }
   });
 });
 
 setInterval(() => {
   Object.keys(rooms).forEach((code) => {
     const alive = rooms[code].players.filter((p) => p.ws.readyState === 1);
-    if (alive.length === 0) { delete rooms[code]; console.log(`[GC] Room ${code} cleaned.`); }
+    if (alive.length === 0) delete rooms[code];
     else rooms[code].players = alive;
   });
 }, 30000);
 
 server.listen(PORT, () => {
-  console.log(`Night Ward Server v3.1 on port ${PORT}`);
+  console.log(`Night Ward Server v3.2 on port ${PORT}`);
 });
