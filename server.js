@@ -32,7 +32,7 @@ const server = http.createServer((req, res) => {
   }
 
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Night Ward Server v3.2 - Running");
+  res.end("Night Ward Server v4.1 - Running");
 });
 
 const wss = new WebSocketServer({ server });
@@ -90,7 +90,6 @@ wss.on("connection", (ws) => {
   allClients.add(ws);
 
   ws.on("message", (raw, isBinary) => {
-    // ── BINARY = VOICE DATA ──
     if (isBinary) {
       if (currentRoom && rooms[currentRoom]) {
         const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
@@ -101,11 +100,9 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ── TEXT = JSON MESSAGES ──
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-    // ── CREATE ROOM ───────────────────────────
     if (msg.type === "create_room") {
       const code = genCode();
       rooms[code] = {
@@ -135,7 +132,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ── JOIN ROOM ────────────────────────────
     if (msg.type === "join_room") {
       const code = (msg.roomCode || "").toUpperCase().trim();
       if (!rooms[code]) { send(ws, { type: "error", message: "Room not found." }); return; }
@@ -184,10 +180,8 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ── PING ──────────────────────────────────
     if (msg.type === "ping") { send(ws, { type: "pong", room: currentRoom }); return; }
 
-    // ── GLOBAL CHAT ───────────────────────────
     if (msg.type === "chat_global") {
       const text = (msg.text || "").substring(0, 200);
       if (text.length === 0) return;
@@ -195,7 +189,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ── ROOM CHAT ─────────────────────────────
     if (msg.type === "chat_room") {
       const text = (msg.text || "").substring(0, 200);
       if (text.length === 0 || !currentRoom) return;
@@ -203,7 +196,6 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // ── BELOW THIS POINT: MUST BE IN A ROOM ──
     if (!currentRoom || !rooms[currentRoom]) return;
     const room = rooms[currentRoom];
     const player = findPlayer(currentRoom, ws);
@@ -230,7 +222,7 @@ wss.on("connection", (ws) => {
           send(target.ws, { type: "kicked", reason: "Kicked by host" });
           target.ws.close();
           room.players = room.players.filter((p) => p.id !== msg.targetId);
-          broadcast(currentRoom, { type: "lobby_update", players: roomPlayers(currentRoom) });
+          sendToAll(currentRoom, { type: "player_left", playerId: msg.targetId, players: roomPlayers(currentRoom) });
           console.log(`[KICK] ${target.name} kicked from ${currentRoom}`);
         }
       }
@@ -252,17 +244,39 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.type === "player_move") {
-      if (player) { player.position = msg.position || player.position; player.rotation = msg.rotation || player.rotation; broadcast(currentRoom, { type: "player_moved", id: player.id, position: player.position, rotation: player.rotation }, ws); }
+      if (player) {
+        player.position = msg.position || player.position;
+        player.rotation = msg.rotation || player.rotation;
+        broadcast(currentRoom, {
+          type: "player_moved", id: player.id,
+          position: player.position, rotation: player.rotation,
+        }, ws);
+      }
+      return;
+    }
+
+    if (msg.type === "ghost_move") {
+      broadcast(currentRoom, {
+        type: "ghost_moved",
+        position: msg.position,
+        rotation: msg.rotation,
+        state: msg.state,
+      }, ws);
+      return;
+    }
+
+    if (msg.type === "door_sync") {
+      broadcast(currentRoom, {
+        type: "door_update",
+        doorId: msg.doorId,
+        isOpen: msg.isOpen,
+        playerId: player?.id,
+      }, ws);
       return;
     }
 
     if (msg.type === "emote") {
       if (player) broadcast(currentRoom, { type: "emote", playerId: player.id, anim: msg.anim }, ws);
-      return;
-    }
-
-    if (msg.type === "door_sync") {
-      broadcast(currentRoom, { type: "door_update", doorId: msg.doorId, isOpen: msg.isOpen, playerId: player?.id }, ws);
       return;
     }
   });
@@ -286,5 +300,5 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, () => {
-  console.log(`Night Ward Server v3.2 on port ${PORT}`);
+  console.log(`Night Ward Server v4.1 on port ${PORT}`);
 });
