@@ -85,6 +85,11 @@ function findPlayer(code, ws) {
   return rooms[code]?.players.find((p) => p.ws === ws);
 }
 
+function hostIdOf(room) {
+  const h = room.players.find((p) => p.ws === room.host);
+  return h ? h.id : (room.players[0] ? room.players[0].id : 1);
+}
+
 wss.on("connection", (ws) => {
   let currentRoom = null;
   allClients.add(ws);
@@ -117,6 +122,7 @@ wss.on("connection", (ws) => {
           characterId: msg.characterId || 0,
           loginType: msg.loginType || "guest",
           userId: msg.userId || "",
+          device: msg.deviceId || "",
           ready: false, slot: 1,
           position: { x: 0, y: 0, z: 0 },
           rotation: { x: 0, y: 0, z: 0, w: 1 },
@@ -127,6 +133,7 @@ wss.on("connection", (ws) => {
         type: "room_created", roomCode: code,
         roomName: rooms[code].roomName, region: rooms[code].region,
         mode: rooms[code].mode, playerId: 1, maxPlayers: rooms[code].maxPlayers,
+        hostId: 1,
       });
       console.log(`[CREATE] ${msg.playerName} (${msg.loginType || "guest"}) → ${code}`);
       return;
@@ -146,12 +153,24 @@ wss.on("connection", (ws) => {
       }
 
       const joinUserId = msg.userId || "";
-      if (joinUserId && room.players.some((p) => p.userId === joinUserId)) {
-        send(ws, { type: "error", message: "This account is already in the room." }); return;
+      const joinDevice = msg.deviceId || "";
+      // Same account: reject only when SAME device (real duplicate login).
+      // Android + Mac ek account le khelna mildo — device farak chha.
+      const sameDeviceAs = (p) => {
+        if (!joinDevice || !p.device) return true;
+        return p.device === joinDevice;
+      };
+      if (joinUserId) {
+        const dupHere = room.players.find((p) => p.userId === joinUserId);
+        if (dupHere && sameDeviceAs(dupHere)) {
+          send(ws, { type: "error", message: "This account is already in the room." }); return;
+        }
       }
       if (joinUserId) {
         for (const [rCode, r] of Object.entries(rooms)) {
-          if (rCode !== code && r.players.some((p) => p.userId === joinUserId)) {
+          if (rCode === code) continue;
+          const other = r.players.find((p) => p.userId === joinUserId);
+          if (other && sameDeviceAs(other)) {
             send(ws, { type: "error", message: "This account is already in another room." }); return;
           }
         }
@@ -162,6 +181,7 @@ wss.on("connection", (ws) => {
         ws, id: pid, name: msg.playerName || "Player",
         characterId: msg.characterId || 0,
         loginType: joinLoginType, userId: joinUserId,
+        device: joinDevice,
         ready: false, slot: pid,
         position: { x: 0, y: 0, z: 0 },
         rotation: { x: 0, y: 0, z: 0, w: 1 },
@@ -174,8 +194,9 @@ wss.on("connection", (ws) => {
         roomName: room.roomName, region: room.region,
         mode: room.mode, playerId: pid,
         maxPlayers: room.maxPlayers, players: roomPlayers(code),
+        hostId: hostIdOf(room),
       });
-      broadcast(code, { type: "player_joined", player: playerPublic(player), players: roomPlayers(code) }, ws);
+      broadcast(code, { type: "player_joined", player: playerPublic(player), players: roomPlayers(code), hostId: hostIdOf(room) }, ws);
       console.log(`[JOIN] ${player.name} (${joinLoginType}) → ${code} as #${pid}`);
       return;
     }
@@ -206,12 +227,12 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.type === "set_character") {
-      if (player) { player.characterId = msg.characterId; broadcast(currentRoom, { type: "lobby_update", players: roomPlayers(currentRoom) }); }
+      if (player) { player.characterId = msg.characterId; broadcast(currentRoom, { type: "lobby_update", players: roomPlayers(currentRoom), hostId: hostIdOf(room) }); }
       return;
     }
 
     if (msg.type === "set_ready") {
-      if (player) { player.ready = !!msg.ready; broadcast(currentRoom, { type: "lobby_update", players: roomPlayers(currentRoom) }); }
+      if (player) { player.ready = !!msg.ready; broadcast(currentRoom, { type: "lobby_update", players: roomPlayers(currentRoom), hostId: hostIdOf(room) }); }
       return;
     }
 
@@ -222,7 +243,7 @@ wss.on("connection", (ws) => {
           send(target.ws, { type: "kicked", reason: "Kicked by host" });
           target.ws.close();
           room.players = room.players.filter((p) => p.id !== msg.targetId);
-          sendToAll(currentRoom, { type: "player_left", playerId: msg.targetId, players: roomPlayers(currentRoom) });
+          sendToAll(currentRoom, { type: "player_left", playerId: msg.targetId, players: roomPlayers(currentRoom), hostId: hostIdOf(room) });
           console.log(`[KICK] ${target.name} kicked from ${currentRoom}`);
         }
       }
@@ -286,8 +307,13 @@ wss.on("connection", (ws) => {
     if (!currentRoom || !rooms[currentRoom]) return;
     const room = rooms[currentRoom];
     room.players = room.players.filter((p) => p.ws !== ws);
-    if (room.players.length === 0) { delete rooms[currentRoom]; console.log(`[DELETE] Room ${currentRoom}`); }
-    else { broadcast(currentRoom, { type: "player_left", playerId: null, players: roomPlayers(currentRoom) }); }
+    if (room.players.length === 0) { delete rooms[currentRoom]; console.log(`[DELETE] Room ${currentRoom}`); return; }
+    if (room.host === ws) {
+      room.host = room.players[0].ws;
+      room.hostName = room.players[0].name;
+      console.log(`[HOST] ${room.hostName} → new host of ${currentRoom}`);
+    }
+    broadcast(currentRoom, { type: "player_left", playerId: null, players: roomPlayers(currentRoom), hostId: hostIdOf(room) });
   });
 });
 
