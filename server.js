@@ -123,7 +123,7 @@ const server = http.createServer((req, res) => {
   }
 
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Night Ward Server v4.3 - Running");
+  res.end("Night Ward Server v4.4 - Running");
 });
 
 const wss = new WebSocketServer({ server });
@@ -364,6 +364,12 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // Match pachi lobby farke: gameStarted clear (late joiner lobby ma nai aaos)
+    if (msg.type === "game_ended") {
+      if (room) room.gameStarted = false;
+      return;
+    }
+
     if (msg.type === "player_move") {
       if (player) {
         player.position = msg.position || player.position;
@@ -493,5 +499,5 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, () => {
-  console.log(`Night Ward Server v4.3 on port ${PORT}`);
+  console.log(`Night Ward Server v4.4 on port ${PORT}`);
 });
