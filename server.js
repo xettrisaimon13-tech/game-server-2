@@ -3,12 +3,103 @@ const { WebSocketServer } = require("ws");
 
 const PORT = process.env.PORT || 7777;
 
+// ── OAuth relay store (Google/Facebook login — no localhost) ──
+// Game le state generate garcha → browser Supabase bata /auth/callback?state=X ma
+// land garcha (tokens URL #fragment ma) → page le /auth/receive ma POST garcha →
+// game le /auth/poll?state=X bata tokens liyincha (one-time, TTL 5 min).
+const pendingAuth = new Map();
+const AUTH_TTL_MS = 5 * 60 * 1000;
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of pendingAuth) if (now - v.ts > AUTH_TTL_MS) pendingAuth.delete(k);
+}, 60000);
+
+const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Night Ward</title>
+<style>body{background:#0b070c;color:#e7d8c4;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.c{text-align:center;padding:40px}h1{color:#c43b4a;font-size:26px}p{color:#8a7a72;font-size:15px}#st{color:#c43b4a;margin-top:16px}</style></head>
+<body><div class="c"><h1>&#10003; Night Ward</h1><p id="st">Completing login...</p>
+<script>
+(function() {
+  var st = document.getElementById('st');
+  var state = new URLSearchParams(location.search).get('state') || '';
+  var hash = location.hash.substring(1);
+  if (!hash) { st.textContent = 'No auth data. Please try again.'; return; }
+  var p = new URLSearchParams(hash);
+  var at = p.get('access_token') || '';
+  var rt = p.get('refresh_token') || '';
+  if (!at) { st.textContent = 'No access token. Please try again.'; return; }
+  st.textContent = 'Logging you in...';
+  fetch('/auth/receive', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({state: state, access_token: at, refresh_token: rt})
+  }).then(function() {
+    st.textContent = 'Login successful! Return to Night Ward.';
+    try { window.location.href = 'nightward://login'; } catch (e) {}
+  }).catch(function(e) {
+    st.textContent = 'Error sending tokens: ' + e;
+  });
+})();
+</script></div></body></html>`;
+
 const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+
+  const qIdx = req.url.indexOf("?");
+  const path = qIdx === -1 ? req.url : req.url.slice(0, qIdx);
+  const gParams = new URLSearchParams(qIdx === -1 ? "" : req.url.slice(qIdx + 1));
+
+  if (path === "/auth/callback") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(AUTH_CALLBACK_HTML);
+    return;
+  }
+
+  if (path === "/auth/receive" && req.method === "POST") {
+    let body = "";
+    let size = 0;
+    req.on("data", (chunk) => {
+      size += chunk.length;
+      if (size <= 65536) body += chunk.toString();
+    });
+    req.on("end", () => {
+      try {
+        const data = JSON.parse(body);
+        const state = String(data.state || "");
+        const at = String(data.access_token || "");
+        if (/^[a-f0-9]{16,64}$/.test(state) && at.length > 20 && at.length < 16384) {
+          pendingAuth.set(state, { at, rt: String(data.refresh_token || ""), ts: Date.now() });
+          console.log("[AUTH] tokens stored for state", state.slice(0, 8));
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        } else {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "invalid payload" }));
+        }
+      } catch {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "invalid json" }));
+      }
+    });
+    return;
+  }
+
+  if (path === "/auth/poll") {
+    const state = gParams.get("state") || "";
+    const entry = pendingAuth.get(state);
+    if (entry) {
+      pendingAuth.delete(state);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ access_token: entry.at, refresh_token: entry.rt }));
+    } else {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ pending: true }));
+    }
+    return;
+  }
 
   if (req.url === "/rooms") {
     const list = Object.entries(rooms)
@@ -32,7 +123,7 @@ const server = http.createServer((req, res) => {
   }
 
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Night Ward Server v4.1 - Running");
+  res.end("Night Ward Server v4.2 - Running");
 });
 
 const wss = new WebSocketServer({ server });
@@ -157,7 +248,7 @@ wss.on("connection", (ws) => {
       // Same account: reject only when SAME device (real duplicate login).
       // Android + Mac ek account le khelna mildo — device farak chha.
       const sameDeviceAs = (p) => {
-        if (!joinDevice || !p.device) return true;
+        if (!joinDevice || !p.device) return true; // purana client / device info chhaina → strict
         return p.device === joinDevice;
       };
       if (joinUserId) {
@@ -226,6 +317,13 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // Lobby self-heal: client return-to-lobby / panel open ma authoritative
+    // room list magcha (stale 1/4 count fix).
+    if (msg.type === "sync_room") {
+      if (player) send(ws, { type: "lobby_update", players: roomPlayers(currentRoom), hostId: hostIdOf(room) });
+      return;
+    }
+
     if (msg.type === "set_character") {
       if (player) { player.characterId = msg.characterId; broadcast(currentRoom, { type: "lobby_update", players: roomPlayers(currentRoom), hostId: hostIdOf(room) }); }
       return;
@@ -258,6 +356,8 @@ wss.on("connection", (ws) => {
     if (msg.type === "start_game") {
       if (ws === room.host) {
         room.gameStarted = true;
+        room.matchLikes = {};       // naya match = naya like state
+        room.matchEliminated = [];
         console.log(`[START] ${currentRoom} mode=${room.mode} players=${room.players.length}`);
         sendToAll(currentRoom, { type: "game_start", mode: room.mode, players: roomPlayers(currentRoom) });
       }
@@ -300,6 +400,66 @@ wss.on("connection", (ws) => {
       if (player) broadcast(currentRoom, { type: "emote", playerId: player.id, anim: msg.anim }, ws);
       return;
     }
+
+    if (msg.type === "entry_anim") {
+      if (player) broadcast(currentRoom, { type: "entry_anim", playerId: player.id, anim: msg.anim }, ws);
+      return;
+    }
+
+    if (msg.type === "ghost_jumpscare") {
+      broadcast(currentRoom, { type: "ghost_jumpscare", targetPlayerId: msg.targetPlayerId | 0 }, ws);
+      return;
+    }
+
+    if (msg.type === "player_hit") {
+      broadcast(currentRoom, { type: "player_hit", targetPlayerId: msg.targetPlayerId | 0 }, ws);
+      return;
+    }
+
+    if (msg.type === "ritual_pickup") {
+      broadcast(currentRoom, { type: "ritual_pickup", itemId: msg.itemId | 0, playerId: player ? player.id : null }, ws);
+      return;
+    }
+
+    if (msg.type === "ritual_place") {
+      broadcast(currentRoom, { type: "ritual_place", itemId: msg.itemId | 0, slotIndex: msg.slotIndex | 0, playerId: player ? player.id : null }, ws);
+      return;
+    }
+
+    if (msg.type === "ritual_drop") {
+      broadcast(currentRoom, { type: "ritual_drop", itemId: msg.itemId | 0, playerId: player ? player.id : null }, ws);
+      return;
+    }
+
+    if (msg.type === "ritual_win") {
+      broadcast(currentRoom, { type: "ritual_win", winnerId: msg.winnerId | 0 }, ws);
+      return;
+    }
+
+    // ── SPECTATOR LIKE SYSTEM (server-authoritative) ──
+    // 1 spectator → 1 like per player per match. 3 likes = target eliminated.
+    if (msg.type === "spectate_like") {
+      if (!player) return;
+      const targetId = msg.targetId | 0;
+      if (targetId < 1 || targetId === player.id) return;
+      if (!room.players.find((p) => p.id === targetId)) return;
+      if (!room.matchLikes) room.matchLikes = {};
+      if (!room.matchEliminated) room.matchEliminated = [];
+      if (room.matchEliminated.includes(targetId)) return;
+      if (!room.matchLikes[targetId]) room.matchLikes[targetId] = { likedBy: [] };
+      const entry = room.matchLikes[targetId];
+      if (entry.likedBy.includes(player.id)) return; // duplicate like — server rejects
+      entry.likedBy.push(player.id);
+      const count = entry.likedBy.length;
+      sendToAll(currentRoom, { type: "spectate_like_update", targetId, count, fromId: player.id });
+      console.log(`[LIKE] #${player.id} ${player.name} → #${targetId} (${count}/3) in ${currentRoom}`);
+      if (count >= 3) {
+        room.matchEliminated.push(targetId);
+        sendToAll(currentRoom, { type: "spectate_eliminated", targetId });
+        console.log(`[ELIM] #${targetId} eliminated by 3 likes in ${currentRoom}`);
+      }
+      return;
+    }
   });
 
   ws.on("close", () => {
@@ -326,5 +486,5 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, () => {
-  console.log(`Night Ward Server v4.1 on port ${PORT}`);
+  console.log(`Night Ward Server v4.2 on port ${PORT}`);
 });
