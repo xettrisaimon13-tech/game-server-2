@@ -123,7 +123,7 @@ const server = http.createServer((req, res) => {
   }
 
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Night Ward Server v4.2 - Running");
+  res.end("Night Ward Server v4.3 - Running");
 });
 
 const wss = new WebSocketServer({ server });
@@ -436,6 +436,13 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // ── MUMMY VS HUMAN — generic round/hit/dead/result sync (room relay) ──
+    if (msg.type === "mummy_sync") {
+      if (!player || !currentRoom) return;
+      broadcast(currentRoom, { type: "mummy_sync", from: player.id, data: msg.data || {} }, ws);
+      return;
+    }
+
     // ── SPECTATOR LIKE SYSTEM (server-authoritative) ──
     // 1 spectator → 1 like per player per match. 3 likes = target eliminated.
     if (msg.type === "spectate_like") {
@@ -486,5 +493,5 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, () => {
-  console.log(`Night Ward Server v4.2 on port ${PORT}`);
+  console.log(`Night Ward Server v4.3 on port ${PORT}`);
 });
