@@ -123,12 +123,14 @@ const server = http.createServer((req, res) => {
   }
 
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Night Ward Server v4.4 - Running");
+  res.end("Night Ward Server v4.5 - Running");
 });
 
 const wss = new WebSocketServer({ server });
 const rooms = {};
 const allClients = new Set();
+// ── QUICK MATCH queue: status-based pairing of any 2 eligible searching players ──
+let matchQueue = [];
 
 function genCode() {
   const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -181,9 +183,47 @@ function hostIdOf(room) {
   return h ? h.id : (room.players[0] ? room.players[0].id : 1);
 }
 
+// Queue ma bhayeka eligible searching players lai JODIHAL — status-based
+// (dukai searching + readyState=1 + queue age < 3 min). Fake player banaudaina.
+function tryQuickPair(entry) {
+  if (!matchQueue.includes(entry)) return; // cancel/expire bhaisakyo
+  if (entry.ws.readyState !== 1) return;
+  matchQueue = matchQueue.filter((q) => q.ws.readyState === 1 && Date.now() - q.queuedAt < 180000);
+  if (!matchQueue.includes(entry)) return;
+  const idx = matchQueue.findIndex((q) => q.ws !== entry.ws && q.ws.readyState === 1);
+  if (idx === -1) return; // kei jodi bhayena — next quick_match aayepachi feri try hunchha
+  const a = matchQueue[idx];  // pahile dekhi queue ma thiyo → host
+  const b = entry;
+  matchQueue = matchQueue.filter((q) => q !== a && q !== b);
+  const code = genCode();
+  const mk = (e, id) => ({
+    ws: e.ws, id, name: e.playerName, characterId: e.characterId,
+    loginType: e.loginType, userId: e.userId, device: e.device,
+    ready: false, slot: id, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 },
+  });
+  rooms[code] = {
+    host: a.ws, hostName: a.playerName,
+    roomName: "Match", region: "ASIA",
+    mode: a.mode, maxPlayers: 4, loginType: a.loginType,
+    players: [mk(a, 1), mk(b, 2)],
+    gameStarted: true, matchmadeAt: Date.now(),
+    matchLikes: {}, matchEliminated: [],
+  };
+  a.ws.setRoom(code);
+  b.ws.setRoom(code);
+  // SAME match assignment — dukai lai eutai code/mode/players + game_start
+  send(a.ws, { type: "room_created", roomCode: code, roomName: "Match", region: "ASIA", mode: rooms[code].mode, playerId: 1, maxPlayers: 4, hostId: 1 });
+  send(b.ws, { type: "room_joined", roomCode: code, roomName: "Match", region: "ASIA", mode: rooms[code].mode, playerId: 2, maxPlayers: 4, players: roomPlayers(code), hostId: 1 });
+  broadcast(code, { type: "player_joined", player: playerPublic(rooms[code].players[1]), players: roomPlayers(code), hostId: 1 }, b.ws);
+  sendToAll(code, { type: "game_start", mode: rooms[code].mode, players: roomPlayers(code) });
+  console.log(`[MATCH] ${a.playerName} ↔ ${b.playerName} → ${code} mode=${rooms[code].mode}`);
+}
+
 wss.on("connection", (ws) => {
   let currentRoom = null;
   allClients.add(ws);
+  // Pairing (aanu ko socket ko handler bata pani) le yo socket ko currentRoom set garna sakos.
+  ws.setRoom = (code) => { currentRoom = code; };
 
   ws.on("message", (raw, isBinary) => {
     if (isBinary) {
@@ -305,6 +345,55 @@ wss.on("connection", (ws) => {
       const text = (msg.text || "").substring(0, 200);
       if (text.length === 0 || !currentRoom) return;
       broadcast(currentRoom, { type: "chat_room", sender: msg.sender || "Player", text, ts: Date.now() });
+      return;
+    }
+
+    // ── QUICK MATCHMAKING — status-based pairing (2 real players, no fakes) ──
+    if (msg.type === "quick_match") {
+      if (matchQueue.some((q) => q.ws === ws)) return; // duplicate request guard
+      // Pahile room ma thiyo bhane niskin (solo host START → matchmaking)
+      if (currentRoom && rooms[currentRoom]) {
+        const old = rooms[currentRoom];
+        old.players = old.players.filter((p) => p.ws !== ws);
+        if (old.players.length === 0) {
+          delete rooms[currentRoom];
+        } else {
+          if (old.host === ws) { old.host = old.players[0].ws; old.hostName = old.players[0].name; }
+          broadcast(currentRoom, { type: "player_left", playerId: null, players: roomPlayers(currentRoom), hostId: hostIdOf(old) });
+        }
+        currentRoom = null;
+      }
+      // Expired (>3 min) / dead entries hatau
+      matchQueue = matchQueue.filter((q) => q.ws.readyState === 1 && Date.now() - q.queuedAt < 180000);
+      const entry = {
+        ws, playerName: msg.playerName || "Player", characterId: msg.characterId | 0,
+        mode: msg.mode || "SURVIVAL", loginType: msg.loginType || "guest",
+        userId: msg.userId || "", device: msg.deviceId || "", queuedAt: Date.now(),
+      };
+      matchQueue.push(entry);
+      // Cancel (X) pachi pair hudaina bhanera microtask ma queue re-check
+      setTimeout(() => tryQuickPair(entry), 0);
+      return;
+    }
+
+    if (msg.type === "quick_match_cancel") {
+      const entry = matchQueue.find((q) => q.ws === ws);
+      matchQueue = matchQueue.filter((q) => q.ws !== ws);
+      // Cancel pachi fresh matchmade room (seal bhako <3s) ma chha → turunti nikal:
+      // duplicate/fake match state bachau, arko player lai player_left janchha.
+      if (entry && currentRoom && rooms[currentRoom]) {
+        const r = rooms[currentRoom];
+        if (r.matchmadeAt && Date.now() - r.matchmadeAt < 3000) {
+          r.players = r.players.filter((p) => p.ws !== ws);
+          if (r.players.length === 0) {
+            delete rooms[currentRoom];
+          } else {
+            if (r.host === ws) { r.host = r.players[0].ws; r.hostName = r.players[0].name; }
+            broadcast(currentRoom, { type: "player_left", playerId: null, players: roomPlayers(currentRoom), hostId: hostIdOf(r) });
+          }
+          currentRoom = null;
+        }
+      }
       return;
     }
 
@@ -477,6 +566,7 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     allClients.delete(ws);
+    matchQueue = matchQueue.filter((q) => q.ws !== ws); // queue bata turunti hata
     if (!currentRoom || !rooms[currentRoom]) return;
     const room = rooms[currentRoom];
     room.players = room.players.filter((p) => p.ws !== ws);
@@ -491,6 +581,8 @@ wss.on("connection", (ws) => {
 });
 
 setInterval(() => {
+  // Queue bata expired/dead entries nikal (180s timeout client-side le pani cancel garchha)
+  matchQueue = matchQueue.filter((q) => q.ws.readyState === 1 && Date.now() - q.queuedAt < 180000);
   Object.keys(rooms).forEach((code) => {
     const alive = rooms[code].players.filter((p) => p.ws.readyState === 1);
     if (alive.length === 0) delete rooms[code];
@@ -499,5 +591,5 @@ setInterval(() => {
 }, 30000);
 
 server.listen(PORT, () => {
-  console.log(`Night Ward Server v4.4 on port ${PORT}`);
+  console.log(`Night Ward Server v4.5 on port ${PORT}`);
 });
