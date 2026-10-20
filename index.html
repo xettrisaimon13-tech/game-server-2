@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DarkWard Online</title>
+<style>
+:root{--ink:#120f1f;--slab:#1d1833;--line:#352b57;--bone:#efe9dc;--mute:#9a91b8;--ember:#ff6b3d;--wraith:#7be0d0}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;background:radial-gradient(ellipse at 50% -10%,#35205f,var(--ink) 62%);color:var(--bone);font-family:system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;padding:22px 14px}
+h1{font-family:Georgia,serif;font-weight:400;font-size:2rem;letter-spacing:.12em;margin:6px 0 16px}
+.card{background:var(--slab);border:1px solid var(--line);border-radius:6px;padding:18px;width:100%;max-width:420px;margin-bottom:14px}
+[hidden]{display:none!important}
+label{font-size:.85rem;color:var(--mute)}
+input{width:100%;margin:6px 0 12px;padding:11px;background:var(--ink);border:1px solid var(--line);border-radius:4px;color:var(--bone);font-size:1rem}
+input:focus,button:focus-visible{outline:2px solid var(--wraith);outline-offset:2px}
+button{background:var(--ember);color:#1a0d08;border:0;border-radius:4px;padding:11px 16px;font-size:.95rem;font-weight:700;cursor:pointer}
+.full{width:100%}
+#msg{color:var(--mute);font-size:.85rem;margin:8px 0 0;min-height:1.1em}
+.head{display:flex;justify-content:space-between;margin-bottom:8px;color:var(--mute);font-size:.9rem}
+.head b{color:var(--bone)}
+table{width:100%;border-collapse:collapse;font-size:.95rem}
+th{text-align:left;font-weight:400;color:var(--mute);font-size:.8rem;padding:4px}
+td{padding:9px 4px;border-top:1px solid var(--line)}
+td.r{width:46px;color:var(--wraith);font-weight:700}
+td.c{text-align:right;color:var(--mute)}
+td button{padding:5px 10px;font-size:.8rem;background:#b3262d;color:#fff}
+.tools{display:flex;gap:8px}.tools input{margin:0}
+#adminLink{background:none;border:0;color:var(--mute);font-weight:400;font-size:.8rem;text-decoration:underline}
+#toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);background:var(--bone);color:#1a0d08;padding:11px 18px;border-radius:4px;font-weight:700}
+</style>
+</head>
+<body>
+<h1>DarkWard</h1>
+
+<div class="card">
+  <label for="name">Your name</label>
+  <input id="name" maxlength="14" autocomplete="off">
+  <button id="save" class="full">Save name</button>
+  <p id="msg">Connecting...</p>
+</div>
+
+<div class="card">
+  <div class="head"><span>Online now: <b id="count">0</b></span></div>
+  <table>
+    <thead><tr><th>Rank</th><th>Name</th><th style="text-align:right">Coins</th><th id="actHead" hidden></th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+
+<button id="adminLink">Host panel</button>
+<div id="admin" class="card" hidden style="margin-top:12px">
+  <div id="login">
+    <label for="pass">Host password</label>
+    <input id="pass" type="password">
+    <button id="loginBtn" class="full">Sign in</button>
+  </div>
+  <div id="tools" class="tools" hidden>
+    <input id="giftAmt" type="number" min="1" value="100" aria-label="Gift amount">
+    <button id="giftBtn">Gift all</button>
+  </div>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const NOSERVER = 'Cannot reach the server. Open the Render URL (https://...onrender.com), not the file.';
+const socket = typeof io === 'function' ? io() : { on() {}, emit() {}, connected: false };
+let isAdmin = false;
+
+function toast(m) {
+  const t = document.createElement('div');
+  t.id = 'toast'; t.textContent = m; document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3000);
+}
+if (typeof io !== 'function') $('msg').textContent = NOSERVER;
+socket.on('connect', () => { $('msg').textContent = 'Connected.'; });
+socket.on('connect_error', () => { $('msg').textContent = NOSERVER; });
+socket.on('you', (d) => { $('name').value = d.name; });
+
+$('save').onclick = () => {
+  if (!socket.connected) { $('msg').textContent = NOSERVER; return; }
+  socket.emit('setName', $('name').value);
+  toast('Name saved');
+};
+
+function render(list) {
+  $('count').textContent = list.length;
+  $('actHead').hidden = !isAdmin;
+  const body = $('rows'); body.textContent = '';
+  list.forEach((p) => {
+    const tr = body.insertRow();
+    tr.insertCell().textContent = '#' + p.rank;
+    tr.cells[0].className = 'r';
+    tr.insertCell().textContent = p.name;
+    const c = tr.insertCell(); c.textContent = p.coins; c.className = 'c';
+    if (isAdmin) {
+      const b = document.createElement('button');
+      b.textContent = 'Delete';
+      b.onclick = () => { if (confirm('Delete ' + p.name + '?')) socket.emit('kick', p.id); };
+      tr.insertCell().appendChild(b);
+    }
+  });
+}
+socket.on('list', (l) => { if (!isAdmin) render(l); });
+socket.on('adminList', (l) => { if (isAdmin) render(l); });
+
+socket.on('gift', (d) => toast('Gift received: +' + d.amount + ' coins'));
+socket.on('kicked', () => {
+  document.body.innerHTML = '<h1>DarkWard</h1><p style="color:#9a91b8">The host removed you. Reload the page to join again.</p>';
+});
+
+$('adminLink').onclick = () => { $('admin').hidden = !$('admin').hidden; };
+$('loginBtn').onclick = () => {
+  if (!socket.connected) { toast('Not connected to the server.'); return; }
+  socket.emit('adminLogin', $('pass').value);
+};
+socket.on('adminFail', () => toast('Wrong host password.'));
+socket.on('adminOk', () => { isAdmin = true; $('login').hidden = true; $('tools').hidden = false; });
+$('giftBtn').onclick = () => socket.emit('giftAll', $('giftAmt').value);
+</script>
+</body>
+</html>
