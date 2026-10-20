@@ -294,15 +294,16 @@ const chatRooms = new Map();   // roomId -> { id, name, ownerId, ownerName, memb
 function chatRoomListPayload() {
   const list = [];
   for (const r of chatRooms.values()) {
-    // Room bhitra ko player names (slots) — world chat row ma dekhau,
-    // naya room kasa kasa cha pata garna sake.
-    const names = [];
-    for (const w of r.members) {
-      if (w.readyState === 1) names.push({ name: w.chatName || "Player", profileId: w.chatProfileId || "" });
-    }
+    // Room bhitra ko player names (slots) — world chat row ma dekhau.
+    // Slot position stable rahe (creator slot 0, joiners le "+" click gareko slot).
     const slots = [];
     for (let i = 0; i < 4; i++) {
-      slots.push(names[i] ? { slot: i, playerName: names[i].name, playerId: names[i].profileId } : {});
+      const w = r.slots ? r.slots[i] : null;
+      if (w && w.readyState === 1) {
+        slots.push({ slot: i, playerName: w.chatName || "Player", playerId: w.chatProfileId || "" });
+      } else {
+        slots.push({});
+      }
     }
     list.push({
       id: r.id,
@@ -340,6 +341,10 @@ function leaveChatRoom(ws) {
   const room = chatRooms.get(ws.chatRoomId);
   if (!room) return;
   room.members.delete(ws);
+  if (room.slots) {
+    const si = room.slots.indexOf(ws);
+    if (si >= 0) room.slots[si] = null;
+  }
   ws.chatRoomId = null;
   // Khali room → delete
   if (room.members.size === 0) {
@@ -367,7 +372,7 @@ function send(ws, data) {
 }
 
 function playerPublic(p) {
-  return { id: p.id, name: p.name, characterId: p.characterId, ready: p.ready, slot: p.slot, position: p.position, rotation: p.rotation, loginType: p.loginType || "guest", groupId: p.groupId || "", region: p.region || "" };
+  return { id: p.id, name: p.name, characterId: p.characterId, ready: p.ready, slot: p.slot, position: p.position, rotation: p.rotation, loginType: p.loginType || "guest", region: p.region || "" };
 }
 
 function roomPlayers(code) {
@@ -406,30 +411,7 @@ function findPlayerByProfileId(profileId) {
   return null;
 }
 
-// Same-GROUP players ekai team ma paraina banaune order.
-// Group members lai round-robin le banaucha → half-split (slice) ma
-// ekai group ko 2 player ekai side ma paraina.
-function interleaveGroups(players) {
-  const buckets = new Map();
-  for (const p of players) {
-    const g = p.groupId || "";
-    if (!buckets.has(g)) buckets.set(g, []);
-    buckets.get(g).push(p);
-  }
-  // Badi group pahile (spread garna best), tar baki
-  const lists = [...buckets.values()].sort((a, b) => b.length - a.length);
-  const out = [];
-  let i = 0;
-  while (out.length < players.length) {
-    let pushed = false;
-    for (const l of lists) {
-      if (i < l.length) { out.push(l[i]); pushed = true; }
-    }
-    if (!pushed) break;
-    i++;
-  }
-  return out;
-}
+// GROUP system REMOVED — 1v1 simple (no group team-splitting).
 
 // Queue ko same mode+teamSize wala haru lai progress count pathau
 // (client counter: 1/0 → 2/0 → … → X/X). Count required vanda badi garnaudaina.
@@ -456,26 +438,25 @@ function tryQuickPair(entry) {
   const required = 2 * entry.teamSize;
   if (same.length < required) return; // ajhai partner chahincha — next join aayepachi feri try
   const picked = same.slice(0, required); // pahile queue ma thiye → host order
-  // Same-group players ekai team ma naparaina banaune order ma halcha
-  const group = interleaveGroups(picked);
+  // 1v1 simple — queue order (host = pahile queue ma thiyo)
   matchQueue = matchQueue.filter((q) => !picked.includes(q));
   const code = genCode();
   const mk = (e, id) => ({
     ws: e.ws, id, name: e.playerName, characterId: e.characterId,
     loginType: e.loginType, userId: e.userId, profileId: e.profileId || "",
-    groupId: e.groupId || "", device: e.device, region: e.region || "ASIA",
+    device: e.device, region: e.region || "ASIA",
     ready: false, slot: id, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 },
   });
   rooms[code] = {
-    host: group[0].ws, hostName: group[0].playerName,
+    host: picked[0].ws, hostName: picked[0].playerName,
     roomName: "Match", region: "GLOBAL",
-    mode: group[0].mode, maxPlayers: required, loginType: group[0].loginType,
-    players: group.map((e, i) => mk(e, i + 1)),
+    mode: picked[0].mode, maxPlayers: required, loginType: picked[0].loginType,
+    players: picked.map((e, i) => mk(e, i + 1)),
     gameStarted: true, matchmadeAt: Date.now(),
     matchLikes: {}, matchEliminated: [],
   };
   // SAME match assignment — sabailai eutai code/mode/players + game_start
-  group.forEach((e, i) => {
+  picked.forEach((e, i) => {
     e.ws.setRoom(code);
     if (i === 0) {
       send(e.ws, { type: "room_created", roomCode: code, roomName: "Match", region: "GLOBAL", mode: rooms[code].mode, playerId: 1, maxPlayers: required, hostId: 1 });
@@ -484,10 +465,10 @@ function tryQuickPair(entry) {
     }
   });
   for (let i = 1; i < required; i++) {
-    broadcast(code, { type: "player_joined", player: playerPublic(rooms[code].players[i]), players: roomPlayers(code), hostId: 1 }, group[i].ws);
+    broadcast(code, { type: "player_joined", player: playerPublic(rooms[code].players[i]), players: roomPlayers(code), hostId: 1 }, picked[i].ws);
   }
   sendToAll(code, { type: "game_start", mode: rooms[code].mode, players: roomPlayers(code) });
-  console.log(`[MATCH] ${group.map((e) => e.playerName).join(" vs ")} → ${code} mode=${rooms[code].mode} ${required}p`);
+  console.log(`[MATCH] ${picked.map((e) => e.playerName).join(" vs ")} → ${code} mode=${rooms[code].mode} ${required}p`);
 }
 
 wss.on("connection", (ws) => {
@@ -645,9 +626,11 @@ wss.on("connection", (ws) => {
         ownerName: name,
         ownerProfileId: ws.chatProfileId || "",
         members: new Set(),
+        slots: [null, null, null, null],   // 4 slots — creator slot 0
         createdAt: Date.now(),
       };
       room.members.add(ws);
+      room.slots[0] = ws;
       chatRooms.set(room.id, room);
       ws.chatRoomId = room.id;
       send(ws, { type: "chatroom_joined", roomId: room.id, roomName: room.name, owner: true });
@@ -671,8 +654,22 @@ wss.on("connection", (ws) => {
       // Joiner ko naam update (slots/list ma yo name dekhaunxa)
       if (msg.name) ws.chatName = String(msg.name).substring(0, 40);
       if (msg.profileId) ws.chatProfileId = String(msg.profileId);
+      // Slot select: client le "+" jaba click gareko slot index pathauncha.
+      let slot = Number(msg.slotIndex);
+      if (!(slot >= 0 && slot < 4)) slot = -1;
+      if (slot >= 0 && room.slots && room.slots[slot] && room.slots[slot] !== ws) {
+        send(ws, { type: "error", message: "That slot is already taken." });
+        return;
+      }
       leaveChatRoom(ws);
       room.members.add(ws);
+      if (!room.slots) room.slots = [null, null, null, null];
+      if (slot < 0) {
+        // Slot diya chaina → first free slot
+        slot = room.slots.findIndex((x) => x === null);
+        if (slot < 0) slot = 0;
+      }
+      room.slots[slot] = ws;
       ws.chatRoomId = room.id;
       send(ws, { type: "chatroom_joined", roomId: room.id, roomName: room.name, owner: false });
       broadcastChatRooms();
@@ -779,7 +776,6 @@ wss.on("connection", (ws) => {
         ws, playerName: msg.playerName || "Player", characterId: msg.characterId | 0,
         mode: msg.mode || "SURVIVAL", loginType: msg.loginType || "guest",
         userId: msg.userId || "", profileId: msg.profileId || "",
-        groupId: String(msg.groupId || ""),
         device: msg.deviceId || "", region: msg.region || DEFAULT_SERVER_ID,
         serverId: msg.serverId || msg.region || DEFAULT_SERVER_ID,
         queuedAt: Date.now(),
