@@ -372,7 +372,7 @@ function send(ws, data) {
 }
 
 function playerPublic(p) {
-  return { id: p.id, name: p.name, characterId: p.characterId, ready: p.ready, slot: p.slot, position: p.position, rotation: p.rotation, loginType: p.loginType || "guest", region: p.region || "" };
+  return { id: p.id, name: p.name, characterId: p.characterId, ready: p.ready, slot: p.slot, position: p.position, rotation: p.rotation, loginType: p.loginType || "guest", groupId: p.groupId || "", region: p.region || "" };
 }
 
 function roomPlayers(code) {
@@ -411,7 +411,30 @@ function findPlayerByProfileId(profileId) {
   return null;
 }
 
-// GROUP system REMOVED — 1v1 simple (no group team-splitting).
+// Same-GROUP players ekai team ma paraina banaune order.
+// Group members lai round-robin le banaucha → half-split (slice) ma
+// ekai group ko 2 player ekai side ma paraina.
+function interleaveGroups(players) {
+  const buckets = new Map();
+  for (const p of players) {
+    const g = p.groupId || "";
+    if (!buckets.has(g)) buckets.set(g, []);
+    buckets.get(g).push(p);
+  }
+  // Badi group pahile (spread garna best), tar baki
+  const lists = [...buckets.values()].sort((a, b) => b.length - a.length);
+  const out = [];
+  let i = 0;
+  while (out.length < players.length) {
+    let pushed = false;
+    for (const l of lists) {
+      if (i < l.length) { out.push(l[i]); pushed = true; }
+    }
+    if (!pushed) break;
+    i++;
+  }
+  return out;
+}
 
 // Queue ko same mode+teamSize wala haru lai progress count pathau
 // (client counter: 1/0 → 2/0 → … → X/X). Count required vanda badi garnaudaina.
@@ -438,25 +461,26 @@ function tryQuickPair(entry) {
   const required = 2 * entry.teamSize;
   if (same.length < required) return; // ajhai partner chahincha — next join aayepachi feri try
   const picked = same.slice(0, required); // pahile queue ma thiye → host order
-  // 1v1 simple — queue order (host = pahile queue ma thiyo)
+  // Same-group players ekai team ma naparaina banaune order ma halcha
+  const group = interleaveGroups(picked);
   matchQueue = matchQueue.filter((q) => !picked.includes(q));
   const code = genCode();
   const mk = (e, id) => ({
     ws: e.ws, id, name: e.playerName, characterId: e.characterId,
     loginType: e.loginType, userId: e.userId, profileId: e.profileId || "",
-    device: e.device, region: e.region || "ASIA",
+    groupId: e.groupId || "", device: e.device, region: e.region || "ASIA",
     ready: false, slot: id, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 },
   });
   rooms[code] = {
-    host: picked[0].ws, hostName: picked[0].playerName,
+    host: group[0].ws, hostName: group[0].playerName,
     roomName: "Match", region: "GLOBAL",
-    mode: picked[0].mode, maxPlayers: required, loginType: picked[0].loginType,
-    players: picked.map((e, i) => mk(e, i + 1)),
+    mode: group[0].mode, maxPlayers: required, loginType: group[0].loginType,
+    players: group.map((e, i) => mk(e, i + 1)),
     gameStarted: true, matchmadeAt: Date.now(),
     matchLikes: {}, matchEliminated: [],
   };
   // SAME match assignment — sabailai eutai code/mode/players + game_start
-  picked.forEach((e, i) => {
+  group.forEach((e, i) => {
     e.ws.setRoom(code);
     if (i === 0) {
       send(e.ws, { type: "room_created", roomCode: code, roomName: "Match", region: "GLOBAL", mode: rooms[code].mode, playerId: 1, maxPlayers: required, hostId: 1 });
@@ -465,10 +489,10 @@ function tryQuickPair(entry) {
     }
   });
   for (let i = 1; i < required; i++) {
-    broadcast(code, { type: "player_joined", player: playerPublic(rooms[code].players[i]), players: roomPlayers(code), hostId: 1 }, picked[i].ws);
+    broadcast(code, { type: "player_joined", player: playerPublic(rooms[code].players[i]), players: roomPlayers(code), hostId: 1 }, group[i].ws);
   }
   sendToAll(code, { type: "game_start", mode: rooms[code].mode, players: roomPlayers(code) });
-  console.log(`[MATCH] ${picked.map((e) => e.playerName).join(" vs ")} → ${code} mode=${rooms[code].mode} ${required}p`);
+  console.log(`[MATCH] ${group.map((e) => e.playerName).join(" vs ")} → ${code} mode=${rooms[code].mode} ${required}p`);
 }
 
 wss.on("connection", (ws) => {
@@ -776,6 +800,7 @@ wss.on("connection", (ws) => {
         ws, playerName: msg.playerName || "Player", characterId: msg.characterId | 0,
         mode: msg.mode || "SURVIVAL", loginType: msg.loginType || "guest",
         userId: msg.userId || "", profileId: msg.profileId || "",
+        groupId: String(msg.groupId || ""),
         device: msg.deviceId || "", region: msg.region || DEFAULT_SERVER_ID,
         serverId: msg.serverId || msg.region || DEFAULT_SERVER_ID,
         queuedAt: Date.now(),
