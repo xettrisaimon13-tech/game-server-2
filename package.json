@@ -1,12 +1,16 @@
 {
   "name": "night-ward-server",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Night Ward multiplayer relay server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
-    "ws": "^8.16.0"
+    "ws": "^8.18.0",
+    "livekit-server-sdk": "^2.11.2"
   }
 }
