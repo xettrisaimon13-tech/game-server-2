@@ -633,6 +633,9 @@ wss.on("connection", (ws) => {
     // create: naya room (creator ko name = room name), creator join huncha
     if (msg.type === "chatroom_create") {
       const name = String(msg.name || ws.chatName || "Player").substring(0, 32);
+      // Creator ko name update (slots/list ma yo name dekhaunxa)
+      if (msg.name) ws.chatName = name;
+      if (msg.profileId) ws.chatProfileId = String(msg.profileId);
       leaveChatRoom(ws);
       const room = {
         id: genCode(),
@@ -665,6 +668,9 @@ wss.on("connection", (ws) => {
         send(ws, { type: "error", message: "That room no longer exists." });
         return;
       }
+      // Joiner ko naam update (slots/list ma yo name dekhaunxa)
+      if (msg.name) ws.chatName = String(msg.name).substring(0, 40);
+      if (msg.profileId) ws.chatProfileId = String(msg.profileId);
       leaveChatRoom(ws);
       room.members.add(ws);
       ws.chatRoomId = room.id;
