@@ -1042,6 +1042,8 @@ wss.on("connection", (ws, req) => {
   ws.chatRoomId = null;
   // Which match server this client is on (live player counts)
   ws.__serverId = null;
+  // Player ko selected mode (set_mode le set huncha) — queue fallback
+  ws.__mode = "";
 
   ws.on("message", (raw, isBinary) => {
     if (isBinary) {
@@ -1375,7 +1377,7 @@ wss.on("connection", (ws, req) => {
       matchQueue = matchQueue.filter((q) => q.ws.readyState === 1 && Date.now() - q.queuedAt < 180000);
       const entry = {
         ws, playerName: msg.playerName || "Player", characterId: msg.characterId | 0,
-        mode: msg.mode || "SURVIVAL", loginType: msg.loginType || "guest",
+        mode: msg.mode || ws.__mode || "MUMMY_VS_HUMAN", loginType: msg.loginType || "guest",
         userId: msg.userId || "", profileId: msg.profileId || "",
         groupId: String(msg.groupId || ""),
         device: msg.deviceId || "", region: msg.region || DEFAULT_SERVER_ID,
@@ -1422,6 +1424,24 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
+    // ── SET MODE (room chahe na ho) ──────────────────────
+    // Player le mode select gare — server le track garcha (per-mode matching
+    // ko laagi). Room ma bhayo bhaye host ko mode update + broadcast.
+    if (msg.type === "set_mode") {
+      const m = String(msg.mode || "");
+      if (m) {
+        ws.__mode = m;
+        if (currentRoom && rooms[currentRoom]) {
+          const r = rooms[currentRoom];
+          if (ws === r.host) {
+            r.mode = m;
+            broadcast(currentRoom, { type: "mode_changed", mode: r.mode, players: roomPlayers(currentRoom) });
+          }
+        }
+      }
+      return;
+    }
+
     if (!currentRoom || !rooms[currentRoom]) return;
     const room = rooms[currentRoom];
     const player = findPlayer(currentRoom, ws);
@@ -1459,11 +1479,6 @@ wss.on("connection", (ws, req) => {
           console.log(`[KICK] ${target.name} kicked from ${currentRoom}`);
         }
       }
-      return;
-    }
-
-    if (msg.type === "set_mode") {
-      if (ws === room.host) { room.mode = msg.mode || room.mode; broadcast(currentRoom, { type: "mode_changed", mode: room.mode, players: roomPlayers(currentRoom) }); }
       return;
     }
 
