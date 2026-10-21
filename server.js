@@ -405,7 +405,7 @@ const server = http.createServer((req, res) => {
         rooms: Object.keys(rooms).length,
         team: true, teamSlots: TEAM_SLOTS,   // team system support (client diagnostic)
         bots: true, botFillMs: BOT_FILL_DELAY_MS, botFillMaxMs: BOT_FILL_DELAY_MAX_MS,
-        botModes: BOT_MODES,
+        botModes: BOT_MODES, botMax: BOT_MAX_PER_ROOM,
       }));
       return;
     });
