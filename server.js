@@ -408,6 +408,14 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── ONLINE PLAYERS (peer → me) ──────────────────────────
+  // Arko backend ma kun players online cha.
+  if (path === "/mm/online-list" && req.method === "POST") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, players: localOnlinePlayers() }));
+    return;
+  }
+
   // ── GROUP INVITE RELAY (peer → me) ──────────────────────
   // Arko backend ma cha friend lai group invite forward garcha.
   if (path === "/mm/group-invite" && req.method === "POST") {
@@ -794,6 +802,20 @@ function hostIdOf(room) {
 // profile_id ("google_<uuid>") → online player (all rooms).
 // Exact profileId match first; fallback derives provider+uuid for older
 // clients that don't send profileId yet.
+// Online players (profileId + name) — yai backend ma connected.
+function localOnlinePlayers() {
+  const out = [];
+  const seen = new Set();
+  for (const w of allClients) {
+    if (w.readyState !== 1) continue;
+    const pid = w.chatProfileId || "";
+    if (!pid || seen.has(pid)) continue;
+    seen.add(pid);
+    out.push({ profileId: pid, name: w.chatName || "Player" });
+  }
+  return out;
+}
+
 function findPlayerByProfileId(profileId) {
   if (!profileId) return null;
   for (const room of Object.values(rooms)) {
@@ -1283,6 +1305,21 @@ wss.on("connection", (ws, req) => {
     if (msg.type === "chat_identity") {
       ws.chatName = String(msg.name || "Player").substring(0, 40);
       ws.chatProfileId = String(msg.profileId || "");
+      return;
+    }
+
+    // online list: kun friends online cha (invite button online matra dekhaune)
+    if (msg.type === "online_list") {
+      const local = localOnlinePlayers();
+      send(ws, { type: "online_list", players: local, scope: "local" });
+      // Arko backend ko online players ni (cross-backend friend)
+      for (const peer of (PEERS || [])) {
+        httpPostJson(peer.url, "/mm/online-list", {}, 3000).then((res) => {
+          if (res && Array.isArray(res.players) && res.players.length) {
+            send(ws, { type: "online_list", players: res.players, scope: "peer" });
+          }
+        });
+      }
       return;
     }
 
