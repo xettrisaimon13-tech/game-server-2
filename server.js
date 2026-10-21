@@ -402,6 +402,7 @@ const server = http.createServer((req, res) => {
         waiting: waiting.length, oldestQueuedAt: oldest,
         players: livePlayerCount(), capacity: MAX_PLAYERS, full: isServerFull(),
         rooms: Object.keys(rooms).length,
+        team: true, teamSlots: TEAM_SLOTS,   // team system support (client diagnostic)
       }));
       return;
     });
@@ -428,12 +429,13 @@ const server = http.createServer((req, res) => {
       const payload = data.payload || {};
       let delivered = false;
       if (targetProfileId && payload && payload.type === "group_invite") {
+        // SAME profileId ko SABA socket lai pathau (2 window / 2 device same
+        // account ma pani popup auncha — pehla matra nai).
         for (const w of allClients) {
           if (w.readyState === 1 && w.chatProfileId && w.chatProfileId === targetProfileId) {
             send(w, payload);
             delivered = true;
-            console.log(`[GROUP-INVITE] relayed → friend (room ${payload.roomId})`);
-            break;
+            console.log(`[GROUP-INVITE] relayed → friend (team ${payload.teamId || ""})`);
           }
         }
       }
@@ -445,22 +447,171 @@ const server = http.createServer((req, res) => {
 
   // ── GLOBAL ROOM DIRECTORY SYNC (peer → me) ──────────────
   // Dusro backend ko room list share garcha → "+" press garera join garna sakcha.
-  if (path === "/mm/chatroom-sync" && req.method === "POST") {
+  // ── TEAM ACCEPT RELAY (peer → me) ──────────────────────
+  // Team owner ko backend ma accept aayo → member add + sab lai pathau.
+  if (path === "/mm/team-accept" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => { body += c; });
     req.on("end", () => {
       let data = {};
       try { data = JSON.parse(body || "{}"); } catch { data = {}; }
-      const from = String(data.from || "");
-      const url = String(data.url || "");
-      if (from && url && from !== SELF_ID) {
-        remoteChatRooms.set(from, { url, rooms: Array.isArray(data.rooms) ? data.rooms : [] });
-        // Local clients lai merged list pathau (peer ko room dekhau)
-        // NOTE: yahile syncRoomsToPeers() call HUNAINDA — loop huna huncha.
-        sendChatRoomsToLocal();
+      const teamId = String(data.teamId || "");
+      const team = teams.get(teamId);
+      if (!team) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, delivered: false }));
+        return;
+      }
+      const pid = String(data.profileId || "");
+      const nm = String(data.name || "Player");
+      const slotIdx = Number(data.slotIndex);
+      const result = teamApplyAccept(team, pid, nm, slotIdx);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(Object.assign({ ok: true, delivered: true }, result)));
+    });
+    return;
+  }
+
+  // ── TEAM MEMBER LEFT RELAY (peer → me) ─────────────────
+  // Arko backend ma member gayo → owner backend ma hataucha + notify.
+  if (path === "/mm/team-member-left" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      let data = {};
+      try { data = JSON.parse(body || "{}"); } catch { data = {}; }
+      const teamId = String(data.teamId || "");
+      const pid = String(data.profileId || "");
+      const team = teams.get(teamId);
+      if (team && pid) {
+        teamRemoveMember(team, pid);
+        teamNotifyAll(team);
+        if (team.members.length === 0) teams.delete(teamId);
       }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
+    });
+    return;
+  }
+
+  // ── TEAM DECLINE RELAY (peer → me) ─────────────────────
+  // Invite LATER gareko → owner backend ma slot free.
+  if (path === "/mm/team-decline" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      let data = {};
+      try { data = JSON.parse(body || "{}"); } catch { data = {}; }
+      const teamId = String(data.teamId || "");
+      const pid = String(data.profileId || "");
+      const team = teams.get(teamId);
+      if (team && pid && team.pending.some((p) => p.profileId === pid)) {
+        team.pending = team.pending.filter((p) => p.profileId !== pid);
+        teamNormalize(team);
+        teamNotifyAll(team);
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    return;
+  }
+
+  // ── TEAM NOTIFY RELAY (peer → me) ──────────────────────
+  // Arko backend ma member lai team state pathau.
+  if (path === "/mm/team-notify" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      let data = {};
+      try { data = JSON.parse(body || "{}"); } catch { data = {}; }
+      const teamId = String(data.teamId || "");
+      const members = Array.isArray(data.members) ? data.members : [];
+      const pending = Array.isArray(data.pending) ? data.pending : [];
+      if (teamId) teamNotifyLocal(members, pending, teamId);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    return;
+  }
+
+  // ── TEAM INVITE REQUEST RELAY (peer → me) ──────────────
+  // Team owner ko backend ma invite request aayo → slot allocate + deliver.
+  if (path === "/mm/team-invite-request" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      let data = {};
+      try { data = JSON.parse(body || "{}"); } catch { data = {}; }
+      const teamId = String(data.teamId || "");
+      const team = teams.get(teamId);
+      if (!team) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, delivered: false, message: "Team not found." }));
+        return;
+      }
+      const targetProfileId = String(data.targetProfileId || "");
+      const result = teamProcessInvite(team, {
+        targetProfileId,
+        targetName: String(data.targetName || ""),
+        wantSlot: Number(data.wantSlot),
+        ownerSlot: Number(data.ownerSlot),
+        fromName: String(data.fromName || "Player"),
+        fromProfileId: String(data.fromProfileId || ""),
+      });
+      if (!result.ok) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, delivered: false, message: result.message }));
+        return;
+      }
+      const payload = {
+        type: "team_invite",
+        teamId,
+        slotIndex: result.slot,
+        fromName: String(data.fromName || "Player"),
+        fromProfileId: String(data.fromProfileId || ""),
+        roomCode: String(data.roomCode || "").trim().toUpperCase(),
+        roomUrl: String(data.roomUrl || "").trim(),
+        ts: Date.now(),
+      };
+      teamDeliverInvite(targetProfileId, payload).then((delivered) => {
+        if (!delivered) {
+          team.pending = team.pending.filter((p) => p.profileId !== targetProfileId);
+          teamNotifyAll(team);
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          ok: delivered, delivered, slotIndex: result.slot,
+          message: delivered ? "" : "That friend is not online.",
+        }));
+      });
+    });
+    return;
+  }
+
+  // ── TEAM INVITE RELAY (peer → me) ──────────────────────
+  // Arko backend ma cha friend lai team invite forward garcha.
+  if (path === "/mm/team-invite" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      let data = {};
+      try { data = JSON.parse(body || "{}"); } catch { data = {}; }
+      const targetProfileId = String(data.targetProfileId || "");
+      const payload = data.payload || {};
+      let delivered = false;
+      if (targetProfileId && payload && payload.type === "team_invite") {
+        // SAME profileId ko SABA socket lai pathau (2 window / 2 device same
+        // account ma pani popup auncha).
+        for (const w of allClients) {
+          if (w.readyState === 1 && w.chatProfileId && w.chatProfileId === targetProfileId) {
+            send(w, payload);
+            delivered = true;
+            console.log(`[TEAM-INVITE] relayed → friend (team ${payload.teamId})`);
+          }
+        }
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, delivered }));
     });
     return;
   }
@@ -643,163 +794,232 @@ function sendGlobal(data) {
 // ═══════════════════════════════════════════════════════════
 // WORLD CHAT ROOMS — player le afnai room create garcha
 // ═══════════════════════════════════════════════════════════
-const chatRooms = new Map();   // roomId -> { id, name, ownerId, ownerName, members:Set(ws), createdAt }
-// GLOBAL room directory — dusro backend ko room (peer sync le aayo).
-// Key = source backend id → { url, rooms: [...] }
-const remoteChatRooms = new Map();
+// ── TEAM SYSTEM (server = authoritative) ───────────────────
+// teamId -> { id, ownerProfileId, members: [{profileId, name, slot}],
+//              pending: [{profileId, name, slot, ts}] }
+// members = accepted players, pending = invite pathako but accept nai gareko.
+// Slot 0..3 = "TEAM 1..4". Slot khali huda free (reuse huncha).
+const teams = new Map();
+const TEAM_SLOTS = 4;
+const TEAM_INVITE_TTL_MS = Number(process.env.TEAM_INVITE_TTL_MS) || 120000;   // invite 2 minute pachi expire
+// Local mirror: teamId -> Set(profileId) — yai backend ma kun member cha.
+const localTeams = new Map();
 
-function chatRoomListPayload() {
-  const list = [];
-  const my_url = peerHostUrl();
-  for (const r of chatRooms.values()) {
-    // Room bhitra ko player names (slots) — world chat row ma dekhau.
-    // Slot position stable rahe (creator slot 0, joiners le "+" click gareko slot).
-    const slots = [];
-    for (let i = 0; i < 4; i++) {
-      const w = r.slots ? r.slots[i] : null;
-      if (w && w.readyState === 1) {
-        slots.push({ slot: i, playerName: w.chatName || "Player", playerId: w.chatProfileId || "" });
-      } else {
-        slots.push({});
-      }
-    }
-    list.push({
-      id: r.id,
-      name: r.name,
-      ownerName: r.ownerName,
-      ownerProfileId: r.ownerProfileId,
-      members: r.members.size,
-      mode: r.mode || "MUMMY_VS_HUMAN",
-      maxPlayers: r.maxPlayers || 4,
-      slots,
-      hostUrl: my_url,     // room kun backend ma cha
-      local: true,
-    });
+function teamGet(teamId) {
+  let t = teams.get(teamId);
+  if (!t) {
+    t = { id: teamId, ownerProfileId: "", members: [], pending: [] };
+    teams.set(teamId, t);
   }
-  // Peer backend ko rooms (global directory)
-  for (const src of remoteChatRooms.values()) {
-    for (const r of (src.rooms || [])) {
-      if (list.some((x) => x.id === r.id)) continue;   // local le override garcha
-      list.push({
-        id: r.id, name: r.name, ownerName: r.ownerName,
-        ownerProfileId: r.ownerProfileId || "",
-        members: r.members || 0,
-        mode: r.mode || "MUMMY_VS_HUMAN",
-        maxPlayers: r.maxPlayers || 4,
-        slots: r.slots || [],
-        hostUrl: src.url,
-        local: false,
-      });
-    }
-  }
-  return list;
+  if (!Array.isArray(t.members)) t.members = [];
+  if (!Array.isArray(t.pending)) t.pending = [];
+  return t;
 }
 
-function broadcastChatRooms() {
-  sendChatRoomsToLocal();
-  // Peer backend lai ni our rooms share garau (global directory)
-  syncRoomsToPeers();
-}
-
-// Local clients lai merged room list pathau (peer sync aayo bhaye pani)
-function sendChatRoomsToLocal() {
-  sendGlobal({ type: "chatroom_list", rooms: chatRoomListPayload() });
-}
-
-// Local room list → peers (global room directory)
-function syncRoomsToPeers() {
-  if (PEERS.length === 0) return;
-  const mine = [];
-  const my_url = peerHostUrl();
-  for (const r of chatRooms.values()) {
-    const slots = [];
-    for (let i = 0; i < 4; i++) {
-      const w = r.slots ? r.slots[i] : null;
-      slots.push(w && w.readyState === 1
-        ? { slot: i, playerName: w.chatName || "Player", playerId: w.chatProfileId || "" }
-        : {});
-    }
-    mine.push({
-      id: r.id, name: r.name, ownerName: r.ownerName,
-      ownerProfileId: r.ownerProfileId || "",
-      members: r.members.size, mode: r.mode || "MUMMY_VS_HUMAN",
-      maxPlayers: r.maxPlayers || 4, slots,
-    });
+// Yai slot occupy bhayo ki? (member ba pending — except pid chhudeu)
+function teamSlotUsed(team, slot, exceptPid) {
+  for (const m of team.members) {
+    if (m.slot === slot && m.profileId !== exceptPid) return true;
   }
-  const payload = { from: SELF_ID, url: my_url, rooms: mine };
-  for (const peer of PEERS) {
-    httpPostJson(peer.url, "/mm/chatroom-sync", payload, 3000);
+  for (const p of team.pending) {
+    if (p.slot === slot && p.profileId !== exceptPid) return true;
   }
+  return false;
 }
 
-// Stale group-invite reservations expire (2 min) — slot permanently block hudaina
-const GROUP_RESERVE_TTL_MS = 120000;
-function sweepChatRoomReservations() {
+// First available slot (TEAM 1 bata) — server matra decide garcha.
+function teamFirstFreeSlot(team, exceptPid) {
+  for (let i = 0; i < TEAM_SLOTS; i++) {
+    if (!teamSlotUsed(team, i, exceptPid)) return i;
+  }
+  return -1;
+}
+
+// Expired pending invites hataucha (ghost reservation rok).
+function teamPruneExpired(team) {
   const now = Date.now();
-  for (const room of chatRooms.values()) {
-    if (!room.reserved) continue;
-    for (const pid of Object.keys(room.reserved)) {
-      const r = room.reserved[pid];
-      if (!r || !r.ts || (now - r.ts) > GROUP_RESERVE_TTL_MS) {
-        delete room.reserved[pid];
-      }
+  const before = team.pending.length;
+  team.pending = team.pending.filter((p) => now - (Number(p.ts) || 0) <= TEAM_INVITE_TTL_MS);
+  return team.pending.length !== before;
+}
+
+function teamMembersPayload(team) {
+  return team.members.slice()
+    .sort((a, b) => (a.slot || 0) - (b.slot || 0))
+    .map((m) => ({ profileId: m.profileId, name: m.name, slot: m.slot }));
+}
+
+function teamPendingPayload(team) {
+  return team.pending.slice()
+    .sort((a, b) => (a.slot || 0) - (b.slot || 0))
+    .map((p) => ({ profileId: p.profileId, name: p.name, slot: p.slot }));
+}
+
+function teamStatePayload(team) {
+  return {
+    teamId: team.id,
+    members: teamMembersPayload(team),
+    pending: teamPendingPayload(team),
+  };
+}
+
+// Slot order matra — renumber hudaina (slot free bhayo bhane khali rahcha).
+function teamNormalize(team) {
+  team.members.sort((a, b) => (a.slot || 0) - (b.slot || 0));
+  team.pending.sort((a, b) => (a.slot || 0) - (b.slot || 0));
+}
+
+// Player lai team ma register (slot choose) — free slot matra.
+function teamRegisterMember(team, pid, nm, wantSlot) {
+  const existing = team.members.find((m) => m.profileId === pid);
+  let slot = (Number.isInteger(wantSlot) && wantSlot >= 0 && wantSlot < TEAM_SLOTS) ? wantSlot : -1;
+  if (existing) {
+    if (slot < 0 || teamSlotUsed(team, slot, pid)) slot = existing.slot;
+    existing.slot = slot;
+    existing.name = nm || existing.name;
+    return slot;
+  }
+  if (slot < 0 || teamSlotUsed(team, slot, pid)) slot = teamFirstFreeSlot(team, pid);
+  if (slot < 0) return -1;
+  team.members.push({ profileId: pid, name: nm, slot });
+  if (!team.ownerProfileId) team.ownerProfileId = pid;
+  return slot;
+}
+
+// Player team bata nikla → usko slot free (future invite ma reuse huncha).
+function teamRemoveMember(team, pid) {
+  const had = team.members.some((m) => m.profileId === pid);
+  team.members = team.members.filter((m) => m.profileId !== pid);
+  // Target banaera rakheko pending invite ni hatau (ghost reservation rok).
+  team.pending = team.pending.filter((p) => p.profileId !== pid);
+  // Owner gayo bhaye sab pending invite cancel (kasaai join na garna paune).
+  if (team.ownerProfileId === pid) team.pending = [];
+  teamNormalize(team);
+  return had;
+}
+
+// Team accept apply — server matra slot decide garcha.
+// Returns { ok, message, slot, members, pending }
+function teamApplyAccept(team, pid, nm, preferSlot) {
+  const pruned = teamPruneExpired(team);
+  if (!pid) return { ok: false, message: "Team join failed — not logged in." };
+  const already = team.members.find((m) => m.profileId === pid);
+  if (already) {
+    // Dherai join (double click) — idempotent, error nai.
+    team.pending = team.pending.filter((p) => p.profileId !== pid);
+    teamNormalize(team);
+    teamNotifyAll(team);
+    return { ok: true, slot: already.slot, members: teamMembersPayload(team), pending: teamPendingPayload(team) };
+  }
+  const pend = team.pending.find((p) => p.profileId === pid);
+  if (!pend) {
+    if (pruned) teamNotifyAll(team);
+    return { ok: false, message: "That invitation is no longer valid (expired or already used)." };
+  }
+  let slot = pend.slot;
+  if (!Number.isInteger(slot) || slot < 0 || slot >= TEAM_SLOTS || teamSlotUsed(team, slot, pid)) {
+    slot = teamFirstFreeSlot(team, pid);
+  }
+  if (slot < 0) {
+    team.pending = team.pending.filter((p) => p.profileId !== pid);
+    teamNotifyAll(team);
+    return { ok: false, message: "Team is full (4/4)." };
+  }
+  team.pending = team.pending.filter((p) => p.profileId !== pid);
+  team.members.push({ profileId: pid, name: nm || pend.name || "Player", slot });
+  teamNormalize(team);
+  teamNotifyAll(team);
+  console.log(`[TEAM] ${nm} joined team ${team.id} (${team.members.length}/${TEAM_SLOTS}) slot ${slot}`);
+  return { ok: true, slot, members: teamMembersPayload(team), pending: teamPendingPayload(team) };
+}
+
+// Team state local sockets lai pathau (members + pending target).
+function teamNotifyLocal(members, pending, teamId) {
+  const ids = [];
+  for (const m of members) ids.push(m.profileId);
+  for (const p of pending) ids.push(p.profileId);
+  for (const w of allClients) {
+    if (w.readyState !== 1 || !w.chatProfileId) continue;
+    if (ids.includes(w.chatProfileId)) {
+      send(w, { type: "team_state", teamId, members, pending });
+      // Purano client sanga compat (members matra).
+      send(w, { type: "team_members", teamId, members });
     }
   }
 }
-setInterval(sweepChatRoomReservations, 30000);
 
-function sendChatRoomMembers(room) {
-  const members = [];
-  for (const w of room.members) {
-    if (w.readyState === 1) {
-      members.push({
-        name: w.chatName || "Player",
-        profileId: w.chatProfileId || "",
-        isOwner: (w === room.ownerWs),
-      });
-    }
-  }
-  for (const w of room.members) {
-    send(w, { type: "chatroom_members", roomId: room.id, members, ownerProfileId: room.ownerId || "" });
+// Team state sab backend lai pathau (local + peer relay).
+function teamNotifyAll(team) {
+  const members = teamMembersPayload(team);
+  const pending = teamPendingPayload(team);
+  teamNotifyLocal(members, pending, team.id);
+  for (const peer of (PEERS || [])) {
+    httpPostJson(peer.url, "/mm/team-notify", { teamId: team.id, members, pending }, 3000);
   }
 }
 
-function leaveChatRoom(ws) {
-  const room = chatRooms.get(ws.chatRoomId);
-  if (!room) return;
-  room.members.delete(ws);
-  if (room.slots) {
-    const si = room.slots.indexOf(ws);
-    if (si >= 0) room.slots[si] = null;
-    // Team slots COMPACT — kholeu hataucha, bache ko Team 1 bata milcha
-    const kept = [];
-    for (let i = 0; i < room.slots.length; i++) {
-      if (room.slots[i]) kept.push(room.slots[i]);
-    }
-    for (let i = 0; i < room.slots.length; i++) {
-      room.slots[i] = kept[i] || null;
+// Invite process (server matra slot decide garcha).
+// wantSlot = client ko suggestion (free cha bhane use), nai bhaye first free.
+// Returns { ok, slot, message, resend }
+function teamProcessInvite(team, opts) {
+  const targetProfileId = String(opts.targetProfileId || "");
+  const targetName = String(opts.targetName || "");
+  const wantSlot = Number(opts.wantSlot);
+  const ownerSlot = Number(opts.ownerSlot);
+  const fromName = String(opts.fromName || "Player");
+  const fromProfileId = String(opts.fromProfileId || "");
+  teamPruneExpired(team);
+  // Inviter team ma register (afno chosen slot, nai bhaye first free).
+  if (fromProfileId && !team.members.some((m) => m.profileId === fromProfileId)) {
+    const own = teamRegisterMember(team, fromProfileId, fromName,
+      Number.isInteger(ownerSlot) ? ownerSlot : -1);
+    if (own < 0) return { ok: false, message: "Team is full (4/4)." };
+  }
+  // Target already member cha → re-invite (popup feri pathau, join idempotent).
+  const already = team.members.find((m) => m.profileId === targetProfileId);
+  if (already) {
+    return { ok: true, slot: already.slot, resend: true };
+  }
+  // Target lai pending invite already cha? → naya reservation hudaina,
+  // matra tyo slot ko invite re-send (duplicate invite thap).
+  const dupe = team.pending.find((p) => p.profileId === targetProfileId);
+  if (dupe) {
+    return { ok: true, slot: dupe.slot, resend: true };
+  }
+  // Slot allocate — server matra.
+  let slot = (Number.isInteger(wantSlot) && wantSlot >= 0 && wantSlot < TEAM_SLOTS) ? wantSlot : -1;
+  if (slot < 0 || teamSlotUsed(team, slot, targetProfileId)) {
+    slot = teamFirstFreeSlot(team, targetProfileId);
+  }
+  if (slot < 0) return { ok: false, message: "Team is full (4/4)." };
+  team.pending.push({
+    profileId: targetProfileId,
+    name: targetName || "Player",
+    slot,
+    ts: Date.now(),
+  });
+  teamNormalize(team);
+  // Inviter lai state pathau (slot reserved + INVITED tag).
+  teamNotifyAll(team);
+  return { ok: true, slot, resend: false };
+}
+
+// Invite payload target lai deliver (local first, tarai peers ma).
+function teamDeliverInvite(targetProfileId, payload) {
+  // SAME profileId ko SABA local socket lai pathau (2 window / 2 device).
+  let sent = false;
+  for (const w of allClients) {
+    if (w.readyState === 1 && w.chatProfileId && w.chatProfileId === targetProfileId) {
+      send(w, payload);
+      sent = true;
     }
   }
-  ws.chatRoomId = null;
-  // Khali room → delete
-  if (room.members.size === 0) {
-    chatRooms.delete(room.id);
-  } else {
-    // Owner gayo bhaye → bache ko RANDOM leader banau
-    if (room.ownerId && !room.members.has(room.ownerWs)) {
-      const rest = [...room.members].filter((w) => w.readyState === 1);
-      if (rest.length > 0) {
-        const newOwner = rest[Math.floor(Math.random() * rest.length)];
-        room.ownerWs = newOwner;
-        room.ownerId = newOwner.chatProfileId || "";
-        room.ownerName = newOwner.chatName || "Player";
-        for (const w of room.members) {
-          send(w, { type: "chatroom_owner", roomId: room.id, ownerProfileId: room.ownerId, ownerName: room.ownerName });
-        }
-      }
-    }
-    sendChatRoomMembers(room);
-  }
+  if (sent) return Promise.resolve(true);
+  const peers = PEERS || [];
+  if (!peers.length) return Promise.resolve(false);
+  return Promise.all(peers.map((peer) =>
+    httpPostJson(peer.url, "/mm/team-invite", { targetProfileId, payload }, 3000)
+  )).then((results) => results.some((r) => r && r.delivered));
 }
 
 function send(ws, data) {
@@ -1194,7 +1414,6 @@ wss.on("connection", (ws, req) => {
   // ── WORLD CHAT identity (online players list + join target) ──
   ws.chatName = "";
   ws.chatProfileId = "";
-  ws.chatRoomId = null;
   // Which match server this client is on (live player counts)
   ws.__serverId = null;
   // Player ko selected mode (set_mode le set huncha) — queue fallback
@@ -1213,15 +1432,6 @@ wss.on("connection", (ws, req) => {
 
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
-
-    // ── create_room DISABLED ────────────────────────────────────────────
-    // Free Fire style: game room manual create garna banned.
-    // Room/group banaune kaam WORLD CHAT (chatroom) bata,
-    // khelne ko QUICK MATCH (matchmaking) matra.
-    if (msg.type === "create_room") {
-      send(ws, { type: "error", message: "Room creation is disabled. Use QUICK MATCH or create a group in World Chat." });
-      return;
-    }
 
     if (msg.type === "join_room") {
       const code = (msg.roomCode || "").toUpperCase().trim();
@@ -1309,6 +1519,10 @@ wss.on("connection", (ws, req) => {
       };
       room.players.push(player);
       currentRoom = code;
+      // Socket identity persist (room join garera arko backend ma gya bhane pani
+      // team invite / online list ma profileId chahida).
+      if (msg.profileId) ws.chatProfileId = String(msg.profileId);
+      if (msg.playerName) ws.chatName = String(msg.playerName).slice(0, 24);
 
       send(ws, {
         type: "room_joined", roomCode: code,
@@ -1372,185 +1586,218 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // ── WORLD CHAT ROOMS ──
-    // list: open rooms (sabai connected players lai live update)
-    if (msg.type === "chatroom_list") {
-      send(ws, { type: "chatroom_list", rooms: chatRoomListPayload() });
-      return;
-    }
-
-    // create: naya room (creator ko name = room name), creator join huncha
-    if (msg.type === "chatroom_create") {
-      const name = String(msg.name || ws.chatName || "Player").substring(0, 32);
-      // NOTE: ws.chatName NAHI overwrite garcha — tyo player ko naam ho
-      // (slots/list ma player name dekhaune chahincha, room name ho chhaina).
-      if (msg.profileId) ws.chatProfileId = String(msg.profileId);
-      leaveChatRoom(ws);
-      // Client ko room id (UUID) diya bhaye use garcha — Supabase persist
-      // ko laagi global unique chahidaina (genCode 4-char backend ma collide huna sakcha).
-      let roomId = String(msg.roomId || "").substring(0, 64);
-      if (!roomId || chatRooms.has(roomId)) roomId = genCode();
-      const room = {
-        id: roomId,
-        name,
-        ownerId: ws.chatProfileId || "",
-        ownerWs: ws,
-        ownerName: ws.chatName || name,     // owner = player ko naam
-        ownerProfileId: ws.chatProfileId || "",
-        members: new Set(),
-        slots: [null, null, null, null],   // 4 slots — creator slot 0
-        reserved: {},                      // profileId -> reserved slot (group invite)
-        mode: String(msg.mode || "MUMMY_VS_HUMAN"),   // room ko game mode
-        maxPlayers: 4,                                    // 4 jana ko group
-        createdAt: Date.now(),
-      };
-      room.members.add(ws);
-      room.slots[0] = ws;
-      chatRooms.set(room.id, room);
-      ws.chatRoomId = room.id;
-      send(ws, { type: "chatroom_joined", roomId: room.id, roomName: room.name, owner: true, slotIndex: 0 });
-      broadcastChatRooms();
-      // Naya room banaayo bhaye sabai lai batau → client le world chat room
-      // list ma "NEW ROOM" system line dekhau.
-      sendGlobal({ type: "chatroom_created", roomId: room.id, roomName: room.name, ownerName: room.ownerName, hostUrl: peerHostUrl(), ts: Date.now() });
-      sendChatRoomMembers(room);
-      console.log(`[CHATROOM] ${name} created ${room.id}`);
-      return;
-    }
-
-    // join: room ma join
-    if (msg.type === "chatroom_join") {
-      const id = String(msg.roomId || "");
-      const room = chatRooms.get(id);
-      if (!room) {
-        send(ws, { type: "chatroom_join_error", error: "room_not_found" });
-        send(ws, { type: "error", message: "That room no longer exists." });
+    // ── TEAM SYSTEM (server = authoritative) ──
+    // team_sync / team_slot_select: player afno slot choose garcha
+    // (Team 1..4) → server ma register + sab lai state pathau.
+    if (msg.type === "team_sync" || msg.type === "team_slot_select") {
+      const teamId = String(msg.teamId || "").trim();
+      const pid = (ws.chatProfileId || String(msg.profileId || "")).trim();
+      if (!teamId || !pid) {
+        send(ws, { type: "team_error", message: "Team sync failed — not logged in." });
         return;
       }
-      // Joiner ko naam update (slots/list ma yo name dekhaunxa)
-      if (msg.name) ws.chatName = String(msg.name).substring(0, 40);
-      if (msg.profileId) ws.chatProfileId = String(msg.profileId);
-      // Slot select: client le "+" jaba click gareko slot index pathauncha.
-      let slot = Number(msg.slotIndex);
-      if (!(slot >= 0 && slot < 4)) slot = -1;
-      // Group invite reserve gareko slot (target le accept gareko) → tyo slot use
-      if (ws.chatProfileId && room.reserved && room.reserved[ws.chatProfileId] !== undefined) {
-        const rv = room.reserved[ws.chatProfileId];
-        const rslot = (rv && typeof rv === "object") ? Number(rv.slot) : Number(rv);
-        delete room.reserved[ws.chatProfileId];
-        if (rslot >= 0 && rslot < 4 && !(room.slots && room.slots[rslot])) slot = rslot;
-      }
-      if (slot >= 0 && room.slots && room.slots[slot] && room.slots[slot] !== ws) {
-        // Slot taken → client lai specific error (world chat ma toast dekhau)
-        send(ws, { type: "chatroom_join_error", error: "slot_taken" });
-        send(ws, { type: "error", message: "That slot is already taken." });
-        return;
-      }
-      leaveChatRoom(ws);
-      room.members.add(ws);
-      if (!room.slots) room.slots = [null, null, null, null];
+      const nm = ws.chatName || String(msg.name || "Player");
+      const wantSlot = Number(msg.slotIndex);
+      const team = teamGet(teamId);
+      const slot = teamRegisterMember(team, pid, nm,
+        Number.isInteger(wantSlot) ? wantSlot : -1);
       if (slot < 0) {
-        // Slot diya chaina → first free slot
-        slot = room.slots.findIndex((x) => x === null);
-        if (slot < 0) slot = 0;
+        send(ws, { type: "team_error", message: "Team is full (4/4)." });
+        return;
       }
-      room.slots[slot] = ws;
-      ws.chatRoomId = room.id;
-      send(ws, { type: "chatroom_joined", roomId: room.id, roomName: room.name, owner: false, slotIndex: slot });
-      broadcastChatRooms();
-      sendChatRoomMembers(room);
+      teamPruneExpired(team);
+      teamNormalize(team);
+      teamNotifyAll(team);
+      send(ws, Object.assign({ type: "team_state" }, teamStatePayload(team)));
+      console.log(`[TEAM] ${nm} took slot ${slot} of team ${teamId}`);
       return;
     }
 
-    // group invite: friend lai group (chatroom) ma invite — slot reserve
-    if (msg.type === "group_invite") {
+    // team invite: friend lai mero team (Team 1..4) ma invite
+    if (msg.type === "team_invite") {
       const targetProfileId = String(msg.targetProfileId || "").trim();
-      const room = chatRooms.get(String(msg.roomId || ""));
-      if (!room) {
-        send(ws, { type: "error", message: "Group invite failed — group not found." });
+      const teamId = String(msg.teamId || "").trim();
+      const targetName = String(msg.targetName || "").trim();
+      const wantSlot = Number(msg.slotIndex);
+      const ownerSlot = Number(msg.ownerSlot);
+      // Free Fire style: invitee le accept garera SAME room ma join garna sake
+      const roomCode = String(msg.roomCode || "").trim().toUpperCase();
+      const roomUrl = String(msg.roomUrl || "").trim();
+      if (!targetProfileId || !teamId) {
+        send(ws, { type: "team_error", message: "Team invite failed — bad request." });
         return;
       }
-      if (!targetProfileId) {
-        send(ws, { type: "error", message: "Group invite failed — no friend." });
+      const myId = ws.chatProfileId || "";
+      if (targetProfileId === myId) {
+        send(ws, { type: "team_error", message: "You cannot invite yourself." });
         return;
       }
-      if (targetProfileId === (ws.chatProfileId || "")) {
-        send(ws, { type: "error", message: "You cannot invite yourself." });
-        return;
-      }
-      // Free slot reserve (4 slots) — client le slot diya bhaye tyo use
-      let slot = -1;
-      const reqSlot = Number(msg.slotIndex);
-      if (Number.isInteger(reqSlot) && reqSlot >= 0 && reqSlot < 4
-          && !(room.slots && room.slots[reqSlot])) {
-        slot = reqSlot;
-      }
-      const takenSlots = room.slots.map((x) => x ? 1 : 0);
-      for (const k of Object.keys(room.reserved || {})) {
-        const rv = room.reserved[k];
-        const rs = (rv && typeof rv === "object") ? Number(rv.slot) : Number(rv);
-        if (rs >= 0 && rs < 4) takenSlots[rs] = 1;
-      }
-      if (slot < 0) {
-        for (let i = 0; i < 4; i++) {
-          if (!takenSlots[i]) { slot = i; break; }
-        }
-      }
-      if (slot < 0) {
-        send(ws, { type: "error", message: "Group is full (4/4)." });
-        return;
-      }
-      if (!room.reserved) room.reserved = {};
-      room.reserved[targetProfileId] = { slot, ts: Date.now() };
-      // NOTE: team slot = slot index (Team 1 = 0)
       const fromName = ws.chatName || "Player";
+      const team = teams.get(teamId);
+      // Team arko backend ma cha (owner tara) → request tara forward garcha
+      // (slot allocation owner backend matra decide garcha).
+      if (!team) {
+        const peers = PEERS || [];
+        if (!peers.length) {
+          send(ws, { type: "team_error", message: "Team not found." });
+          return;
+        }
+        let pending = peers.length;
+        let done = false;
+        let lastErr = "Team not found.";
+        for (const peer of peers) {
+          httpPostJson(peer.url, "/mm/team-invite-request", {
+            teamId, targetProfileId, targetName, ownerSlot, roomCode, roomUrl,
+            fromName, fromProfileId: myId,
+          }, 3000).then((res) => {
+            if (res && res.ok) {
+              done = true;
+              send(ws, {
+                type: "team_invite_sent", targetProfileId, name: targetName,
+                slotIndex: Number(res.slotIndex || 0),
+              });
+            } else if (res && res.message) {
+              lastErr = res.message;
+            }
+            pending -= 1;
+            if (pending === 0 && !done) send(ws, { type: "team_error", message: lastErr });
+          });
+        }
+        return;
+      }
+      // Team yai backend ma cha → inviter register + slot reserve + deliver.
+      const result = teamProcessInvite(team, {
+        targetProfileId, targetName, wantSlot, ownerSlot, fromName, fromProfileId: myId,
+      });
+      if (!result.ok) {
+        send(ws, { type: "team_error", message: result.message });
+        return;
+      }
       const payload = {
-        type: "group_invite",
-        roomId: room.id,
-        roomName: room.name,
-        hostUrl: peerHostUrl(),
-        slotIndex: slot,
+        type: "team_invite",
+        teamId,
+        slotIndex: result.slot,
         fromName,
-        fromProfileId: ws.chatProfileId || "",
+        fromProfileId: myId,
+        roomCode: roomCode,
+        roomUrl: roomUrl,
         ts: Date.now(),
       };
-      // Target yai backend ma cha?
-      let target = null;
-      for (const w of allClients) {
-        if (w.readyState === 1 && w.chatProfileId && w.chatProfileId === targetProfileId) { target = w; break; }
-      }
-      if (target) {
-        send(target, payload);
-        console.log(`[GROUP-INVITE] ${fromName} → friend (slot ${slot}) room ${room.id}`);
+      teamDeliverInvite(targetProfileId, payload).then((delivered) => {
+        if (delivered) {
+          send(ws, { type: "team_invite_sent", targetProfileId, name: targetName, slotIndex: result.slot });
+          console.log(`[TEAM-INVITE] ${fromName} → friend (team ${teamId} slot ${result.slot})`);
+        } else {
+          // Target offline → reservation release (slot free).
+          team.pending = team.pending.filter((p) => p.profileId !== targetProfileId);
+          teamNotifyAll(team);
+          send(ws, { type: "team_error", message: "That friend is not online." });
+        }
+      });
+      return;
+    }
+
+    // team accept: friend le team join gare
+    if (msg.type === "team_accept") {
+      const teamId = String(msg.teamId || "").trim();
+      const slotIndex = Number(msg.slotIndex);
+      if (!teamId) {
+        send(ws, { type: "team_error", message: "Team join failed — bad request." });
         return;
       }
-      // Arko backend ma cha → peer ma forward
+      const pid = ws.chatProfileId || "";
+      if (!pid) {
+        send(ws, { type: "team_error", message: "Team join failed — not logged in." });
+        return;
+      }
+      const nm = ws.chatName || "Player";
+      const team = teams.get(teamId);
+      if (team) {
+        // Team yai backend ma cha → validate + add + notify
+        const result = teamApplyAccept(team, pid, nm, slotIndex);
+        if (!result.ok) {
+          send(ws, { type: "team_error", message: result.message });
+          return;
+        }
+        send(ws, { type: "team_state", teamId, members: result.members, pending: result.pending });
+        return;
+      }
+      // Team owner arko backend ma cha → peer ma forward
+      // Local mirror (disconnect bhaye owner lai bataune)
+      if (!localTeams.has(teamId)) localTeams.set(teamId, new Set());
+      localTeams.get(teamId).add(pid);
       const peers = PEERS || [];
-      let delivered = false;
       let pending = peers.length;
+      let ok = false;
+      let lastErr = "Team not found.";
       if (pending === 0) {
-        send(ws, { type: "error", message: "That friend is not online." });
+        send(ws, { type: "team_error", message: lastErr });
         return;
       }
       for (const peer of peers) {
-        httpPostJson(peer.url, "/mm/group-invite", {
-          targetProfileId, payload,
+        httpPostJson(peer.url, "/mm/team-accept", {
+          teamId, profileId: pid, name: nm, slotIndex,
         }, 3000).then((res) => {
-          if (res && res.delivered) delivered = true;
+          if (res && res.delivered) {
+            ok = true;
+            // Peer le handle gareko state → joiner lai direct pathau.
+            if (res && Array.isArray(res.members)) {
+              send(ws, {
+                type: "team_state",
+                teamId,
+                members: res.members,
+                pending: Array.isArray(res.pending) ? res.pending : [],
+              });
+            }
+          } else if (res && res.message) {
+            lastErr = res.message;
+          }
           pending -= 1;
-          if (pending === 0 && !delivered) {
-            delete room.reserved[targetProfileId];
-            send(ws, { type: "error", message: "That friend is not online." });
+          if (pending === 0 && !ok) {
+            send(ws, { type: "team_error", message: lastErr });
           }
         });
       }
       return;
     }
 
-    // leave: room bata nikal
-    if (msg.type === "chatroom_leave") {
-      leaveChatRoom(ws);
-      broadcastChatRooms();
+    // team decline: invite LATER (slot free hoyo — ghost reservation nai rakhne)
+    if (msg.type === "team_decline") {
+      const teamId = String(msg.teamId || "").trim();
+      const pid = ws.chatProfileId || "";
+      if (!teamId || !pid) return;
+      const team = teams.get(teamId);
+      if (team) {
+        const had = team.pending.some((p) => p.profileId === pid);
+        if (had) {
+          team.pending = team.pending.filter((p) => p.profileId !== pid);
+          teamNormalize(team);
+          teamNotifyAll(team);
+        }
+      } else {
+        for (const peer of (PEERS || [])) {
+          httpPostJson(peer.url, "/mm/team-decline", { teamId, profileId: pid }, 3000);
+        }
+      }
+      return;
+    }
+
+    // team leave: team bata nikal
+    if (msg.type === "team_leave") {
+      const teamId = String(msg.teamId || "").trim();
+      const pid = ws.chatProfileId || "";
+      const team = teams.get(teamId);
+      if (team && pid) {
+        teamRemoveMember(team, pid);
+        teamNotifyAll(team);
+        if (team.members.length === 0) teams.delete(teamId);
+      } else if (pid) {
+        // Owner arko backend ma cha → peer ma forward
+        for (const peer of (PEERS || [])) {
+          httpPostJson(peer.url, "/mm/team-member-left", { teamId, profileId: pid }, 3000);
+        }
+      }
+      if (localTeams.has(teamId)) localTeams.get(teamId).delete(pid);
       return;
     }
 
@@ -1610,6 +1857,9 @@ wss.on("connection", (ws, req) => {
 
     // ── QUICK MATCHMAKING — status-based pairing (2 real players, no fakes) ──
     if (msg.type === "quick_match") {
+      // Socket identity (quick match pachi pani team/online list kaam garna)
+      if (msg.profileId) ws.chatProfileId = String(msg.profileId);
+      if (msg.playerName) ws.chatName = String(msg.playerName).slice(0, 24);
       if (matchQueue.some((q) => q.ws === ws)) return; // duplicate request guard
       // Server full cha bhaye naya player admit hudaina (client lai popup dekhau).
       if (isServerFull()) {
@@ -1860,8 +2110,28 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", () => {
-    leaveChatRoom(ws);
-    broadcastChatRooms();
+    // Team bata hataucha (slot free + ghost hatau) + bachelai batau
+    const pid = ws.chatProfileId || "";
+    if (pid) {
+      for (const team of teams.values()) {
+        const hadPending = team.pending.some((p) => p.profileId === pid);
+        const hadMember = team.members.some((m) => m.profileId === pid);
+        if (hadMember || hadPending) {
+          teamRemoveMember(team, pid);
+          teamNotifyAll(team);
+          if (team.members.length === 0) teams.delete(team.id);
+        }
+      }
+      // Local mirror (team owner arko backend ma cha) → peer ma forward
+      for (const [tid, set] of localTeams.entries()) {
+        if (set.has(pid)) {
+          set.delete(pid);
+          for (const peer of (PEERS || [])) {
+            httpPostJson(peer.url, "/mm/team-member-left", { teamId: tid, profileId: pid }, 3000);
+          }
+        }
+      }
+    }
     allClients.delete(ws);
     matchQueue = matchQueue.filter((q) => q.ws !== ws); // queue bata turunti hata
     if (!currentRoom || !rooms[currentRoom]) return;
@@ -1910,6 +2180,10 @@ setInterval(() => {
       q.claimedBy = "";
       q.claimedAt = 0;
     }
+  }
+  // Expired team invites hatau (slot free + ghost reservation nai rakhne)
+  for (const team of teams.values()) {
+    if (teamPruneExpired(team)) teamNotifyAll(team);
   }
   // ── RENDER LOGS: periodic real player count ──
   const live = livePlayerCount();
