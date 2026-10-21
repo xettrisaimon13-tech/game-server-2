@@ -608,6 +608,8 @@ function chatRoomListPayload() {
       ownerName: r.ownerName,
       ownerProfileId: r.ownerProfileId,
       members: r.members.size,
+      mode: r.mode || "MUMMY_VS_HUMAN",
+      maxPlayers: r.maxPlayers || 4,
       slots,
     });
   }
@@ -801,6 +803,9 @@ async function tryPeerPair(entry) {
   if (entry.pairing) return false;
   if (!matchQueue.includes(entry)) return false;
   if (entry.ws.readyState !== 1) return false;
+  // CROSS-BACKEND pairing = 1v1 matra. Group (2v2/4v4) members SAME backend
+  // ma huncha — group lai split na garna cross claim hatauna.
+  if (entry.teamSize !== 1) return false;
   entry.pairing = true;
   try {
     return await _tryPeerPairInner(entry);
@@ -1225,6 +1230,8 @@ wss.on("connection", (ws, req) => {
         ownerProfileId: ws.chatProfileId || "",
         members: new Set(),
         slots: [null, null, null, null],   // 4 slots — creator slot 0
+        mode: String(msg.mode || "MUMMY_VS_HUMAN"),   // room ko game mode
+        maxPlayers: 4,                                    // 4 jana ko group
         createdAt: Date.now(),
       };
       room.members.add(ws);
@@ -1692,6 +1699,7 @@ setInterval(() => {
       && q.teamSize === entry.teamSize && q.serverId === entry.serverId
       && (q.groupId || "") === (entry.groupId || "") && !q.claimedBy).length;
     if (localCount >= 2 * entry.teamSize) continue;
+    if (entry.teamSize !== 1) continue;   // group = local match matra
     tryPeerPair(entry);
   }
 }, 2500);
