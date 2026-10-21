@@ -807,7 +807,8 @@ function sendGlobal(data) {
 // Bot fill delay: 30s..50s (random) — real player lai fair chance ✓
 const BOT_FILL_DELAY_MS = Math.max(2000, Number(process.env.BOT_FILL_DELAY_MS) || 30000);
 const BOT_FILL_DELAY_MAX_MS = Math.max(BOT_FILL_DELAY_MS, Number(process.env.BOT_FILL_DELAY_MAX_MS) || 50000);
-const BOT_MAX_PER_ROOM = Math.max(0, Number(process.env.BOT_MAX_PER_ROOM) || 3);
+// Max bots per match — 4v4 (8 slots) puri fill garna 7 chahida ✓
+const BOT_MAX_PER_ROOM = Math.max(0, Number(process.env.BOT_MAX_PER_ROOM) || 7);
 const BOT_MODES = ["MUMMY_VS_HUMAN"];   // bots ye mode ma matra add hunchu
 const BOT_NAMES = ["NOOB", "RAFA", "ZEKE", "VIPER", "GHOST", "BOLT", "FANG", "ROOK", "MIRA", "KANE"];
 const BOT_PERSONALITIES = ["aggressive", "balanced", "cautious", "berserker", "opportunist"];
