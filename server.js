@@ -408,6 +408,33 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── GROUP INVITE RELAY (peer → me) ──────────────────────
+  // Arko backend ma cha friend lai group invite forward garcha.
+  if (path === "/mm/group-invite" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      let data = {};
+      try { data = JSON.parse(body || "{}"); } catch { data = {}; }
+      const targetProfileId = String(data.targetProfileId || "");
+      const payload = data.payload || {};
+      let delivered = false;
+      if (targetProfileId && payload && payload.type === "group_invite") {
+        for (const w of allClients) {
+          if (w.readyState === 1 && w.chatProfileId && w.chatProfileId === targetProfileId) {
+            send(w, payload);
+            delivered = true;
+            console.log(`[GROUP-INVITE] relayed → friend (room ${payload.roomId})`);
+            break;
+          }
+        }
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, delivered }));
+    });
+    return;
+  }
+
   // ── GLOBAL ROOM DIRECTORY SYNC (peer → me) ──────────────
   // Dusro backend ko room list share garcha → "+" press garera join garna sakcha.
   if (path === "/mm/chatroom-sync" && req.method === "POST") {
@@ -1311,6 +1338,7 @@ wss.on("connection", (ws, req) => {
         ownerProfileId: ws.chatProfileId || "",
         members: new Set(),
         slots: [null, null, null, null],   // 4 slots — creator slot 0
+        reserved: {},                      // profileId -> reserved slot (group invite)
         mode: String(msg.mode || "MUMMY_VS_HUMAN"),   // room ko game mode
         maxPlayers: 4,                                    // 4 jana ko group
         createdAt: Date.now(),
@@ -1344,6 +1372,12 @@ wss.on("connection", (ws, req) => {
       // Slot select: client le "+" jaba click gareko slot index pathauncha.
       let slot = Number(msg.slotIndex);
       if (!(slot >= 0 && slot < 4)) slot = -1;
+      // Group invite reserve gareko slot (target le accept gareko) → tyo slot use
+      if (ws.chatProfileId && room.reserved && room.reserved[ws.chatProfileId] !== undefined) {
+        const rslot = room.reserved[ws.chatProfileId];
+        delete room.reserved[ws.chatProfileId];
+        if (!(room.slots && room.slots[rslot])) slot = rslot;
+      }
       if (slot >= 0 && room.slots && room.slots[slot] && room.slots[slot] !== ws) {
         // Slot taken → client lai specific error (world chat ma toast dekhau)
         send(ws, { type: "chatroom_join_error", error: "slot_taken" });
@@ -1363,6 +1397,82 @@ wss.on("connection", (ws, req) => {
       send(ws, { type: "chatroom_joined", roomId: room.id, roomName: room.name, owner: false, slotIndex: slot });
       broadcastChatRooms();
       sendChatRoomMembers(room);
+      return;
+    }
+
+    // group invite: friend lai group (chatroom) ma invite — slot reserve
+    if (msg.type === "group_invite") {
+      const targetProfileId = String(msg.targetProfileId || "").trim();
+      const room = chatRooms.get(String(msg.roomId || ""));
+      if (!room) {
+        send(ws, { type: "error", message: "Group invite failed — group not found." });
+        return;
+      }
+      if (!targetProfileId) {
+        send(ws, { type: "error", message: "Group invite failed — no friend." });
+        return;
+      }
+      if (targetProfileId === (ws.chatProfileId || "")) {
+        send(ws, { type: "error", message: "You cannot invite yourself." });
+        return;
+      }
+      // Free slot reserve (4 slots)
+      let slot = -1;
+      const takenSlots = room.slots.map((x) => x ? 1 : 0);
+      for (const k of Object.keys(room.reserved || {})) {
+        const rs = room.reserved[k];
+        if (rs >= 0 && rs < 4) takenSlots[rs] = 1;
+      }
+      for (let i = 0; i < 4; i++) {
+        if (!takenSlots[i]) { slot = i; break; }
+      }
+      if (slot < 0) {
+        send(ws, { type: "error", message: "Group is full (4/4)." });
+        return;
+      }
+      if (!room.reserved) room.reserved = {};
+      room.reserved[targetProfileId] = slot;
+      const fromName = ws.chatName || "Player";
+      const payload = {
+        type: "group_invite",
+        roomId: room.id,
+        roomName: room.name,
+        hostUrl: peerHostUrl(),
+        slotIndex: slot,
+        fromName,
+        fromProfileId: ws.chatProfileId || "",
+        ts: Date.now(),
+      };
+      // Target yai backend ma cha?
+      let target = null;
+      for (const w of allClients) {
+        if (w.readyState === 1 && w.chatProfileId && w.chatProfileId === targetProfileId) { target = w; break; }
+      }
+      if (target) {
+        send(target, payload);
+        console.log(`[GROUP-INVITE] ${fromName} → friend (slot ${slot}) room ${room.id}`);
+        return;
+      }
+      // Arko backend ma cha → peer ma forward
+      const peers = PEERS || [];
+      let delivered = false;
+      let pending = peers.length;
+      if (pending === 0) {
+        send(ws, { type: "error", message: "That friend is not online." });
+        return;
+      }
+      for (const peer of peers) {
+        httpPostJson(peer.url, "/mm/group-invite", {
+          targetProfileId, payload,
+        }, 3000).then((res) => {
+          if (res && res.delivered) delivered = true;
+          pending -= 1;
+          if (pending === 0 && !delivered) {
+            delete room.reserved[targetProfileId];
+            send(ws, { type: "error", message: "That friend is not online." });
+          }
+        });
+      }
       return;
     }
 
