@@ -408,6 +408,28 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── GLOBAL ROOM DIRECTORY SYNC (peer → me) ──────────────
+  // Dusro backend ko room list share garcha → "+" press garera join garna sakcha.
+  if (path === "/mm/chatroom-sync" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      let data = {};
+      try { data = JSON.parse(body || "{}"); } catch { data = {}; }
+      const from = String(data.from || "");
+      const url = String(data.url || "");
+      if (from && url && from !== SELF_ID) {
+        remoteChatRooms.set(from, { url, rooms: Array.isArray(data.rooms) ? data.rooms : [] });
+        // Local clients lai merged list pathau (peer ko room dekhau)
+        // NOTE: yahile syncRoomsToPeers() call HUNAINDA — loop huna huncha.
+        sendChatRoomsToLocal();
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+    return;
+  }
+
   if (path === "/mm/claim" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -587,9 +609,13 @@ function sendGlobal(data) {
 // WORLD CHAT ROOMS — player le afnai room create garcha
 // ═══════════════════════════════════════════════════════════
 const chatRooms = new Map();   // roomId -> { id, name, ownerId, ownerName, members:Set(ws), createdAt }
+// GLOBAL room directory — dusro backend ko room (peer sync le aayo).
+// Key = source backend id → { url, rooms: [...] }
+const remoteChatRooms = new Map();
 
 function chatRoomListPayload() {
   const list = [];
+  const my_url = peerHostUrl();
   for (const r of chatRooms.values()) {
     // Room bhitra ko player names (slots) — world chat row ma dekhau.
     // Slot position stable rahe (creator slot 0, joiners le "+" click gareko slot).
@@ -611,13 +637,64 @@ function chatRoomListPayload() {
       mode: r.mode || "MUMMY_VS_HUMAN",
       maxPlayers: r.maxPlayers || 4,
       slots,
+      hostUrl: my_url,     // room kun backend ma cha
+      local: true,
     });
+  }
+  // Peer backend ko rooms (global directory)
+  for (const src of remoteChatRooms.values()) {
+    for (const r of (src.rooms || [])) {
+      if (list.some((x) => x.id === r.id)) continue;   // local le override garcha
+      list.push({
+        id: r.id, name: r.name, ownerName: r.ownerName,
+        ownerProfileId: r.ownerProfileId || "",
+        members: r.members || 0,
+        mode: r.mode || "MUMMY_VS_HUMAN",
+        maxPlayers: r.maxPlayers || 4,
+        slots: r.slots || [],
+        hostUrl: src.url,
+        local: false,
+      });
+    }
   }
   return list;
 }
 
 function broadcastChatRooms() {
+  sendChatRoomsToLocal();
+  // Peer backend lai ni our rooms share garau (global directory)
+  syncRoomsToPeers();
+}
+
+// Local clients lai merged room list pathau (peer sync aayo bhaye pani)
+function sendChatRoomsToLocal() {
   sendGlobal({ type: "chatroom_list", rooms: chatRoomListPayload() });
+}
+
+// Local room list → peers (global room directory)
+function syncRoomsToPeers() {
+  if (PEERS.length === 0) return;
+  const mine = [];
+  const my_url = peerHostUrl();
+  for (const r of chatRooms.values()) {
+    const slots = [];
+    for (let i = 0; i < 4; i++) {
+      const w = r.slots ? r.slots[i] : null;
+      slots.push(w && w.readyState === 1
+        ? { slot: i, playerName: w.chatName || "Player", playerId: w.chatProfileId || "" }
+        : {});
+    }
+    mine.push({
+      id: r.id, name: r.name, ownerName: r.ownerName,
+      ownerProfileId: r.ownerProfileId || "",
+      members: r.members.size, mode: r.mode || "MUMMY_VS_HUMAN",
+      maxPlayers: r.maxPlayers || 4, slots,
+    });
+  }
+  const payload = { from: SELF_ID, url: my_url, rooms: mine };
+  for (const peer of PEERS) {
+    httpPostJson(peer.url, "/mm/chatroom-sync", payload, 3000);
+  }
 }
 
 function sendChatRoomMembers(room) {
@@ -1217,8 +1294,8 @@ wss.on("connection", (ws, req) => {
     // create: naya room (creator ko name = room name), creator join huncha
     if (msg.type === "chatroom_create") {
       const name = String(msg.name || ws.chatName || "Player").substring(0, 32);
-      // Creator ko name update (slots/list ma yo name dekhaunxa)
-      if (msg.name) ws.chatName = name;
+      // NOTE: ws.chatName NAHI overwrite garcha — tyo player ko naam ho
+      // (slots/list ma player name dekhaune chahincha, room name ho chhaina).
       if (msg.profileId) ws.chatProfileId = String(msg.profileId);
       leaveChatRoom(ws);
       const room = {
@@ -1226,7 +1303,7 @@ wss.on("connection", (ws, req) => {
         name,
         ownerId: ws.chatProfileId || "",
         ownerWs: ws,
-        ownerName: name,
+        ownerName: ws.chatName || name,     // owner = player ko naam
         ownerProfileId: ws.chatProfileId || "",
         members: new Set(),
         slots: [null, null, null, null],   // 4 slots — creator slot 0
@@ -1242,7 +1319,7 @@ wss.on("connection", (ws, req) => {
       broadcastChatRooms();
       // Naya room banaayo bhaye sabai lai batau → client le world chat room
       // list ma "NEW ROOM" system line dekhau.
-      sendGlobal({ type: "chatroom_created", roomId: room.id, roomName: room.name, ownerName: room.ownerName, ts: Date.now() });
+      sendGlobal({ type: "chatroom_created", roomId: room.id, roomName: room.name, ownerName: room.ownerName, hostUrl: peerHostUrl(), ts: Date.now() });
       sendChatRoomMembers(room);
       console.log(`[CHATROOM] ${name} created ${room.id}`);
       return;
