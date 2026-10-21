@@ -321,27 +321,32 @@ const server = http.createServer((req, res) => {
         else if (now - p.ts >= PRESENCE_TTL) presence.delete(pid);
       }
       const disabled = DISABLED_SERVERS.has(sv.id);
-      // Aafno backend (SELF) ma REAL live count — presence estimate bhanda
-      // thik. Baaki slot ma best-effort estimate.
+      // REAL count: aafno backend = live socket count; baaki = peer bata aako
+      // cached REAL count (presence estimate ho chhaina).
       const isSelf = sv.id === SELF_ID;
-      const total = isSelf ? livePlayerCount() : (connected + queued + browsing);
+      const peerReal = peerLiveCount(sv.id);
+      const real = isSelf ? livePlayerCount() : (peerReal > 0 ? peerReal : (connected + queued + browsing));
       return {
         id: sv.id,
         name: sv.name,
         countries: sv.countries || [],
         online: !disabled,
         status: disabled ? "offline" : "online",
-        players: total,
+        players: real,
         connected,
         queued,
         browsing,
         capacity: MAX_PLAYERS,
-        load: Math.min(100, Math.round((total / MAX_PLAYERS) * 100)),
-        full: total >= MAX_PLAYERS,
+        load: Math.min(100, Math.round((real / MAX_PLAYERS) * 100)),
+        full: real >= MAX_PLAYERS,
       };
     });
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ servers: list }));
+    res.end(JSON.stringify({
+      servers: list,
+      poolLive: poolLiveCount(),
+      poolCapacity: poolCapacity(),
+    }));
     return;
   }
 
@@ -364,6 +369,7 @@ const server = http.createServer((req, res) => {
       players: Object.values(rooms).reduce((a, r) => a + r.players.length, 0),
       serverId: SELF_ID, pool: POOL_OF[SELF_ID] || SELF_ID, peers: PEERS.length,
       capacity: MAX_PLAYERS, live: livePlayerCount(), full: isServerFull(),
+      poolLive: poolLiveCount(), poolCapacity: poolCapacity(),
     }));
     return;
   }
@@ -378,14 +384,15 @@ const server = http.createServer((req, res) => {
     req.on("end", () => {
       let data = {};
       try { data = JSON.parse(body || "{}"); } catch { data = {}; }
+      const allMode = data.mode === "";      // stats poll (all counts)
       const mode = String(data.mode || "SURVIVAL");
       const teamSize = Math.max(1, Math.min(4, Number(data.teamSize) || 1));
       const groupId = String(data.groupId || "");
       const now = Date.now();
       const waiting = matchQueue.filter((q) => q.ws.readyState === 1
         && now - q.queuedAt < 180000
-        && q.mode === mode && q.teamSize === teamSize
-        && (q.groupId || "") === groupId && !q.claimedBy);
+        && (allMode || (q.mode === mode && q.teamSize === teamSize))
+        && (allMode || (q.groupId || "") === groupId) && !q.claimedBy);
       // OLDEST waiting player ko timestamp (ordering rule ko)
       let oldest = 0;
       for (const q of waiting) if (!oldest || q.queuedAt < oldest) oldest = q.queuedAt;
@@ -822,6 +829,8 @@ async function _tryPeerPairInner(entry) {
       mode: entry.mode, teamSize: entry.teamSize, groupId,
     }, 2500);
     if (!status || !status.ok) return null;
+    // Peer ko REAL live count cache (panel/logs ma dekhaune)
+    cachePeerLive(peer.id, status.players);
     const peerOldest = Number(status.oldestQueuedAt) || 0;
     if (!peerOldest) return null;
     // HOST RULE: kam-load backend (older player tie-break) ma room bancha.
@@ -907,6 +916,46 @@ function livePlayerCount() {
   return n;
 }
 
+// ── PEER REAL LIVE COUNT CACHE ──────────────────────────
+// Har peer backend ko REAL connected player count (presence estimate ho chhaina).
+// /mm/status response ma peer le afno `players` pathauncha → tya bata cache update.
+// Cache stale (45s+) bhaye value lai skip garcha (galat number na dekhau).
+const peerLiveCache = new Map();   // peerId → { live, at }
+let lastConnectLog = 0;            // connect log throttle
+let lastLoggedCount = 0;           // 100-player milestone tracker
+const PEER_LIVE_TTL_MS = 45000;
+
+function cachePeerLive(peerId, live) {
+  if (!peerId) return;
+  peerLiveCache.set(peerId, { live: Number(live) || 0, at: Date.now() });
+}
+
+function peerLiveCount(peerId) {
+  const c = peerLiveCache.get(peerId);
+  if (!c) return 0;
+  if (Date.now() - c.at > PEER_LIVE_TTL_MS) return 0;
+  return c.live;
+}
+
+// GLOBAL pool total — sab 8 backend ko REAL count sum.
+function poolLiveCount() {
+  let total = livePlayerCount();
+  for (const [pid] of peerLiveCache) total += peerLiveCount(pid);
+  return total;
+}
+
+// Pool capacity — 8 backend × MAX_PLAYERS
+function poolCapacity() {
+  return MAX_PLAYERS * Object.keys(BACKEND_HOSTS).length;
+}
+
+// Render logs ma real player count (dashboard → Logs ma dekhincha)
+function logPlayerCount(reason) {
+  const live = livePlayerCount();
+  console.log(`[POOL] ${SELF_ID} live=${live} pool=${poolLiveCount()}/${poolCapacity()} (${reason})`);
+  return live;
+}
+
 // Server full cha? (capacity = MAX_PLAYERS, target 400)
 function isServerFull() {
   return livePlayerCount() >= MAX_PLAYERS;
@@ -975,6 +1024,16 @@ wss.on("connection", (ws, req) => {
   allClients.add(ws);
   // WS upgrade request bata pani identity detect garu (pehla HTTP hit nai bhayo bhaye)
   if (req && req.headers && req.headers.host) detectSelf(req.headers.host);
+  // ── RENDER LOGS: real player count (connect huda) ──
+  // 100 player cross bhayo bhaye alag line (milestone).
+  const liveNow = livePlayerCount();
+  if (liveNow % 100 === 0) {
+    console.log(`[POOL] ${SELF_ID} reached ${liveNow} players — pool ${poolLiveCount()}/${poolCapacity()}`);
+  }
+  if (Date.now() - lastConnectLog > 5000) {
+    lastConnectLog = Date.now();
+    logPlayerCount("connect");
+  }
   // Pairing (aanu ko socket ko handler bata pani) le yo socket ko currentRoom set garna sakos.
   ws.setRoom = (code) => { currentRoom = code; };
   // ── WORLD CHAT identity (online players list + join target) ──
@@ -1582,7 +1641,27 @@ setInterval(() => {
       q.claimedAt = 0;
     }
   }
+  // ── RENDER LOGS: periodic real player count ──
+  const live = livePlayerCount();
+  if (live >= lastLoggedCount + 100) {
+    lastLoggedCount = Math.floor(live / 100) * 100;
+    console.log(`[POOL] ${SELF_ID} crossed ${lastLoggedCount} players — pool ${poolLiveCount()}/${poolCapacity()}`);
+  }
+  logPlayerCount("tick");
 }, 30000);
+
+// ── PEER STATS POLL (real online count) ─────────────────
+// Dusro backend ko REAL player count kina chahincha → panel ma dekhaune.
+// Aafno backend ma kunai player cha bhane matra poll (free tier ma sleeping
+// instance na jaag-chau).
+setInterval(async () => {
+  if (PEERS.length === 0) return;
+  if (livePlayerCount() === 0) return;   // kunai chaina → poll nai garne
+  await Promise.all(PEERS.map(async (peer) => {
+    const st = await httpPostJson(peer.url, "/mm/status", { mode: "", teamSize: 0, groupId: "" }, 3000);
+    if (st && st.ok) cachePeerLive(peer.id, st.players);
+  }));
+}, 20000);
 
 // ── MATCHMAKING RETRY TICK ──────────────────────────────
 // Waiting player lai periodic feri peer scan — stale scan le deadlock na hos.
