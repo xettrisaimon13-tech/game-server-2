@@ -42,21 +42,26 @@ const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><ti
 </script></div></body></html>`;
 
 // ── SERVER REGISTRY ───────────────────────────────────────
-// 5 logical match servers. Each client picks one; matchmaking NEVER pairs
-// players from different servers. `id` is what the client sends in every
-// request; `name` is the display label shown in the UI.
+// 8 logical match servers. Each client picks one; `id` is what the client
+// sends in every request; `name` is the display label shown in the UI.
+// `countries` = player ko dekhaune list (server panel ma).
 const SERVERS = [
-  { id: "ASIA", name: "Server 1 (ASIA)" },
-  { id: "ASIA 2", name: "Server 2 (ASIA 2)" },  // backend: https://darkward-asia2.onrender.com
-  { id: "EUROPE", name: "Server 3 (EUROPE)" },  // backend: https://darkward-europe.onrender.com
-  { id: "AFRICA", name: "Server 4 (AFRICA)" },  // backend: https://darkwrad-afcria.onrender.com
-  { id: "OCEANIA", name: "Server 5 (OCEANIA)" },
-  { id: "NORTH AMERICA", name: "Server 6 (NORTH AMERICA)" },  // backend: https://darkward-na.onrender.com
-  { id: "SOUTH AMERICA", name: "Server 7 (SOUTH AMERICA)" },  // backend: https://darkward-sa.onrender.com
-  { id: "MIDDLE EAST", name: "Server 7 (MIDDLE EAST)" },  // backend: https://darkwrad-middle.onrender.com
+  { id: "ASIA", name: "Server 1 (ASIA)", countries: ["Nepal", "India", "Pakistan", "Bangladesh", "Sri Lanka", "Myanmar", "Cambodia", "Vietnam"] },
+  { id: "ASIA 2", name: "Server 2 (ASIA 2)", countries: ["China", "Japan", "Korea", "Taiwan", "Hong Kong", "Malaysia", "Philippines", "Indonesia", "Thailand"] },
+  { id: "EUROPE", name: "Server 3 (EUROPE)", countries: ["UK", "Ireland", "Germany", "France", "Italy", "Spain", "Netherlands", "Poland", "Sweden", "Ukraine"] },
+  { id: "AFRICA", name: "Server 4 (AFRICA)", countries: ["South Africa", "Nigeria", "Kenya", "Egypt", "Morocco", "Ghana", "Tanzania", "Uganda"] },
+  { id: "OCEANIA", name: "Server 5 (OCEANIA)", countries: ["Australia", "New Zealand", "Fiji", "Papua New Guinea", "Samoa"] },
+  { id: "NORTH AMERICA", name: "Server 6 (NORTH AMERICA)", countries: ["USA", "Canada", "Mexico", "Guatemala", "Costa Rica", "Panama"] },
+  { id: "SOUTH AMERICA", name: "Server 7 (SOUTH AMERICA)", countries: ["Brazil", "Argentina", "Colombia", "Chile", "Peru", "Venezuela"] },
+  { id: "MIDDLE EAST", name: "Server 8 (MIDDLE EAST)", countries: ["UAE", "Saudi Arabia", "Qatar", "Kuwait", "Oman", "Bahrain", "Jordan", "Lebanon", "Iran", "Iraq"] },
 ];
 const DEFAULT_SERVER_ID = SERVERS[0].id;
 const serverById = (id) => SERVERS.find((sv) => sv.id === id) || null;
+// ── CAPACITY ──────────────────────────────────────────────
+// Ek backend ma katti player handle garna sakincha. Target = 400.
+// Load full bhayo bhaye client lai popup dekhau ("traffic full, try later
+// or choose another server"). Load normal bhaye KAHILE popup hudaina.
+const MAX_PLAYERS = Math.max(10, Number(process.env.MAX_PLAYERS) || 400);
 // Operator can take a server offline without a redeploy.
 const DISABLED_SERVERS = new Set(
   (process.env.DISABLED_SERVERS || "").split(",").map((s) => s.trim()).filter(Boolean),
@@ -116,14 +121,33 @@ const BACKEND_URLS = {
   "MIDDLE EAST": "https://middle-east-ward.onrender.com",
 };
 // Match pool per slot — same pool = cross-backend match allowed.
+// GLOBAL pool: sab 8 backend ek pool ma → kun slot pick garyo, kasa sanga
+// pani START press gare same match ma parcha.
 const POOL_OF = {
-  "ASIA": "ASIA",
-  "ASIA 2": "ASIA",
+  "ASIA": "GLOBAL",
+  "ASIA 2": "GLOBAL",
+  "EUROPE": "GLOBAL",
+  "AFRICA": "GLOBAL",
+  "OCEANIA": "GLOBAL",
+  "NORTH AMERICA": "GLOBAL",
+  "SOUTH AMERICA": "GLOBAL",
+  "MIDDLE EAST": "GLOBAL",
 };
 
 let SELF_ID = (process.env.SERVER_ID || "").trim();
 let SELF_URL = (process.env.PUBLIC_URL || "").trim();
 let PEERS = [];
+let ENV_PEERS = [];
+
+// Pool peers banaunu — same pool + arko backend matra.
+function rebuildPeers() {
+  if (ENV_PEERS.length) { PEERS = ENV_PEERS; return; }
+  const myPool = POOL_OF[SELF_ID] || SELF_ID;
+  PEERS = Object.keys(BACKEND_URLS)
+    .filter((id) => (POOL_OF[id] || id) === myPool && id !== SELF_ID)
+    .map((id) => ({ id, url: BACKEND_URLS[id] }))
+    .filter((p) => p.url);
+}
 
 // Host header bata identity detect garu (first request ma).
 function detectSelf(host) {
@@ -131,21 +155,17 @@ function detectSelf(host) {
   const h = String(host).toLowerCase().split(":")[0].trim();
   const found = BACKEND_HOSTS[h];
   if (!found) return;
+  if (SELF_ID === found) return;
   SELF_ID = found;
   if (!SELF_URL) SELF_URL = "https://" + h;
-  // Pool peers (same pool, arko slot)
-  const myPool = POOL_OF[SELF_ID] || SELF_ID;
-  PEERS = Object.keys(POOL_OF)
-    .filter((id) => (POOL_OF[id] || id) === myPool && id !== SELF_ID)
-    .map((id) => ({ id, url: BACKEND_URLS[id] }))
-    .filter((p) => p.url);
+  rebuildPeers();
 }
 
 // Env override (explicit config wins over host detection).
 if (process.env.SERVER_ID) {
   SELF_ID = process.env.SERVER_ID.trim();
   if (process.env.PUBLIC_URL) SELF_URL = process.env.PUBLIC_URL.trim();
-  const envPeers = (process.env.PEERS || "")
+  ENV_PEERS = (process.env.PEERS || "")
     .split(",")
     .map((p) => p.trim())
     .filter(Boolean)
@@ -155,22 +175,8 @@ if (process.env.SERVER_ID) {
       return { id: p.slice(0, i).trim(), url: p.slice(i + 1).trim() };
     })
     .filter(Boolean);
-  if (envPeers.length) PEERS = envPeers;
-  else {
-    const myPool = POOL_OF[SELF_ID] || SELF_ID;
-    PEERS = Object.keys(POOL_OF)
-      .filter((id) => (POOL_OF[id] || id) === myPool && id !== SELF_ID)
-      .map((id) => ({ id, url: BACKEND_URLS[id] }))
-      .filter((p) => p.url);
-  }
-} else if (!SELF_URL) {
-  // Host detect garna first request ko wait garu
-  const myPoolGuess = "ASIA";
-  PEERS = Object.keys(POOL_OF)
-    .filter((id) => (POOL_OF[id] || id) === myPoolGuess && id !== "ASIA")
-    .map((id) => ({ id, url: BACKEND_URLS[id] }))
-    .filter((p) => p.url);
 }
+rebuildPeers();
 
 // Claim tokens: roomCode → { roomCode, slotIndex, player }  (reserved on this host)
 const pendingClaims = new Map();
@@ -315,15 +321,23 @@ const server = http.createServer((req, res) => {
         else if (now - p.ts >= PRESENCE_TTL) presence.delete(pid);
       }
       const disabled = DISABLED_SERVERS.has(sv.id);
+      // Aafno backend (SELF) ma REAL live count — presence estimate bhanda
+      // thik. Baaki slot ma best-effort estimate.
+      const isSelf = sv.id === SELF_ID;
+      const total = isSelf ? livePlayerCount() : (connected + queued + browsing);
       return {
         id: sv.id,
         name: sv.name,
+        countries: sv.countries || [],
         online: !disabled,
         status: disabled ? "offline" : "online",
-        players: connected + queued + browsing,   // real clients on this server
+        players: total,
         connected,
         queued,
         browsing,
+        capacity: MAX_PLAYERS,
+        load: Math.min(100, Math.round((total / MAX_PLAYERS) * 100)),
+        full: total >= MAX_PLAYERS,
       };
     });
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -349,6 +363,7 @@ const server = http.createServer((req, res) => {
       status: "ok", rooms: Object.keys(rooms).length,
       players: Object.values(rooms).reduce((a, r) => a + r.players.length, 0),
       serverId: SELF_ID, pool: POOL_OF[SELF_ID] || SELF_ID, peers: PEERS.length,
+      capacity: MAX_PLAYERS, live: livePlayerCount(), full: isServerFull(),
     }));
     return;
   }
@@ -357,14 +372,32 @@ const server = http.createServer((req, res) => {
   // /mm/status  → how many players are waiting here (for a peer to poll)
   // /mm/claim   → peer asks: "give me one waiting player" (atomic)
   // /mm/release → peer confirms: "this player is now reserved for room X"
-  if (path === "/mm/status" && req.method === "GET") {
-    const now = Date.now();
-    const waiting = matchQueue.filter((q) => q.ws.readyState === 1 && now - q.queuedAt < 180000);
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      ok: true, serverId: SELF_ID, pool: POOL_OF[SELF_ID] || SELF_ID,
-      waiting: waiting.length, rooms: Object.keys(rooms).length,
-    }));
+  if (path === "/mm/status" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      let data = {};
+      try { data = JSON.parse(body || "{}"); } catch { data = {}; }
+      const mode = String(data.mode || "SURVIVAL");
+      const teamSize = Math.max(1, Math.min(4, Number(data.teamSize) || 1));
+      const groupId = String(data.groupId || "");
+      const now = Date.now();
+      const waiting = matchQueue.filter((q) => q.ws.readyState === 1
+        && now - q.queuedAt < 180000
+        && q.mode === mode && q.teamSize === teamSize
+        && (q.groupId || "") === groupId && !q.claimedBy);
+      // OLDEST waiting player ko timestamp (ordering rule ko)
+      let oldest = 0;
+      for (const q of waiting) if (!oldest || q.queuedAt < oldest) oldest = q.queuedAt;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true, serverId: SELF_ID, pool: POOL_OF[SELF_ID] || SELF_ID,
+        waiting: waiting.length, oldestQueuedAt: oldest,
+        players: livePlayerCount(), capacity: MAX_PLAYERS, full: isServerFull(),
+        rooms: Object.keys(rooms).length,
+      }));
+      return;
+    });
     return;
   }
 
@@ -378,25 +411,41 @@ const server = http.createServer((req, res) => {
       const teamSize = Math.max(1, Math.min(4, Number(data.teamSize) || 1));
       const groupId = String(data.groupId || "");
       const now = Date.now();
-      // Atomic-ish claim: find the first eligible waiting player and pull
-      // it out of the queue so two peers can't grab the same one.
-      const idx = matchQueue.findIndex((q) => q.ws.readyState === 1
-        && now - q.queuedAt < 180000
-        && q.mode === mode && q.teamSize === teamSize
-        && (q.groupId || "") === groupId
-        && !q.claimedBy);
+      // OLDEST candidate (FIFO) — claim garne player.
+      let idx = -1;
+      for (let i = 0; i < matchQueue.length; i++) {
+        const q = matchQueue[i];
+        if (q.ws.readyState !== 1) continue;
+        if (now - q.queuedAt >= 180000) continue;
+        if (q.mode !== mode || q.teamSize !== teamSize) continue;
+        if ((q.groupId || "") !== groupId) continue;
+        if (q.claimedBy) continue;
+        if (q.pairing) continue;          // busy pairing (nai claim garne)
+        if (idx < 0 || q.queuedAt < matchQueue[idx].queuedAt) idx = i;
+      }
       if (idx < 0) {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: false, reason: "no_waiting_player" }));
         return;
       }
       const entry = matchQueue[idx];
+      // HOST RULE (server-side authoritative): requester nai host hunuparcha
+      // (kam load / older player). Na bhaye yo claim deny — mutual claim rok.
+      const reqKey = hostKeyOf(Number(data.myLoad) || 0, Number(data.myOldest) || 0, String(data.myId || ""));
+      const myKey = hostKeyOf(livePlayerCount(), entry.queuedAt, SELF_ID);
+      if (!hostKeyLess(reqKey, myKey)) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, reason: "not_your_turn" }));
+        return;
+      }
       entry.claimedBy = String(data.claimId || "");
+      entry.claimedAt = now;
       // Keep it in the queue but flagged — release removes the flag.
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         ok: true,
         claimId: entry.claimedBy,
+        queuedAt: entry.queuedAt,
         player: {
           name: entry.playerName, characterId: entry.characterId,
           loginType: entry.loginType, userId: entry.userId, profileId: entry.profileId,
@@ -417,6 +466,14 @@ const server = http.createServer((req, res) => {
       let found = null;
       for (const q of matchQueue) {
         if (q.claimedBy === claimId) { found = q; break; }
+      }
+      if (found && data.cancel) {
+        // Claim cancel — player afno queue ma nai badhne (lost hudaina)
+        found.claimedBy = "";
+        found.claimedAt = 0;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: true, cancelled: true }));
+        return;
       }
       if (found) {
         // Player is being migrated to the peer host → drop from our queue.
@@ -675,7 +732,7 @@ function progressTo(mode, teamSize, serverId) {
   const required = 2 * teamSize;
   // Server isolation: queue ma same SERVER ko players matra.
   const same = matchQueue.filter((q) => q.ws.readyState === 1 && q.mode === mode
-    && q.teamSize === teamSize && q.serverId === serverId);
+    && q.teamSize === teamSize && q.serverId === serverId && !q.claimedBy);
   const count = Math.min(same.length, required);
   same.forEach((q) => send(q.ws, { type: "match_progress", count, required }));
   return same;
@@ -684,37 +741,128 @@ function progressTo(mode, teamSize, serverId) {
 // ── CROSS-SERVER MATCHMAKING ───────────────────────────
 // Same pool ko arko backend (e.g. ASIA 2) bata ek player claim garcha.
 // Claimed player migrate huncha — room HOST backend ma bancha.
+//
+// RACE PROTECTION (7 peer ek satma):
+//   Ek matra side le claim garcha. Rule: "oldest waiting player le host
+//   banchha" — (myOldest, myId) < (peerOldest, peerId) bhaye matra ma
+//   peer bata pull garcha. Same timestamp bhaye server id le tie-break.
+//   Yette mutual claim (2 room, 2 player alag room) hudaina.
+function localOldestQueuedAt(mode, teamSize, groupId) {
+  let oldest = 0;
+  for (const q of matchQueue) {
+    if (q.ws.readyState !== 1) continue;
+    if (q.mode !== mode || q.teamSize !== teamSize) continue;
+    if ((q.groupId || "") !== (groupId || "")) continue;
+    if (q.claimedBy) continue;
+    if (!oldest || q.queuedAt < oldest) oldest = q.queuedAt;
+  }
+  return oldest;
+}
+
+// HOST KEY — kun backend ma room bancha decide garcha.
+//   Priority: (1) kam load (load balancing), (2) oldest waiting player
+//   (FIFO), (3) server id (tie-break, deterministic).
+//   Dui tara le SAME key compute garcha → ek matra side le pull garcha
+//   (mutual claim hudaina).
+function hostKeyOf(load, oldest, id) {
+  return [Number(load) || 0, Number(oldest) || 0, String(id || "")];
+}
+function hostKeyLess(a, b) {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] < b[i]) return true;
+    if (a[i] > b[i]) return false;
+  }
+  return false;
+}
+
+// Round-robin: ekchoti sab peer scan nagarda (Render cold-start bachat).
+let peerScanCursor = 0;
+function nextPeers(count) {
+  if (PEERS.length === 0) return [];
+  const n = Math.min(count, PEERS.length);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    out.push(PEERS[(peerScanCursor + i) % PEERS.length]);
+  }
+  peerScanCursor = (peerScanCursor + n) % PEERS.length;
+  return out;
+}
+
 async function tryPeerPair(entry) {
   if (PEERS.length === 0) return false;
+  // Per-entry lock — ekai player ko 2 oparu tryPeerPair le claim huna hudaina.
+  if (entry.pairing) return false;
   if (!matchQueue.includes(entry)) return false;
   if (entry.ws.readyState !== 1) return false;
+  entry.pairing = true;
+  try {
+    return await _tryPeerPairInner(entry);
+  } finally {
+    entry.pairing = false;
+  }
+}
+
+async function _tryPeerPairInner(entry) {
+  // Server full cha bhaye naya player yahii admit haina.
+  if (isServerFull()) return false;
   const required = 2 * entry.teamSize;
+  const groupId = entry.groupId || "";
   // Already enough locally → no need to bother peers.
   const localCount = matchQueue.filter((q) => q.ws.readyState === 1 && q.mode === entry.mode
     && q.teamSize === entry.teamSize && q.serverId === entry.serverId
-    && (q.groupId || "") === (entry.groupId || "")).length;
+    && (q.groupId || "") === groupId && !q.claimedBy).length;
   if (localCount >= required) return false;
 
-  for (const peer of PEERS) {
+  const myOldest = localOldestQueuedAt(entry.mode, entry.teamSize, groupId);
+  const candidates = nextPeers(3);   // 3 peer per tick (sab 7 chhaina, chhaina 3 tick pachi)
+
+  // Peer status + claim PARALLEL (sequential 7×4s = 28s bhayo)
+  const results = await Promise.all(candidates.map(async (peer) => {
+    const status = await httpPostJson(peer.url, "/mm/status", {
+      mode: entry.mode, teamSize: entry.teamSize, groupId,
+    }, 2500);
+    if (!status || !status.ok) return null;
+    const peerOldest = Number(status.oldestQueuedAt) || 0;
+    if (!peerOldest) return null;
+    // HOST RULE: kam-load backend (older player tie-break) ma room bancha.
+    const myKey = hostKeyOf(livePlayerCount(), myOldest, SELF_ID);
+    const peerKey = hostKeyOf(Number(status.players) || 0, peerOldest, peer.id);
+    if (!hostKeyLess(myKey, peerKey)) return null;   // peer nai host huncha
     const claimId = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
     const res = await httpPostJson(peer.url, "/mm/claim", {
-      claimId, mode: entry.mode, teamSize: entry.teamSize, groupId: entry.groupId || "",
-    }, 4000);
-    if (!res || !res.ok || !res.player) continue;
+      claimId, mode: entry.mode, teamSize: entry.teamSize, groupId,
+      myOldest, myId: SELF_ID, myLoad: livePlayerCount(),
+    }, 3000);
+    if (!res || !res.ok || !res.player) return null;
+    return { peer, res, claimId };
+  }));
+
+  for (const hit of results) {
+    if (!hit) continue;
+    const peer = hit.peer;
+    const res = hit.res;
+    const claimId = hit.claimId;
     const remote = res.player;
+    // Local player abhi kahile queue ma chha bhane feri check (double-claim guard).
+    // Arko peer le AAJULE claim gari sake bhane → hamro claim cancel.
+    // (Nai gare bhane player 2 room ma parcha — mutual claim rok.)
+    if (!matchQueue.includes(entry) || entry.ws.readyState !== 1 || entry.claimedBy) {
+      await httpPostJson(peer.url, "/mm/release", { claimId, cancel: true }, 3000);
+      return false;
+    }
 
     // Room banaa — host backend (yo) ma. Remote player ko reserved slot.
     const code = genCode();
     const localPlayer = {
       ws: entry.ws, id: 1, name: entry.playerName, characterId: entry.characterId,
       loginType: entry.loginType, userId: entry.userId, profileId: entry.profileId || "",
-      groupId: entry.groupId || "", device: entry.device, region: entry.region || "ASIA",
+      groupId: groupId, device: entry.device, region: entry.region || "ASIA",
       ready: false, slot: 1, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 },
     };
     const remotePlayer = {
       ws: null, id: 2, name: remote.name || "Player", characterId: remote.characterId || 0,
       loginType: remote.loginType || "guest", userId: remote.userId || "", profileId: remote.profileId || "",
-      groupId: remote.groupId || entry.groupId || "", device: remote.device || "", region: remote.region || entry.region || "ASIA",
+      groupId: remote.groupId || groupId, device: remote.device || "", region: remote.region || entry.region || "ASIA",
       ready: false, slot: 2, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 },
     };
     rooms[code] = {
@@ -750,6 +898,18 @@ async function tryPeerPair(entry) {
     return true;
   }
   return false;
+}
+
+// Server ko live load — capacity vs current players.
+function livePlayerCount() {
+  let n = 0;
+  for (const w of allClients) if (w.readyState === 1) n++;
+  return n;
+}
+
+// Server full cha? (capacity = MAX_PLAYERS, target 400)
+function isServerFull() {
+  return livePlayerCount() >= MAX_PLAYERS;
 }
 
 // Ye backend ko public URL (remote player migrate garna chaina).
@@ -1135,6 +1295,11 @@ wss.on("connection", (ws, req) => {
     // ── QUICK MATCHMAKING — status-based pairing (2 real players, no fakes) ──
     if (msg.type === "quick_match") {
       if (matchQueue.some((q) => q.ws === ws)) return; // duplicate request guard
+      // Server full cha bhaye naya player admit hudaina (client lai popup dekhau).
+      if (isServerFull()) {
+        send(ws, { type: "error", message: "This server's traffic is full. Please try in a later or choose another server." });
+        return;
+      }
       // Pahile room ma thiyo bhane niskin (solo host START → matchmaking)
       if (currentRoom && rooms[currentRoom]) {
         const old = rooms[currentRoom];
@@ -1410,8 +1575,33 @@ setInterval(() => {
       if (rooms[code]) delete rooms[code];
     }
   }
+  // Stuck claims clear (claimer crash bhayo bhane player block na hos)
+  for (const q of matchQueue) {
+    if (q.claimedBy && nowC - (q.claimedAt || 0) > 20000) {
+      q.claimedBy = "";
+      q.claimedAt = 0;
+    }
+  }
 }, 30000);
 
+// ── MATCHMAKING RETRY TICK ──────────────────────────────
+// Waiting player lai periodic feri peer scan — stale scan le deadlock na hos.
+// 2.5s interval, ekchoti 3 peer (round-robin) — Render cold-start bachat.
+setInterval(() => {
+  if (PEERS.length === 0) return;
+  if (isServerFull()) return;
+  // Local ma already pair bhayo bhane peer scan garna pardaina
+  for (const entry of matchQueue.slice()) {
+    if (entry.ws.readyState !== 1) continue;
+    if (entry.claimedBy) continue;
+    const localCount = matchQueue.filter((q) => q.ws.readyState === 1 && q.mode === entry.mode
+      && q.teamSize === entry.teamSize && q.serverId === entry.serverId
+      && (q.groupId || "") === (entry.groupId || "") && !q.claimedBy).length;
+    if (localCount >= 2 * entry.teamSize) continue;
+    tryPeerPair(entry);
+  }
+}, 2500);
+
 server.listen(PORT, () => {
-  console.log(`Night Ward Server v4.5 on port ${PORT}`);
+  console.log(`Night Ward Server v4.5 on port ${PORT} (${SELF_ID})`);
 });
