@@ -1253,7 +1253,7 @@ wss.on("connection", (ws, req) => {
 
     // ── WORLD CHAT ──
     // hello: client le afno name + profileId pathauncha (online list + join target)
-    if (msg.type === "world_chat_hello") {
+    if (msg.type === "chat_identity") {
       ws.chatName = String(msg.name || "Player").substring(0, 40);
       ws.chatProfileId = String(msg.profileId || "");
       return;
@@ -1298,8 +1298,12 @@ wss.on("connection", (ws, req) => {
       // (slots/list ma player name dekhaune chahincha, room name ho chhaina).
       if (msg.profileId) ws.chatProfileId = String(msg.profileId);
       leaveChatRoom(ws);
+      // Client ko room id (UUID) diya bhaye use garcha — Supabase persist
+      // ko laagi global unique chahidaina (genCode 4-char backend ma collide huna sakcha).
+      let roomId = String(msg.roomId || "").substring(0, 64);
+      if (!roomId || chatRooms.has(roomId)) roomId = genCode();
       const room = {
-        id: genCode(),
+        id: roomId,
         name,
         ownerId: ws.chatProfileId || "",
         ownerWs: ws,
@@ -1315,7 +1319,7 @@ wss.on("connection", (ws, req) => {
       room.slots[0] = ws;
       chatRooms.set(room.id, room);
       ws.chatRoomId = room.id;
-      send(ws, { type: "chatroom_joined", roomId: room.id, roomName: room.name, owner: true });
+      send(ws, { type: "chatroom_joined", roomId: room.id, roomName: room.name, owner: true, slotIndex: 0 });
       broadcastChatRooms();
       // Naya room banaayo bhaye sabai lai batau → client le world chat room
       // list ma "NEW ROOM" system line dekhau.
@@ -1330,6 +1334,7 @@ wss.on("connection", (ws, req) => {
       const id = String(msg.roomId || "");
       const room = chatRooms.get(id);
       if (!room) {
+        send(ws, { type: "chatroom_join_error", error: "room_not_found" });
         send(ws, { type: "error", message: "That room no longer exists." });
         return;
       }
@@ -1340,6 +1345,8 @@ wss.on("connection", (ws, req) => {
       let slot = Number(msg.slotIndex);
       if (!(slot >= 0 && slot < 4)) slot = -1;
       if (slot >= 0 && room.slots && room.slots[slot] && room.slots[slot] !== ws) {
+        // Slot taken → client lai specific error (world chat ma toast dekhau)
+        send(ws, { type: "chatroom_join_error", error: "slot_taken" });
         send(ws, { type: "error", message: "That slot is already taken." });
         return;
       }
@@ -1353,7 +1360,7 @@ wss.on("connection", (ws, req) => {
       }
       room.slots[slot] = ws;
       ws.chatRoomId = room.id;
-      send(ws, { type: "chatroom_joined", roomId: room.id, roomName: room.name, owner: false });
+      send(ws, { type: "chatroom_joined", roomId: room.id, roomName: room.name, owner: false, slotIndex: slot });
       broadcastChatRooms();
       sendChatRoomMembers(room);
       return;
@@ -1367,23 +1374,6 @@ wss.on("connection", (ws, req) => {
     }
 
     // msg: room bhitra message (members lai matra)
-    if (msg.type === "chatroom_msg") {
-      const room = chatRooms.get(ws.chatRoomId);
-      if (!room) return;
-      const text = String(msg.text || "").substring(0, 200);
-      if (text.length === 0) return;
-      const payload = {
-        type: "chatroom_msg",
-        roomId: room.id,
-        sender: ws.chatName || "Player",
-        senderProfileId: ws.chatProfileId || "",
-        text,
-        ts: Date.now(),
-      };
-      for (const w of room.members) send(w, payload);
-      return;
-    }
-
     if (msg.type === "chat_global") {
       const text = (msg.text || "").substring(0, 200);
       if (text.length === 0) return;
