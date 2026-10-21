@@ -732,6 +732,22 @@ function syncRoomsToPeers() {
   }
 }
 
+// Stale group-invite reservations expire (2 min) — slot permanently block hudaina
+const GROUP_RESERVE_TTL_MS = 120000;
+function sweepChatRoomReservations() {
+  const now = Date.now();
+  for (const room of chatRooms.values()) {
+    if (!room.reserved) continue;
+    for (const pid of Object.keys(room.reserved)) {
+      const r = room.reserved[pid];
+      if (!r || !r.ts || (now - r.ts) > GROUP_RESERVE_TTL_MS) {
+        delete room.reserved[pid];
+      }
+    }
+  }
+}
+setInterval(sweepChatRoomReservations, 30000);
+
 function sendChatRoomMembers(room) {
   const members = [];
   for (const w of room.members) {
@@ -755,6 +771,14 @@ function leaveChatRoom(ws) {
   if (room.slots) {
     const si = room.slots.indexOf(ws);
     if (si >= 0) room.slots[si] = null;
+    // Team slots COMPACT — kholeu hataucha, bache ko Team 1 bata milcha
+    const kept = [];
+    for (let i = 0; i < room.slots.length; i++) {
+      if (room.slots[i]) kept.push(room.slots[i]);
+    }
+    for (let i = 0; i < room.slots.length; i++) {
+      room.slots[i] = kept[i] || null;
+    }
   }
   ws.chatRoomId = null;
   // Khali room → delete
@@ -1411,9 +1435,10 @@ wss.on("connection", (ws, req) => {
       if (!(slot >= 0 && slot < 4)) slot = -1;
       // Group invite reserve gareko slot (target le accept gareko) → tyo slot use
       if (ws.chatProfileId && room.reserved && room.reserved[ws.chatProfileId] !== undefined) {
-        const rslot = room.reserved[ws.chatProfileId];
+        const rv = room.reserved[ws.chatProfileId];
+        const rslot = (rv && typeof rv === "object") ? Number(rv.slot) : Number(rv);
         delete room.reserved[ws.chatProfileId];
-        if (!(room.slots && room.slots[rslot])) slot = rslot;
+        if (rslot >= 0 && rslot < 4 && !(room.slots && room.slots[rslot])) slot = rslot;
       }
       if (slot >= 0 && room.slots && room.slots[slot] && room.slots[slot] !== ws) {
         // Slot taken → client lai specific error (world chat ma toast dekhau)
@@ -1453,22 +1478,31 @@ wss.on("connection", (ws, req) => {
         send(ws, { type: "error", message: "You cannot invite yourself." });
         return;
       }
-      // Free slot reserve (4 slots)
+      // Free slot reserve (4 slots) — client le slot diya bhaye tyo use
       let slot = -1;
+      const reqSlot = Number(msg.slotIndex);
+      if (Number.isInteger(reqSlot) && reqSlot >= 0 && reqSlot < 4
+          && !(room.slots && room.slots[reqSlot])) {
+        slot = reqSlot;
+      }
       const takenSlots = room.slots.map((x) => x ? 1 : 0);
       for (const k of Object.keys(room.reserved || {})) {
-        const rs = room.reserved[k];
+        const rv = room.reserved[k];
+        const rs = (rv && typeof rv === "object") ? Number(rv.slot) : Number(rv);
         if (rs >= 0 && rs < 4) takenSlots[rs] = 1;
       }
-      for (let i = 0; i < 4; i++) {
-        if (!takenSlots[i]) { slot = i; break; }
+      if (slot < 0) {
+        for (let i = 0; i < 4; i++) {
+          if (!takenSlots[i]) { slot = i; break; }
+        }
       }
       if (slot < 0) {
         send(ws, { type: "error", message: "Group is full (4/4)." });
         return;
       }
       if (!room.reserved) room.reserved = {};
-      room.reserved[targetProfileId] = slot;
+      room.reserved[targetProfileId] = { slot, ts: Date.now() };
+      // NOTE: team slot = slot index (Team 1 = 0)
       const fromName = ws.chatName || "Player";
       const payload = {
         type: "group_invite",
