@@ -807,6 +807,7 @@ function sendGlobal(data) {
 const BOT_FILL_DELAY_MS = Math.max(2000, Number(process.env.BOT_FILL_DELAY_MS) || 30000);
 const BOT_FILL_DELAY_MAX_MS = Math.max(BOT_FILL_DELAY_MS, Number(process.env.BOT_FILL_DELAY_MAX_MS) || 50000);
 const BOT_MAX_PER_ROOM = Math.max(0, Number(process.env.BOT_MAX_PER_ROOM) || 3);
+const BOT_MODES = ["MUMMY_VS_HUMAN"];   // bots ye mode ma matra add hunchu
 const BOT_NAMES = ["NOOB", "RAFA", "ZEKE", "VIPER", "GHOST", "BOLT", "FANG", "ROOK", "MIRA", "KANE"];
 const BOT_PERSONALITIES = ["aggressive", "balanced", "cautious", "berserker", "opportunist"];
 const BOT_CHARACTERS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
@@ -851,10 +852,13 @@ function addBotToRoom(code) {
 // Real player aayena bhaye BOT_FILL_DELAY_MS pachi missing slots bots le fill.
 function scheduleQueueBotFill(entry) {
   if (!entry || entry.botFillTimer) return;
+  // Bots ONLY in MUMMY VS HUMAN mode (other modes: real players matra ✓)
+  if (!BOT_MODES.includes(entry.mode)) return;
   const delay = BOT_FILL_DELAY_MS + Math.floor(Math.random() * Math.max(0, BOT_FILL_DELAY_MAX_MS - BOT_FILL_DELAY_MS));
   const h = setTimeout(() => {
     entry.botFillTimer = null;
     if (!matchQueue.includes(entry)) return;      // already matched / cancelled
+    if (!BOT_MODES.includes(entry.mode)) return;  // bots only in mummy mode ✓
     const required = 2 * entry.teamSize;
     const groupId = entry.groupId || "";
     const local = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && q.mode === entry.mode
