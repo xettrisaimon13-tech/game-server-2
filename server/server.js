@@ -1003,8 +1003,8 @@ function removeBotForRealPlayer(code) {
 // Slot 0..3 = "TEAM 1..4". Slot khali huda free (reuse huncha).
 const teams = new Map();
 const TEAM_SLOTS = 4;
-// Team bana/join → size 4 (auto ✓) — leader le pachi change garna sakinchha ✓
-const TEAM_SIZE_AUTO = 4;
+// Team size = leader/member ko selection (1/2/4 ✓) — naya team default 4 ✓
+const TEAM_SIZE_DEFAULT = 4;
 const TEAM_INVITE_TTL_MS = Number(process.env.TEAM_INVITE_TTL_MS) || 120000;   // invite 2 minute pachi expire
 // Local mirror: teamId -> Set(profileId) — yai backend ma kun member cha.
 const localTeams = new Map();
@@ -1012,7 +1012,7 @@ const localTeams = new Map();
 function teamGet(teamId) {
   let t = teams.get(teamId);
   if (!t) {
-    t = { id: teamId, ownerProfileId: "", teamSize: TEAM_SIZE_AUTO, members: [], pending: [], kicked: [] };
+    t = { id: teamId, ownerProfileId: "", teamSize: TEAM_SIZE_DEFAULT, members: [], pending: [], kicked: [] };
     teams.set(teamId, t);
   }
   if (!Array.isArray(t.members)) t.members = [];
@@ -1026,7 +1026,7 @@ function teamGet(teamId) {
 function teamMaxSize(team) {
   const ts = Number(team.teamSize || 0);
   if (ts === 1 || ts === 2 || ts === 4) return ts;
-  return TEAM_SIZE_AUTO;   // default = 4 ✓
+  return TEAM_SIZE_DEFAULT;   // default = 4 ✓
 }
 
 // Team full? (members + pending ≥ cap) ✓
@@ -1130,11 +1130,9 @@ function teamRegisterMember(team, pid, nm, wantSlot) {
   team.members.push({ profileId: pid, name: nm, slot });
   // Leader = team banaera (creator ✓) — join gareko NEVER leader hudaina ✓
   if (!team.ownerProfileId) {
+    // Creator = leader ✓ (naya team → default size 4 ✓)
     team.ownerProfileId = pid;
-    team.teamSize = TEAM_SIZE_AUTO;       // naya team → 4 ✓
-  } else if (team.ownerProfileId !== pid) {
-    // MEMBER join bhayo → size 4 (auto ✓) — leader ko choice overwrite hudaina ✗
-    team.teamSize = TEAM_SIZE_AUTO;
+    team.teamSize = TEAM_SIZE_DEFAULT;
   }
   // Ek matra ek team ✓
   teamRemovePlayerEverywhere(team, pid, team.id);
@@ -1201,8 +1199,7 @@ function teamApplyAccept(team, pid, nm, preferSlot) {
   }
   team.pending = team.pending.filter((p) => p.profileId !== pid);
   team.members.push({ profileId: pid, name: nm || pend.name || "Player", slot });
-  // Join bhayo → size 4 (auto ✓) — join gareko leader hudaina ✓
-  team.teamSize = TEAM_SIZE_AUTO;
+  // Join gareko → leader hudaina ✓ + team size (leader ko selection ✓) unchanged ✓
   teamNormalize(team);
   // Ek matra ek team ✓
   teamRemovePlayerEverywhere(team, pid, team.id);
@@ -1328,11 +1325,13 @@ function send(ws, data) {
 }
 
 function playerPublic(p) {
+  if (!p) return { id: 0, name: "?", characterId: 0, ready: false, slot: 0, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, loginType: "guest", groupId: "", region: "", profileId: "", isBot: false, botSkill: 0.5, botPersonality: "balanced" };
   return { id: p.id, name: p.name, characterId: p.characterId, ready: p.ready, slot: p.slot, position: p.position, rotation: p.rotation, loginType: p.loginType || "guest", groupId: p.groupId || "", region: p.region || "", profileId: p.profileId || "", isBot: !!p.isBot, botSkill: p.botSkill != null ? p.botSkill : 0.5, botPersonality: p.botPersonality || "balanced" };
 }
 
 function roomPlayers(code) {
-  return rooms[code].players.map(playerPublic);
+  if (!rooms[code] || !Array.isArray(rooms[code].players)) return [];
+  return rooms[code].players.filter(Boolean).map(playerPublic);
 }
 
 function findPlayer(code, ws) {
@@ -1474,6 +1473,46 @@ function progressTo(mode, teamSize, serverId, groupId) {
   const count = Math.min(same.length, required);
   same.forEach((q) => { if (q.ws) send(q.ws, { type: "match_progress", count, required }); });
   return same;
+}
+
+// ── FRIENDLY FIRE (same team = no damage ✓) ───────────────
+function teamIdOfProfile(pid) {
+  const p = String(pid || "");
+  if (!p) return "";
+  for (const [tid, t] of teams.entries()) {
+    if (t.members.some((m) => m.profileId === p)) return tid;
+  }
+  return "";
+}
+
+// Same team? (attacker + target ✓)
+function sameTeam(attackerPid, targetPid) {
+  const a = String(attackerPid || "");
+  const b = String(targetPid || "");
+  if (!a || !b || a === b) return false;
+  const ta = teamIdOfProfile(a);
+  const tb = teamIdOfProfile(b);
+  return !!(ta && tb && ta === tb);
+}
+
+// ── PARTY PICKING (team ek party ✓ — split hudaina ✗) ────
+// Group (team) ko ek party jasto whole pick huncha ✓.
+// Aa partial team (3/4) pani ek party ✓ (members split hudaina ✗).
+function pickParties(same, required) {
+  const parties = new Map();
+  for (const e of same) {
+    const g = e.groupId || ("solo:" + (e.id || e.profileId || e.playerName));
+    if (!parties.has(g)) parties.set(g, []);
+    parties.get(g).push(e);
+  }
+  const out = [];
+  let total = 0;
+  for (const [, list] of parties) {
+    if (total + list.length > required) continue;   // capacity ✓
+    for (const e of list) out.push(e);
+    total += list.length;
+  }
+  return out;
 }
 
 // ── CROSS-SERVER MATCHMAKING ───────────────────────────
@@ -1713,16 +1752,23 @@ function tryQuickPair(entry) {
   if (entry.ws) { if (entry.ws.readyState !== 1) return; } else if (!entry.isBot) { return; }
   matchQueue = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && Date.now() - q.queuedAt < 180000);
   if (!matchQueue.includes(entry)) return;
-  const same = progressTo(entry.mode, entry.teamSize, entry.serverId); // X/X pugyo ki nai herna agadi nai count pathau
+  // X/X pugyo ki nai herna agadi nai count pathau (mode + teamSize EXACT ✓)
+  const same = progressTo(entry.mode, entry.teamSize, entry.serverId);
   const required = 2 * entry.teamSize;
-  if (same.length < required) {
-    // Local ma partner chhaina → same-pool ko arko backend bata claim garna try.
+  // PARTY pick — team (groupId) ek party jasto whole ✓ (members split hudaina ✗)
+  const picked = pickParties(same, required);
+  const partyCount = new Set(picked.map((q) => q.groupId || ("solo:" + (q.id || q.profileId || q.playerName)))).size;
+  // Euta party matra cha → arko party chahidaina (solo+duo / squad+squad match hudaina ✗)
+  if (picked.length < required && partyCount < 2) {
     tryPeerPair(entry);
     return; // ajhai partner chahincha — next join aayepachi feri try
   }
-  const picked = same.slice(0, required); // pahile queue ma thiye → host order
-  // Same-group players ekai team ma naparaina banaune order ma halcha
-  const group = interleaveGroups(picked);
+  if (picked.length < 2) {
+    tryPeerPair(entry);
+    return;
+  }
+  // Party order (badi party pahile ✓) — team members ekai side ma ✓
+  const group = picked;
   for (const q of picked) {
     if (q.botFillTimer) { clearTimeout(q.botFillTimer); q.botFillTimer = null; }
   }
@@ -1756,7 +1802,9 @@ function tryQuickPair(entry) {
       send(e.ws, { type: "room_joined", roomCode: code, roomName: "Match", region: "GLOBAL", mode: rooms[code].mode, playerId: i + 1, maxPlayers: required, players: roomPlayers(code), hostId: 1 });
     }
   });
-  for (let i = 1; i < required; i++) {
+  // Party match ma members < required huna sakinchha (3/4 squad + 4/4 squad = 7 ✓)
+  // → loop ma ACTUAL player count use ✓ (undefined crash ✓)
+  for (let i = 1; i < rooms[code].players.length; i++) {
     broadcast(code, { type: "player_joined", player: playerPublic(rooms[code].players[i]), players: roomPlayers(code), hostId: 1 }, group[i].ws);
   }
   sendToAll(code, { type: "game_start", mode: rooms[code].mode, players: roomPlayers(code) });
@@ -1976,20 +2024,42 @@ wss.on("connection", (ws, req) => {
       const wantSlot = Number(msg.slotIndex);
       const teamExisted = teams.has(teamId);
       const team = teamGet(teamId);
-      // Team size change → LEADER matra ✓ (member le garna mildaina ✗)
       const wantSize = Number(msg.teamSize || 0);
       const validSize = (wantSize === 1 || wantSize === 2 || wantSize === 4);
+      const isOwner = !team.ownerProfileId || team.ownerProfileId === pid;
       const slot = teamRegisterMember(team, pid, nm,
         Number.isInteger(wantSlot) ? wantSlot : -1);
-      // Size rule:
-      //   • NAYA team banyo → 4 (auto ✓)
-      //   • MEMBER join → 4 (auto ✓)
-      //   • LEADER le change gareko → leader ko choice ✓
-      const isOwner = team.ownerProfileId === pid;
-      if (!teamExisted || !isOwner) {
-        team.teamSize = TEAM_SIZE_AUTO;
-      } else if (validSize) {
-        team.teamSize = wantSize;
+      if (slot < 0) {
+        const errMsg = (team.kicked && team.kicked.includes(pid))
+          ? "You were removed from this group by the leader."
+          : "Team is full.";
+        send(ws, { type: "team_error", message: errMsg });
+        return;
+      }
+      // ── SIZE RULES (leader only ✓) ──
+      //  • Member le size change garna mildaina ✗
+      //  • 4 → 2/1 allowed chhaina (team chhodna parcha ✓)
+      //  • 2 → 4 allowed ✓
+      //  • Member count > size allowed chhaina ✗
+      if (validSize && isOwner) {
+        const cur = Number(team.teamSize || TEAM_SIZE_DEFAULT);
+        if (!teamExisted) {
+          // NAYA team → leader ko selection apply ✓ (1/2/4 ✓)
+          team.teamSize = wantSize;
+        } else if (wantSize === 1 || wantSize === 2) {
+          if (cur === 4) {
+            // 4 → chhoto: allowed chhaina (exit/disband garna parcha ✓)
+            send(ws, { type: "team_error", message: "Exit or disband the team before switching to a smaller size." });
+            team.teamSize = cur;
+          } else if (team.members.length > wantSize) {
+            send(ws, { type: "team_error", message: "Too many members for that team size." });
+            team.teamSize = cur;
+          } else {
+            team.teamSize = wantSize;
+          }
+        } else {
+          team.teamSize = wantSize;   // 2 → 4 ✓ (ya 4 → 4 ✓)
+        }
       }
       if (slot < 0) {
         const wasKicked = team.kicked && team.kicked.includes(pid);
@@ -2378,6 +2448,10 @@ wss.on("connection", (ws, req) => {
         queuedAt: Date.now(),
         teamSize: (Number(msg.teamSize) >= 1 ? Math.min(4, Number(msg.teamSize)) : 2),
       };
+      // DUPLICATE guard — ek player ek matra queue ma ✓
+      // (ws reconnect hunda hai → profileId bata match ✓)
+      const qPid = String(msg.profileId || ws.chatProfileId || "");
+      matchQueue = matchQueue.filter((q) => q.ws !== ws && !(qPid && q.profileId === qPid));
       matchQueue.push(entry);
       // Group fill (3/4 squad + lone squad player → 4/4 ✓)
       pumpQueueGroups();
@@ -2399,9 +2473,15 @@ wss.on("connection", (ws, req) => {
     }
 
     if (msg.type === "quick_match_cancel") {
-      const entry = matchQueue.find((q) => q.ws === ws);
+      // NOTE: quick_match le ws reconnect garcha → entry ko ws purano huncha ✗
+      //       → profileId bata match garo ✓
+      const cancelPid = String(msg.profileId || ws.chatProfileId || "");
+      let entry = matchQueue.find((q) => q.ws === ws);
+      if (!entry && cancelPid) entry = matchQueue.find((q) => q.profileId === cancelPid);
       if (entry && entry.botFillTimer) { clearTimeout(entry.botFillTimer); entry.botFillTimer = null; }
-      matchQueue = matchQueue.filter((q) => q.ws !== ws);
+      // Entry (purano ws wala ✓) + naya ws dono hatau ✓
+      matchQueue = matchQueue.filter((q) => q !== entry && q.ws !== ws);
+      console.log(`[CANCEL] ${cancelPid || "?"} → removed=${!!entry} queue=${matchQueue.length}`);
       // Baki queue members ko count refresh (1/0 → … counter nai satik rahanos)
       if (entry) progressTo(entry.mode, entry.teamSize);
       // Cancel pachi fresh matchmade room (seal bhako <3s) ma chha → turunti nikal:
@@ -2530,6 +2610,7 @@ wss.on("connection", (ws, req) => {
       if (!bot) return;
       const target = room.players.find((p) => p.id === (msg.targetPlayerId | 0) && !p.isBot);
       if (!target) return;
+      // Bot ko team chhaina ✓ → bots le always damage garna sakinchha ✓
       broadcast(currentRoom, {
         type: "player_hit", targetPlayerId: target.id,
         fromPlayerId: bot.id, isBot: true, dmg: Number(msg.dmg) || 30,
@@ -2573,7 +2654,13 @@ wss.on("connection", (ws, req) => {
     }
 
     if (msg.type === "player_hit") {
-      broadcast(currentRoom, { type: "player_hit", targetPlayerId: msg.targetPlayerId | 0 }, ws);
+      // FRIENDLY FIRE OFF ✓ — same team = damage haina (server-authoritative ✓)
+      const targetId = msg.targetPlayerId | 0;
+      if (player && sameTeam(ws.chatProfileId, targetId)) {
+        console.log(`[DMG] blocked friendly fire ${ws.chatProfileId} → ${targetId}`);
+        return;
+      }
+      broadcast(currentRoom, { type: "player_hit", targetPlayerId: targetId }, ws);
       return;
     }
 
@@ -2676,6 +2763,16 @@ wss.on("connection", (ws, req) => {
     broadcast(currentRoom, { type: "player_left", playerId: null, players: roomPlayers(currentRoom), hostId: hostIdOf(room) });
   });
 });
+
+// ── QUEUE PUMP (2s) ───────────────────────────────────────
+// Party-wise matching retry — sabai queue huna sammaha try ✓
+// (mode + teamSize EXACT ✓, group ek party ✓)
+setInterval(() => {
+  for (const q of matchQueue.slice()) {
+    if (!q || q.claimedBy) continue;
+    tryQuickPair(q);
+  }
+}, 2000);
 
 setInterval(() => {
   // Stale presence (client gayo) nikal
