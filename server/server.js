@@ -2176,6 +2176,44 @@ wss.on("connection", (ws, req) => {
     }
 
     // team leave: team bata nikal
+    // ── GROUP MATCHING STATE (leader start/cancel → sab group member lai ✓)
+    if (msg.type === "group_mm") {
+      const teamId = String(msg.teamId || "").trim();
+      const op = String(msg.op || "").trim();
+      const pid = (ws.chatProfileId || String(msg.profileId || "")).trim();
+      if (!teamId) return;
+      const team = teams.get(teamId);
+      // Auth check — group member matra ✓
+      const isMember = team ? team.members.some((m) => m.profileId === pid) : false;
+      const isLeader = team ? team.ownerProfileId === pid : false;
+      if (op === "start" && !isLeader) {
+        // Start = leader matra ✓
+        return;
+      }
+      if (op === "cancel" && !isMember) {
+        // Cancel = group member matra ✓ (outsider garna hudaina ✗)
+        return;
+      }
+      // Group ma kasaile press garna sakinchha (cancel sab lai jauncha ✓)
+      if (op === "cancel") {
+        // Group ko sab queue entry hatau (member le cancel gare bhaye ✓)
+        const before = matchQueue.length;
+        matchQueue = matchQueue.filter((q) => (q.groupId || "") !== teamId);
+        if (matchQueue.length !== before) {
+          console.log(`[GROUP] ${pid} cancelled group ${teamId} matching`);
+        }
+      }
+      // Group ko sab member lai pathau ✓
+      const ids = team ? team.members.map((m) => m.profileId) : (pid ? [pid] : []);
+      for (const w of allClients) {
+        if (w.readyState !== 1 || !w.chatProfileId) continue;
+        if (ids.includes(w.chatProfileId)) {
+          send(w, { type: "group_mm", op, teamId });
+        }
+      }
+      return;
+    }
+
     if (msg.type === "team_leave") {
       const teamId = String(msg.teamId || "").trim();
       const pid = (ws.chatProfileId || String(msg.profileId || "")).trim();
