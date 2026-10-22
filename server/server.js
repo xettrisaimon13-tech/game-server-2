@@ -404,6 +404,9 @@ const server = http.createServer((req, res) => {
         players: livePlayerCount(), capacity: MAX_PLAYERS, full: isServerFull(),
         rooms: Object.keys(rooms).length,
         team: true, teamSlots: TEAM_SLOTS,   // team system support (client diagnostic)
+        groupV2: true,          // group leader/kick/size-cap/handoff/group-mm relay (deploy check ✓)
+        groupKick: true,        // team_kick endpoint ✓
+        groupMm: true,          // group_mm relay ✓
         bots: true, botFillMs: BOT_FILL_DELAY_MS, botFillMaxMs: BOT_FILL_DELAY_MAX_MS,
         botModes: BOT_MODES, botMax: BOT_MAX_PER_ROOM,
       }));
