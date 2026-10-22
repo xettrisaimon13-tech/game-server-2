@@ -619,6 +619,7 @@ const server = http.createServer((req, res) => {
         ownerSlot: Number(data.ownerSlot),
         fromName: String(data.fromName || "Player"),
         fromProfileId: String(data.fromProfileId || ""),
+        inviterProfileId: String(data.fromProfileId || ""),
       });
       if (!result.ok) {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -1242,6 +1243,11 @@ function teamNotifyAll(team, extraIds) {
 function teamProcessInvite(team, opts) {
   const targetProfileId = String(opts.targetProfileId || "");
   const targetName = String(opts.targetName || "");
+  // Jasto invite gareko = group LEADER ✓ (team naya cha bhaye ✓)
+  const inviterPid = String(opts.inviterProfileId || "");
+  if (inviterPid && !team.ownerProfileId) {
+    team.ownerProfileId = inviterPid;
+  }
   // Team size cap (Duo=2 / Squad=4) — full bhaye invite nai ✓
   if (teamIsFull(team, targetProfileId)) {
     return { ok: false, message: "Team is full." };
@@ -2037,6 +2043,7 @@ wss.on("connection", (ws, req) => {
       // Team yai backend ma cha → inviter register + slot reserve + deliver.
       const result = teamProcessInvite(team, {
         targetProfileId, targetName, wantSlot, ownerSlot, fromName, fromProfileId: myId,
+        inviterProfileId: myId,
       });
       if (!result.ok) {
         send(ws, { type: "team_error", message: result.message });
