@@ -1378,6 +1378,7 @@ function interleaveGroups(players) {
 //   - Open slot matra ✓
 //   - Ek player ekchoti matra ek group ma ✓ (groupId reassign)
 function pumpQueueGroups() {
+  // Group fill rules → MUMMY VS HUMAN mode matra ✓ (other modes unchanged ✓)
   const groups = new Map();
   for (const q of matchQueue) {
     if (q.claimedBy) continue;
@@ -1401,6 +1402,8 @@ function pumpQueueGroups() {
       if (entries2.length >= size) continue;
       if (entries2[0].mode !== entries[0].mode) continue;
       if (entries2[0].serverId !== entries[0].serverId) continue;
+      // Mode gate — MUMMY VS HUMAN matra ✓
+      if (entries[0].mode !== "MUMMY_VS_HUMAN") continue;
       // Merge — group2 ko members group1 ma (open slot fill ✓)
       for (const e of entries2) {
         e.groupId = gid;
