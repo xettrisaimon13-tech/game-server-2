@@ -533,8 +533,6 @@ const server = http.createServer((req, res) => {
           if (w.readyState !== 1 || !w.chatProfileId) continue;
           if (w.chatProfileId === targetId) {
             send(w, { type: "team_removed", teamId, reason: "kicked" });
-            send(w, { type: "team_notice", teamId,
-              message: "YOU WILL BE REMOVED BY THE LEADER" });
             send(w, { type: "team_state", teamId, ownerProfileId: team.ownerProfileId || "",
               teamSize: Number(team.teamSize || 0), maxSize: teamMaxSize(team),
               members: [], pending: [] });
@@ -1005,6 +1003,8 @@ function removeBotForRealPlayer(code) {
 // Slot 0..3 = "TEAM 1..4". Slot khali huda free (reuse huncha).
 const teams = new Map();
 const TEAM_SLOTS = 4;
+// Team bana/join → size 4 (auto ✓) — leader le pachi change garna sakinchha ✓
+const TEAM_SIZE_AUTO = 4;
 const TEAM_INVITE_TTL_MS = Number(process.env.TEAM_INVITE_TTL_MS) || 120000;   // invite 2 minute pachi expire
 // Local mirror: teamId -> Set(profileId) — yai backend ma kun member cha.
 const localTeams = new Map();
@@ -1012,7 +1012,7 @@ const localTeams = new Map();
 function teamGet(teamId) {
   let t = teams.get(teamId);
   if (!t) {
-    t = { id: teamId, ownerProfileId: "", teamSize: 0, members: [], pending: [], kicked: [] };
+    t = { id: teamId, ownerProfileId: "", teamSize: TEAM_SIZE_AUTO, members: [], pending: [], kicked: [] };
     teams.set(teamId, t);
   }
   if (!Array.isArray(t.members)) t.members = [];
@@ -1026,7 +1026,7 @@ function teamGet(teamId) {
 function teamMaxSize(team) {
   const ts = Number(team.teamSize || 0);
   if (ts === 1 || ts === 2 || ts === 4) return ts;
-  return TEAM_SLOTS;
+  return TEAM_SIZE_AUTO;   // default = 4 ✓
 }
 
 // Team full? (members + pending ≥ cap) ✓
@@ -1128,7 +1128,14 @@ function teamRegisterMember(team, pid, nm, wantSlot) {
   // Size cap ✓ (Solo 1 / Duo 2 / Squad 4)
   if (teamIsFull(team, pid)) return -1;
   team.members.push({ profileId: pid, name: nm, slot });
-  if (!team.ownerProfileId) team.ownerProfileId = pid;
+  // Leader = team banaera (creator ✓) — join gareko NEVER leader hudaina ✓
+  if (!team.ownerProfileId) {
+    team.ownerProfileId = pid;
+    team.teamSize = TEAM_SIZE_AUTO;       // naya team → 4 ✓
+  } else if (team.ownerProfileId !== pid) {
+    // MEMBER join bhayo → size 4 (auto ✓) — leader ko choice overwrite hudaina ✗
+    team.teamSize = TEAM_SIZE_AUTO;
+  }
   // Ek matra ek team ✓
   teamRemovePlayerEverywhere(team, pid, team.id);
   return slot;
@@ -1194,6 +1201,8 @@ function teamApplyAccept(team, pid, nm, preferSlot) {
   }
   team.pending = team.pending.filter((p) => p.profileId !== pid);
   team.members.push({ profileId: pid, name: nm || pend.name || "Player", slot });
+  // Join bhayo → size 4 (auto ✓) — join gareko leader hudaina ✓
+  team.teamSize = TEAM_SIZE_AUTO;
   teamNormalize(team);
   // Ek matra ek team ✓
   teamRemovePlayerEverywhere(team, pid, team.id);
@@ -1965,15 +1974,23 @@ wss.on("connection", (ws, req) => {
       }
       const nm = ws.chatName || String(msg.name || "Player");
       const wantSlot = Number(msg.slotIndex);
+      const teamExisted = teams.has(teamId);
       const team = teamGet(teamId);
-      // Team size (Solo 1 / Duo 2 / Squad 4) — owner le set garcha ✓
+      // Team size change → LEADER matra ✓ (member le garna mildaina ✗)
       const wantSize = Number(msg.teamSize || 0);
-      const isOwner = !team.ownerProfileId || team.ownerProfileId === pid;
-      if ((wantSize === 1 || wantSize === 2 || wantSize === 4) && isOwner) {
-        team.teamSize = wantSize;
-      }
+      const validSize = (wantSize === 1 || wantSize === 2 || wantSize === 4);
       const slot = teamRegisterMember(team, pid, nm,
         Number.isInteger(wantSlot) ? wantSlot : -1);
+      // Size rule:
+      //   • NAYA team banyo → 4 (auto ✓)
+      //   • MEMBER join → 4 (auto ✓)
+      //   • LEADER le change gareko → leader ko choice ✓
+      const isOwner = team.ownerProfileId === pid;
+      if (!teamExisted || !isOwner) {
+        team.teamSize = TEAM_SIZE_AUTO;
+      } else if (validSize) {
+        team.teamSize = wantSize;
+      }
       if (slot < 0) {
         const wasKicked = team.kicked && team.kicked.includes(pid);
         const errMsg = wasKicked ? "You were removed from this group by the leader." : "Team is full.";
@@ -2174,8 +2191,6 @@ wss.on("connection", (ws, req) => {
         if (w.readyState !== 1 || !w.chatProfileId) continue;
         if (w.chatProfileId === targetId) {
           send(w, { type: "team_removed", teamId, reason: "kicked" });
-          send(w, { type: "team_notice", teamId,
-            message: "YOU WILL BE REMOVED BY THE LEADER" });
           send(w, { type: "team_state", teamId, ownerProfileId: team.ownerProfileId || "",
             teamSize: Number(team.teamSize || 0), maxSize: teamMaxSize(team),
             members: [], pending: [] });
@@ -2251,9 +2266,9 @@ wss.on("connection", (ws, req) => {
       const team = teams.get(teamId);
       if (team && pid) {
         teamRemoveMember(team, pid);
-        // Leaver lai pani state pathau (stale member list avoid ✓)
+        // Leaver lai pani state pathau (stale member list avoid ✓ — silent ✓)
         teamNotifyAll(team, [pid]);
-        // Leaver ko "removed" → client Solo ma reset ✓
+        // Leaver ko "removed" → client Solo ma reset ✓ (koi message hudaina ✗ ✓)
         for (const w of allClients) {
           if (w.readyState !== 1 || !w.chatProfileId) continue;
           if (w.chatProfileId === pid) {
