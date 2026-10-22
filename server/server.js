@@ -530,6 +530,8 @@ const server = http.createServer((req, res) => {
           if (w.readyState !== 1 || !w.chatProfileId) continue;
           if (w.chatProfileId === targetId) {
             send(w, { type: "team_removed", teamId, reason: "kicked" });
+            send(w, { type: "team_notice", teamId,
+              message: "YOU WILL BE REMOVED BY THE LEADER" });
             send(w, { type: "team_state", teamId, ownerProfileId: team.ownerProfileId || "",
               teamSize: Number(team.teamSize || 0), maxSize: teamMaxSize(team),
               members: [], pending: [] });
@@ -1006,11 +1008,12 @@ const localTeams = new Map();
 function teamGet(teamId) {
   let t = teams.get(teamId);
   if (!t) {
-    t = { id: teamId, ownerProfileId: "", teamSize: 0, members: [], pending: [] };
+    t = { id: teamId, ownerProfileId: "", teamSize: 0, members: [], pending: [], kicked: [] };
     teams.set(teamId, t);
   }
   if (!Array.isArray(t.members)) t.members = [];
   if (!Array.isArray(t.pending)) t.pending = [];
+  if (!Array.isArray(t.kicked)) t.kicked = [];
   return t;
 }
 
@@ -1116,6 +1119,8 @@ function teamRegisterMember(team, pid, nm, wantSlot) {
   }
   if (slot < 0 || teamSlotUsed(team, slot, pid)) slot = teamFirstFreeSlot(team, pid);
   if (slot < 0) return -1;
+  // Kick gareko player feri join garna mildaina ✓
+  if (team.kicked && team.kicked.includes(pid)) return -1;
   // Size cap ✓ (Solo 1 / Duo 2 / Squad 4)
   if (teamIsFull(team, pid)) return -1;
   team.members.push({ profileId: pid, name: nm, slot });
@@ -1131,6 +1136,8 @@ function teamRemoveMember(team, pid) {
   team.members = team.members.filter((m) => m.profileId !== pid);
   // Target banaera rakheko pending invite ni hatau (ghost reservation rok).
   team.pending = team.pending.filter((p) => p.profileId !== pid);
+  // Kick gareko player lai group bata feri auna mildaina ✓ (kicked list ✓)
+  if (!team.kicked.includes(pid)) team.kicked.push(pid);
   // Owner gayo bhaye sab pending invite cancel (kasaai join na garna paune).
   if (team.ownerProfileId === pid) {
     team.pending = [];
@@ -1154,6 +1161,12 @@ function teamApplyAccept(team, pid, nm, preferSlot) {
     teamNormalize(team);
     teamNotifyAll(team);
     return { ok: true, slot: already.slot, members: teamMembersPayload(team), pending: teamPendingPayload(team) };
+  }
+  // Kick gareko player feri join garna mildaina ✓
+  if (team.kicked && team.kicked.includes(pid)) {
+    team.pending = team.pending.filter((p) => p.profileId !== pid);
+    teamNotifyAll(team);
+    return { ok: false, message: "You were removed from this group by the leader." };
   }
   const pend = team.pending.find((p) => p.profileId === pid);
   if (!pend) {
@@ -1229,6 +1242,10 @@ function teamProcessInvite(team, opts) {
   // Team size cap (Duo=2 / Squad=4) — full bhaye invite nai ✓
   if (teamIsFull(team, targetProfileId)) {
     return { ok: false, message: "Team is full." };
+  }
+  // Kick gareko player lai feri invite garna mildaina ✓
+  if (team.kicked && team.kicked.includes(targetProfileId)) {
+    return { ok: false, message: "That player was removed from this group." };
   }
   const wantSlot = Number(opts.wantSlot);
   const ownerSlot = Number(opts.ownerSlot);
@@ -1949,7 +1966,9 @@ wss.on("connection", (ws, req) => {
       const slot = teamRegisterMember(team, pid, nm,
         Number.isInteger(wantSlot) ? wantSlot : -1);
       if (slot < 0) {
-        send(ws, { type: "team_error", message: "Team is full." });
+        const wasKicked = team.kicked && team.kicked.includes(pid);
+        const errMsg = wasKicked ? "You were removed from this group by the leader." : "Team is full.";
+        send(ws, { type: "team_error", message: errMsg });
         return;
       }
       teamPruneExpired(team);
@@ -2145,6 +2164,8 @@ wss.on("connection", (ws, req) => {
         if (w.readyState !== 1 || !w.chatProfileId) continue;
         if (w.chatProfileId === targetId) {
           send(w, { type: "team_removed", teamId, reason: "kicked" });
+          send(w, { type: "team_notice", teamId,
+            message: "YOU WILL BE REMOVED BY THE LEADER" });
           send(w, { type: "team_state", teamId, ownerProfileId: team.ownerProfileId || "",
             teamSize: Number(team.teamSize || 0), maxSize: teamMaxSize(team),
             members: [], pending: [] });
