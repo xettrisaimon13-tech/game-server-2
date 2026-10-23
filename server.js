@@ -14,9 +14,9 @@ setInterval(() => {
   for (const [k, v] of pendingAuth) if (now - v.ts > AUTH_TTL_MS) pendingAuth.delete(k);
 }, 60000);
 
-const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Night Ward</title>
-<style>body{background:#0b070c;color:#e7d8c4;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.c{text-align:center;padding:40px}h1{color:#c43b4a;font-size:26px}p{color:#8a7a72;font-size:15px}#st{color:#c43b4a;margin-top:16px}</style></head>
-<body><div class="c"><h1>&#10003; Night Ward</h1><p id="st">Completing login...</p>
+const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Night Ward - FLAME STRIKE</title>
+<style>body{background:#0b070c;color:#e7d8c4;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.c{text-align:center;padding:40px}h1{color:#c43b4a;font-size:26px;margin-bottom:4px}h2{color:#ff7a1a;font-size:20px;letter-spacing:4px;margin:0 0 16px}p{color:#8a7a72;font-size:15px}#st{color:#c43b4a;margin-top:16px}</style></head>
+<body><div class="c"><h1>&#10003; Night Ward</h1><h2>FLAME STRIKE</h2><p id="st">Completing login...</p>
 <script>
 (function() {
   var st = document.getElementById('st');
