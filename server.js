@@ -181,14 +181,14 @@ const server = http.createServer((req, res) => {
         const state = String(data.state || "");
         const at = String(data.access_token || "");
         
-        // FIX: Adjusted regex to support hyphens and underscores commonly found in UUIDs/OAuth states
+        // FIXED: Allow hyphens and underscores to support UUIDs and URL-safe OAuth states
         if (/^[a-zA-Z0-9\-_]{16,128}$/.test(state) && at.length > 20 && at.length < 16384) {
           pendingAuth.set(state, { at, rt: String(data.refresh_token || ""), ts: Date.now() });
           console.log("[AUTH] tokens stored for state", state.slice(0, 8));
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true }));
         } else {
-          console.log("[AUTH] invalid payload rejected. State:", state, "Length:", state.length);
+          console.log("[AUTH] invalid payload rejected. State:", state);
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "invalid payload" }));
         }
