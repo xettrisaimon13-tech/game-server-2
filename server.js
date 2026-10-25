@@ -147,40 +147,7 @@ function httpPostJson(url, path, bodyObj, timeoutMs) {
     req.end();
   });
 }
-  if (path === "/auth/receive" && req.method === "POST") {
-    let body = "";
-    let size = 0;
-    req.on("data", (chunk) => {
-      size += chunk.length;
-      if (size <= 65536) body += chunk.toString();
-    });
-    req.on("end", () => {
-      try {
-        const data = JSON.parse(body);
-        const state = String(data.state || "");
-        const at = String(data.access_token || "");
-        
-        console.log(`[AUTH-RECEIVE] Attempting to store tokens. State: ${state.slice(0, 10)}... Token length: ${at.length}`);
 
-        // RELAXED VALIDATION: We check if state exists and token is reasonable length
-        if (state.length > 5 && at.length > 20) {
-          pendingAuth.set(state, { at, rt: String(data.refresh_token || ""), ts: Date.now() });
-          console.log(`[AUTH-SUCCESS] Tokens stored for state: ${state.slice(0, 10)}...`);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ ok: true }));
-        } else {
-          console.log(`[AUTH-REJECTED] Invalid payload. State length: ${state.length}, Token length: ${at.length}`);
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "invalid payload" }));
-        }
-      } catch (e) {
-        console.log(`[AUTH-ERROR] JSON parse failed: ${e.message}`);
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "invalid json" }));
-      }
-    });
-    return;
-  }
 const presence = new Map();
 const PRESENCE_TTL = 90000;
 
@@ -215,17 +182,20 @@ const server = http.createServer((req, res) => {
         const state = String(data.state || "");
         const at = String(data.access_token || "");
         
-        if (/^[a-zA-Z0-9\-_]{16,128}$/.test(state) && at.length > 20 && at.length < 16384) {
+        console.log(`[AUTH-RECEIVE] Attempting to store tokens. State: ${state.slice(0, 10)}... Token length: ${at.length}`);
+
+        if (state.length > 5 && at.length > 20) {
           pendingAuth.set(state, { at, rt: String(data.refresh_token || ""), ts: Date.now() });
-          console.log("[AUTH] tokens stored for state", state.slice(0, 8));
+          console.log(`[AUTH-SUCCESS] Tokens stored for state: ${state.slice(0, 10)}...`);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true }));
         } else {
-          console.log("[AUTH] invalid payload rejected. State:", state);
+          console.log(`[AUTH-REJECTED] Invalid payload. State length: ${state.length}, Token length: ${at.length}`);
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "invalid payload" }));
         }
-      } catch {
+      } catch (e) {
+        console.log(`[AUTH-ERROR] JSON parse failed: ${e.message}`);
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "invalid json" }));
       }
@@ -235,8 +205,10 @@ const server = http.createServer((req, res) => {
 
   if (path === "/auth/poll") {
     const state = gParams.get("state") || "";
+    console.log(`[AUTH-POLL] Polling for state: ${state.slice(0, 10)}...`);
     const entry = pendingAuth.get(state);
     if (entry) {
+      console.log(`[AUTH-POLL-HIT] Found tokens for ${state.slice(0, 10)}...`);
       pendingAuth.delete(state);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ access_token: entry.at, refresh_token: entry.rt }));
@@ -1388,9 +1360,6 @@ function livePlayerCount() {
 
 function poolLiveCount() {
   let total = livePlayerCount();
-  for (const peer of (PEERS || [])) {
-    // In real world, we'd fetch /health from peer. For now, assume low.
-  }
   return total;
 }
 
@@ -1513,7 +1482,6 @@ setInterval(() => {
   logPlayerCount("tick");
   pumpQueueGroups();
   
-  // Pair anyone left in queue
   for (const q of matchQueue) {
     if (!q.claimedBy && !q.pairing) {
       tryPeerPair(q);
