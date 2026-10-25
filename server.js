@@ -4,11 +4,15 @@ const { WebSocketServer } = require("ws");
 const PORT = process.env.PORT || 10000;
 
 // ── OAuth relay store ──
-const pendingAuth = new Map();
-const AUTH_TTL_MS = 30 * 60 * 1000; // 30 mins
+// We now use a single object for the "Current Global Login" to bypass all state issues
+let currentGlobalLogin = null; 
+
+const AUTH_TTL_MS = 10 * 60 * 1000;
 setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of pendingAuth) if (now - v.ts > AUTH_TTL_MS) pendingAuth.delete(k);
+  if (currentGlobalLogin && (Date.now() - currentGlobalLogin.ts > AUTH_TTL_MS)) {
+    console.log("[AUTH] Global login expired.");
+    currentGlobalLogin = null;
+  }
 }, 60000);
 
 const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>FLAME STRIKE AUTH</title>
@@ -19,19 +23,19 @@ const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><ti
 (function() {
   var st = document.getElementById('st');
   var btn = document.getElementById('btn');
-  var state = new URLSearchParams(location.search).get('state') || 'fallback_state';
   var hash = location.hash.substring(1);
-  if (!hash) { st.textContent = 'No auth data found in URL.'; btn.style.display='inline-block'; return; }
+  if (!hash) { st.textContent = 'No auth data found.'; btn.style.display='inline-block'; return; }
   var p = new URLSearchParams(hash);
-  var at = p.get('access_token') || 'none';
+  var at = p.get('access_token') || '';
   var rt = p.get('refresh_token') || '';
+  if (!at) { st.textContent = 'No access token found.'; btn.style.display='inline-block'; return; }
 
   window.sendTokens = function() {
     st.textContent = 'Sending tokens...';
     fetch('/auth/receive', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({state: state, access_token: at, refresh_token: rt})
+      body: JSON.stringify({ access_token: at, refresh_token: rt })
     }).then(function(res) {
       if(res.ok) {
         st.textContent = 'SUCCESS! Return to FLAME STRIKE.';
@@ -43,6 +47,7 @@ const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><ti
       st.textContent = 'Network Error: ' + e;
     });
   };
+
   st.textContent = 'Logging you in...';
   sendTokens();
   setTimeout(function() {
@@ -54,55 +59,6 @@ const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><ti
 })();
 </script></div></body></html>`;
 
-const SERVERS = [
-  { id: "ASIA", name: "Server 1 (ASIA)" },
-  { id: "ASIA 2", name: "Server 2 (ASIA 2)" },
-  { id: "EUROPE", name: "Server 3 (EUROPE)" },
-  { id: "AFRICA", name: "Server 4 (AFRICA)" },
-  { id: "OCEANIA", name: "Server 5 (OCEANIA)" },
-  { id: "NORTH AMERICA", name: "Server 6 (NORTH AMERICA)" },
-  { id: "SOUTH AMERICA", name: "Server 7 (SOUTH AMERICA)" },
-  { id: "MIDDLE EAST", name: "Server 8 (MIDDLE EAST)" },
-];
-const BACKEND_URLS = { 
-  "ASIA": "https://dark-ward-sever.onrender.com", 
-  "ASIA 2": "https://darkward-asia2.onrender.com", 
-  "EUROPE": "https://darkward-europe.onrender.com", 
-  "AFRICA": "https://darkwrad-afcria.onrender.com", 
-  "OCEANIA": "https://ocenina-darkward.onrender.com", 
-  "NORTH AMERICA": "https://north-amecria-ward.onrender.com", 
-  "SOUTH AMERICA": "https://south-america-ward.onrender.com", 
-  "MIDDLE EAST": "https://middle-east-ward.onrender.com" 
-};
-
-let SELF_ID = (process.env.SERVER_ID || "ASIA").trim();
-let PEERS = Object.keys(BACKEND_URLS).filter(id => id !== SELF_ID).map(id => ({ id, url: BACKEND_URLS[id] }));
-
-function httpPostJson(url, path, bodyObj) {
-  return new Promise((resolve) => {
-    try {
-      const target = new URL(path, url);
-      const payload = JSON.stringify(bodyObj || {});
-      const mod = target.protocol === "http:" ? require("http") : require("https");
-      const req = mod.request({
-        hostname: target.hostname,
-        port: target.port || (target.protocol === "http:" ? 80 : 443),
-        path: target.pathname + (target.search || ""),
-        method: "POST",
-        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) },
-        timeout: 2000,
-      }, (res) => {
-        let data = "";
-        res.on("data", (c) => { data += c; });
-        res.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
-      });
-      req.on("error", () => resolve(null));
-      req.write(payload);
-      req.end();
-    } catch { resolve(null); }
-  });
-}
-
 const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -111,7 +67,6 @@ const server = http.createServer((req, res) => {
 
   const qIdx = req.url.indexOf("?");
   const path = qIdx === -1 ? req.url : req.url.slice(0, qIdx);
-  const gParams = new URLSearchParams(qIdx === -1 ? "" : req.url.slice(qIdx + 1));
 
   if (path === "/auth/callback") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -122,22 +77,17 @@ const server = http.createServer((req, res) => {
   if (path === "/auth/receive" && req.method === "POST") {
     let body = "";
     req.on("data", (chunk) => { body += chunk.toString(); });
-    req.on("end", async () => {
+    req.on("end", () => {
       try {
         const data = JSON.parse(body);
-        const state = String(data.state || "unknown");
-        const at = String(data.access_token || "none");
-        const rt = String(data.refresh_token || "");
+        console.log(`[AUTH-RECEIVE] Storing Global Token...`);
         
-        console.log(`[AUTH-SYNC] Token received for state: ${state}. Syncing to all servers...`);
-        
-        // Store locally
-        pendingAuth.set(state, { at, rt, ts: Date.now() });
-        
-        // SYNC: Tell every other server about this token
-        for (const peer of PEERS) {
-          httpPostJson(peer.url, "/auth/sync", { state, at, rt });
-        }
+        // Store as the ONLY active login
+        currentGlobalLogin = { 
+          at: String(data.access_token), 
+          rt: String(data.refresh_token || ""), 
+          ts: Date.now() 
+        };
 
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
@@ -149,31 +99,14 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Internal endpoint for servers to talk to each other
-  if (path === "/auth/sync" && req.method === "POST") {
-    let body = "";
-    req.on("data", (chunk) => { body += chunk.toString(); });
-    req.on("end", () => {
-      try {
-        const data = JSON.parse(body);
-        pendingAuth.set(data.state, { at: data.at, rt: data.rt, ts: Date.now() });
-        console.log(`[AUTH-SYNC-RECV] Synced state: ${data.state}`);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      } catch { res.writeHead(400).end(); }
-    });
-    return;
-  }
-
   if (path === "/auth/poll") {
-    const state = gParams.get("state") || "";
-    console.log(`[AUTH-POLL] Checking state: ${state}`);
-    const entry = pendingAuth.get(state);
-    if (entry) {
-      console.log(`[AUTH-POLL-HIT] Success for ${state}`);
-      pendingAuth.delete(state);
+    console.log(`[AUTH-POLL] Checking for any available token...`);
+    if (currentGlobalLogin) {
+      console.log(`[AUTH-POLL-HIT] Found Global Token!`);
+      const token = currentGlobalLogin;
+      currentGlobalLogin = null; // Clear it so the next person doesn't get it
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ access_token: entry.at, refresh_token: entry.rt }));
+      res.end(JSON.stringify({ access_token: token.at, refresh_token: token.rt }));
     } else {
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ pending: true }));
@@ -183,14 +116,14 @@ const server = http.createServer((req, res) => {
 
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", serverId: SELF_ID }));
+    res.end(JSON.stringify({ status: "ok" }));
     return;
   }
 
   res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Night Ward Sync Server Live");
+  res.end("Night Ward Zero-State Server Live");
 });
 
 server.listen(PORT, () => {
-  console.log(`Night Ward Sync Server Live on port ${PORT} (${SELF_ID})`);
+  console.log(`Night Ward Zero-State Server Live on port ${PORT}`);
 });
