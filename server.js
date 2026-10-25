@@ -4,9 +4,6 @@ const { WebSocketServer } = require("ws");
 const PORT = process.env.PORT || 7777;
 
 // ── OAuth relay store (Google/Facebook login — no localhost) ──
-// Game le state generate garcha → browser Supabase bata /auth/callback?state=X ma
-// land garcha (tokens URL #fragment ma) → page le /auth/receive ma POST garcha →
-// game le /auth/poll?state=X bata tokens liyincha (one-time, TTL 5 min).
 const pendingAuth = new Map();
 const AUTH_TTL_MS = 5 * 60 * 1000;
 setInterval(() => {
@@ -42,9 +39,6 @@ const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><ti
 </script></div></body></html>`;
 
 // ── SERVER REGISTRY ───────────────────────────────────────
-// 8 logical match servers. Each client picks one; `id` is what the client
-// sends in every request; `name` is the display label shown in the UI.
-// `countries` = player ko dekhaune list (server panel ma).
 const SERVERS = [
   { id: "ASIA", name: "Server 1 (ASIA)", countries: ["Nepal", "India", "Pakistan", "Bangladesh", "Sri Lanka", "Myanmar", "Cambodia", "Vietnam"] },
   { id: "ASIA 2", name: "Server 2 (ASIA 2)", countries: ["China", "Japan", "Korea", "Taiwan", "Hong Kong", "Malaysia", "Philippines", "Indonesia", "Thailand"] },
@@ -57,48 +51,11 @@ const SERVERS = [
 ];
 const DEFAULT_SERVER_ID = SERVERS[0].id;
 const serverById = (id) => SERVERS.find((sv) => sv.id === id) || null;
-// ── CAPACITY ──────────────────────────────────────────────
-// Ek backend ma katti player handle garna sakincha. Target = 400.
-// Load full bhayo bhaye client lai popup dekhau ("traffic full, try later
-// or choose another server"). Load normal bhaye KAHILE popup hudaina.
 const MAX_PLAYERS = Math.max(10, Number(process.env.MAX_PLAYERS) || 400);
-// Operator can take a server offline without a redeploy.
 const DISABLED_SERVERS = new Set(
   (process.env.DISABLED_SERVERS || "").split(",").map((s) => s.trim()).filter(Boolean),
 );
 
-// ═══════════════════════════════════════════════════════════
-// CROSS-SERVER MATCHMAKING (peer handshake)
-// ═══════════════════════════════════════════════════════════
-// Each Render backend is a SEPARATE process with its own in-memory
-// queue — so "ASIA 1" (dark-ward-sever) and "ASIA 2" (darkward-asia2)
-// could never pair, even with the same serverId.
-//
-// Fix: a MATCH POOL. Slots in the same pool may pair ACROSS backends.
-//   pool "ASIA"  → ["ASIA", "ASIA 2"]   (Nepal/India players meet each other)
-//   every other region is its own pool (no cross-continent match)
-//
-// How the cross-backend pair actually happens:
-//   1. Player A queues on backend X. X finds nobody locally → asks its
-//      pool-peers (HTTP POST /mm/claim) for a waiting player.
-//   2. Peer Y atomically removes a waiting player from ITS queue and
-//      returns a CLAIM TOKEN + that player's profile.
-//   3. X creates the room on ITSELF with a "reserved" slot for the
-//      remote player, and tells Y "give this player to me" (POST /mm/release).
-//   4. Y tells its client: {"type":"match_migrate", roomCode, hostUrl}.
-//   5. The client reconnects to X (hostUrl) and sends join_room →
-//      X binds the reserved slot → game_start for both.
-//
-// The room ALWAYS lives on one backend (X) so all realtime traffic
-// (movement, ghosts, ritual) stays on a single socket server.
-//
-// ── SELF-IDENTIFICATION (no Render env var needed) ──────
-// Render ma sab backend SAME server.js file chalauncha. Aafno identity
-// request ko Host header bata determine garchu:
-//   dark-ward-sever.onrender.com     → "ASIA"
-//   darkward-asia2.onrender.com      → "ASIA 2"
-//   ... etc.
-// Env var (SERVER_ID / PEERS) le override garna sakincha.
 const BACKEND_HOSTS = {
   "dark-ward-sever.onrender.com": "ASIA",
   "darkward-asia2.onrender.com": "ASIA 2",
@@ -109,7 +66,6 @@ const BACKEND_HOSTS = {
   "south-america-ward.onrender.com": "SOUTH AMERICA",
   "middle-east-ward.onrender.com": "MIDDLE EAST",
 };
-// Backend URL for each slot (peer handshake mate).
 const BACKEND_URLS = {
   "ASIA": "https://dark-ward-sever.onrender.com",
   "ASIA 2": "https://darkward-asia2.onrender.com",
@@ -120,18 +76,9 @@ const BACKEND_URLS = {
   "SOUTH AMERICA": "https://south-america-ward.onrender.com",
   "MIDDLE EAST": "https://middle-east-ward.onrender.com",
 };
-// Match pool per slot — same pool = cross-backend match allowed.
-// GLOBAL pool: sab 8 backend ek pool ma → kun slot pick garyo, kasa sanga
-// pani START press gare same match ma parcha.
 const POOL_OF = {
-  "ASIA": "GLOBAL",
-  "ASIA 2": "GLOBAL",
-  "EUROPE": "GLOBAL",
-  "AFRICA": "GLOBAL",
-  "OCEANIA": "GLOBAL",
-  "NORTH AMERICA": "GLOBAL",
-  "SOUTH AMERICA": "GLOBAL",
-  "MIDDLE EAST": "GLOBAL",
+  "ASIA": "GLOBAL", "ASIA 2": "GLOBAL", "EUROPE": "GLOBAL", "AFRICA": "GLOBAL",
+  "OCEANIA": "GLOBAL", "NORTH AMERICA": "GLOBAL", "SOUTH AMERICA": "GLOBAL", "MIDDLE EAST": "GLOBAL",
 };
 
 let SELF_ID = (process.env.SERVER_ID || "").trim();
@@ -139,7 +86,6 @@ let SELF_URL = (process.env.PUBLIC_URL || "").trim();
 let PEERS = [];
 let ENV_PEERS = [];
 
-// Pool peers banaunu — same pool + arko backend matra.
 function rebuildPeers() {
   if (ENV_PEERS.length) { PEERS = ENV_PEERS; return; }
   const myPool = POOL_OF[SELF_ID] || SELF_ID;
@@ -149,7 +95,6 @@ function rebuildPeers() {
     .filter((p) => p.url);
 }
 
-// Host header bata identity detect garu (first request ma).
 function detectSelf(host) {
   if (!host) return;
   const h = String(host).toLowerCase().split(":")[0].trim();
@@ -161,28 +106,20 @@ function detectSelf(host) {
   rebuildPeers();
 }
 
-// Env override (explicit config wins over host detection).
 if (process.env.SERVER_ID) {
   SELF_ID = process.env.SERVER_ID.trim();
   if (process.env.PUBLIC_URL) SELF_URL = process.env.PUBLIC_URL.trim();
-  ENV_PEERS = (process.env.PEERS || "")
-    .split(",")
-    .map((p) => p.trim())
-    .filter(Boolean)
-    .map((p) => {
+  ENV_PEERS = (process.env.PEERS || "").split(",").map((p) => p.trim()).filter(Boolean).map((p) => {
       const i = p.indexOf("=");
       if (i < 0) return null;
       return { id: p.slice(0, i).trim(), url: p.slice(i + 1).trim() };
-    })
-    .filter(Boolean);
+    }).filter(Boolean);
 }
 rebuildPeers();
 
-// Claim tokens: roomCode → { roomCode, slotIndex, player }  (reserved on this host)
 const pendingClaims = new Map();
 const CLAIM_TTL_MS = 60000;
 
-// Simple JSON POST to a peer backend (no external deps).
 function httpPostJson(url, path, bodyObj, timeoutMs) {
   return new Promise((resolve) => {
     let target;
@@ -210,15 +147,10 @@ function httpPostJson(url, path, bodyObj, timeoutMs) {
   });
 }
 
-// ── ONLINE PRESENCE ───────────────────────────────────────
-// Lobby ma basayera server dekhnay player le ping pathauncha → real
-// "online players" count (na bhaye connected socket matra).
-const presence = new Map();      // playerKey -> { serverId, ts }
-const PRESENCE_TTL = 90000;      // 90s ma purana presence discard
+const presence = new Map();
+const PRESENCE_TTL = 90000;
 
 const server = http.createServer((req, res) => {
-  // Aafno backend identity detect garu (Host header bata) — Render env var
-  // chahiyana chhaina.
   detectSelf(req.headers && req.headers.host);
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
@@ -248,12 +180,16 @@ const server = http.createServer((req, res) => {
         const data = JSON.parse(body);
         const state = String(data.state || "");
         const at = String(data.access_token || "");
-        if (/^[a-f0-9]{16,64}$/.test(state) && at.length > 20 && at.length < 16384) {
+        
+        // FIX: Changed regex from /^[a-f0-9]{16,64}$/ to /^[a-zA-Z0-9]{16,128}$/
+        // This allows standard alphanumeric states generated by most OAuth clients.
+        if (/^[a-zA-Z0-9]{16,128}$/.test(state) && at.length > 20 && at.length < 16384) {
           pendingAuth.set(state, { at, rt: String(data.refresh_token || ""), ts: Date.now() });
           console.log("[AUTH] tokens stored for state", state.slice(0, 8));
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ ok: true }));
         } else {
+          console.log("[AUTH] invalid payload rejected. State:", state, "Length:", state.length);
           res.writeHead(400, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "invalid payload" }));
         }
@@ -279,7 +215,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── PRESENCE PING (client le "ma online chu" batauncha) ──
   if (path === "/servers/ping" && req.method === "POST") {
     let body = "";
     let size = 0;
@@ -302,7 +237,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── SERVER LIST (real status + real online counts) ──
   if (path === "/servers") {
     const list = SERVERS.map((sv) => {
       let connected = 0;
@@ -312,9 +246,8 @@ const server = http.createServer((req, res) => {
       }
       for (const q of matchQueue) {
         if (q.ws && q.ws.readyState === 1 && q.serverId === sv.id) queued++;
-        else if (q.isBot && q.serverId === sv.id) queued++;   // AI bot (no socket)
+        else if (q.isBot && q.serverId === sv.id) queued++;
       }
-      // Lobby ma online (presence ping banya) players
       const now = Date.now();
       let browsing = 0;
       for (const [pid, p] of presence) {
@@ -322,42 +255,23 @@ const server = http.createServer((req, res) => {
         else if (now - p.ts >= PRESENCE_TTL) presence.delete(pid);
       }
       const disabled = DISABLED_SERVERS.has(sv.id);
-      // REAL count: aafno backend = live socket count; baaki = peer bata aako
-      // cached REAL count (presence estimate ho chhaina).
       const isSelf = sv.id === SELF_ID;
       const peerReal = peerLiveCount(sv.id);
       const real = isSelf ? livePlayerCount() : (peerReal > 0 ? peerReal : (connected + queued + browsing));
       return {
-        id: sv.id,
-        name: sv.name,
-        countries: sv.countries || [],
-        online: !disabled,
-        status: disabled ? "offline" : "online",
-        players: real,
-        connected,
-        queued,
-        browsing,
-        capacity: MAX_PLAYERS,
-        load: Math.min(100, Math.round((real / MAX_PLAYERS) * 100)),
-        full: real >= MAX_PLAYERS,
+        id: sv.id, name: sv.name, countries: sv.countries || [], online: !disabled, status: disabled ? "offline" : "online",
+        players: real, connected, queued, browsing, capacity: MAX_PLAYERS, load: Math.min(100, Math.round((real / MAX_PLAYERS) * 100)), full: real >= MAX_PLAYERS,
       };
     });
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      servers: list,
-      poolLive: poolLiveCount(),
-      poolCapacity: poolCapacity(),
-    }));
+    res.end(JSON.stringify({ servers: list, poolLive: poolLiveCount(), poolCapacity: poolCapacity() }));
     return;
   }
 
   if (req.url === "/rooms") {
     const list = Object.entries(rooms)
       .filter(([, r]) => r.players.length < r.maxPlayers)
-      .map(([code, room]) => ({
-        code, name: room.roomName, players: room.players.length,
-        maxPlayers: room.maxPlayers, region: room.region, mode: room.mode, host: room.hostName,
-      }));
+      .map(([code, room]) => ({ code, name: room.roomName, players: room.players.length, maxPlayers: room.maxPlayers, region: room.region, mode: room.mode, host: room.hostName }));
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ rooms: list }));
     return;
@@ -366,26 +280,20 @@ const server = http.createServer((req, res) => {
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
-      status: "ok", rooms: Object.keys(rooms).length,
-      players: Object.values(rooms).reduce((a, r) => a + r.players.length, 0),
-      serverId: SELF_ID, pool: POOL_OF[SELF_ID] || SELF_ID, peers: PEERS.length,
-      capacity: MAX_PLAYERS, live: livePlayerCount(), full: isServerFull(),
+      status: "ok", rooms: Object.keys(rooms).length, players: Object.values(rooms).reduce((a, r) => a + r.players.length, 0),
+      serverId: SELF_ID, pool: POOL_OF[SELF_ID] || SELF_ID, peers: PEERS.length, capacity: MAX_PLAYERS, live: livePlayerCount(), full: isServerFull(),
       poolLive: poolLiveCount(), poolCapacity: poolCapacity(),
     }));
     return;
   }
 
-  // ── CROSS-SERVER MATCHMAKING ENDPOINTS ──────────────────
-  // /mm/status  → how many players are waiting here (for a peer to poll)
-  // /mm/claim   → peer asks: "give me one waiting player" (atomic)
-  // /mm/release → peer confirms: "this player is now reserved for room X"
   if (path === "/mm/status" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => { body += c; });
     req.on("end", () => {
       let data = {};
       try { data = JSON.parse(body || "{}"); } catch { data = {}; }
-      const allMode = data.mode === "";      // stats poll (all counts)
+      const allMode = data.mode === "";
       const mode = String(data.mode || "SURVIVAL");
       const teamSize = Math.max(1, Math.min(4, Number(data.teamSize) || 1));
       const groupId = String(data.groupId || "");
@@ -394,37 +302,26 @@ const server = http.createServer((req, res) => {
         && now - q.queuedAt < 180000
         && (allMode || (q.mode === mode && q.teamSize === teamSize))
         && (allMode || (q.groupId || "") === groupId) && !q.claimedBy);
-      // OLDEST waiting player ko timestamp (ordering rule ko)
       let oldest = 0;
       for (const q of waiting) if (!oldest || q.queuedAt < oldest) oldest = q.queuedAt;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         ok: true, serverId: SELF_ID, pool: POOL_OF[SELF_ID] || SELF_ID,
-        waiting: waiting.length, oldestQueuedAt: oldest,
-        players: livePlayerCount(), capacity: MAX_PLAYERS, full: isServerFull(),
-        rooms: Object.keys(rooms).length,
-        team: true, teamSlots: TEAM_SLOTS,   // team system support (client diagnostic)
-        groupV2: true,          // group leader/kick/size-cap/handoff/group-mm relay (deploy check ✓)
-        groupKick: true,        // team_kick endpoint ✓
-        groupMm: true,          // group_mm relay ✓
-        bots: true, botFillMs: BOT_FILL_DELAY_MS, botFillMaxMs: BOT_FILL_DELAY_MAX_MS,
-        botModes: BOT_MODES, botMax: BOT_MAX_PER_ROOM,
+        waiting: waiting.length, oldestQueuedAt: oldest, players: livePlayerCount(), capacity: MAX_PLAYERS, full: isServerFull(),
+        rooms: Object.keys(rooms).length, team: true, teamSlots: TEAM_SLOTS, groupV2: true, groupKick: true, groupMm: true,
+        bots: true, botFillMs: BOT_FILL_DELAY_MS, botFillMaxMs: BOT_FILL_DELAY_MAX_MS, botModes: BOT_MODES, botMax: BOT_MAX_PER_ROOM,
       }));
       return;
     });
     return;
   }
 
-  // ── ONLINE PLAYERS (peer → me) ──────────────────────────
-  // Arko backend ma kun players online cha.
   if (path === "/mm/online-list" && req.method === "POST") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, players: localOnlinePlayers() }));
     return;
   }
 
-  // ── GROUP INVITE RELAY (peer → me) ──────────────────────
-  // Arko backend ma cha friend lai group invite forward garcha.
   if (path === "/mm/group-invite" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -435,13 +332,10 @@ const server = http.createServer((req, res) => {
       const payload = data.payload || {};
       let delivered = false;
       if (targetProfileId && payload && payload.type === "group_invite") {
-        // SAME profileId ko SABA socket lai pathau (2 window / 2 device same
-        // account ma pani popup auncha — pehla matra nai).
         for (const w of allClients) {
           if (w.readyState === 1 && w.chatProfileId && w.chatProfileId === targetProfileId) {
             send(w, payload);
             delivered = true;
-            console.log(`[GROUP-INVITE] relayed → friend (team ${payload.teamId || ""})`);
           }
         }
       }
@@ -451,10 +345,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── GLOBAL ROOM DIRECTORY SYNC (peer → me) ──────────────
-  // Dusro backend ko room list share garcha → "+" press garera join garna sakcha.
-  // ── TEAM ACCEPT RELAY (peer → me) ──────────────────────
-  // Team owner ko backend ma accept aayo → member add + sab lai pathau.
   if (path === "/mm/team-accept" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -478,8 +368,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── TEAM MEMBER LEFT RELAY (peer → me) ─────────────────
-  // Arko backend ma member gayo → owner backend ma hataucha + notify.
   if (path === "/mm/team-member-left" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -492,16 +380,7 @@ const server = http.createServer((req, res) => {
       if (team && pid) {
         teamRemoveMember(team, pid);
         teamNotifyAll(team, [pid]);
-        if (team.members.length === 0) {
-          teams.delete(teamId);
-          for (const w of allClients) {
-            if (w.readyState !== 1 || !w.chatProfileId) continue;
-            if (w.chatProfileId === pid) {
-              send(w, { type: "team_state", teamId, ownerProfileId: "", teamSize: 0,
-                maxSize: 4, members: [], pending: [] });
-            }
-          }
-        }
+        if (team.members.length === 0) teams.delete(teamId);
       }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
@@ -509,8 +388,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── TEAM KICK RELAY (peer → me) ─────────────────────────
-  // Leader ko arko backend ma cha → kick yahinchha ✓
   if (path === "/mm/team-kick" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -533,9 +410,7 @@ const server = http.createServer((req, res) => {
           if (w.readyState !== 1 || !w.chatProfileId) continue;
           if (w.chatProfileId === targetId) {
             send(w, { type: "team_removed", teamId, reason: "kicked" });
-            send(w, { type: "team_state", teamId, ownerProfileId: team.ownerProfileId || "",
-              teamSize: Number(team.teamSize || 0), maxSize: teamMaxSize(team),
-              members: [], pending: [] });
+            send(w, { type: "team_state", teamId, ownerProfileId: team.ownerProfileId || "", teamSize: Number(team.teamSize || 0), maxSize: teamMaxSize(team), members: [], pending: [] });
           }
         }
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -548,8 +423,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── TEAM DECLINE RELAY (peer → me) ─────────────────────
-  // Invite LATER gareko → owner backend ma slot free.
   if (path === "/mm/team-decline" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -570,8 +443,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── TEAM NOTIFY RELAY (peer → me) ──────────────────────
-  // Arko backend ma member lai team state pathau.
   if (path === "/mm/team-notify" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -594,8 +465,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── TEAM BROADCAST RELAY (peer → me) ────────────────────
-  // Emote / group chat peer backend ko local team members lai deliver.
   if (path === "/mm/team-broadcast" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -612,8 +481,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── TEAM INVITE REQUEST RELAY (peer → me) ──────────────
-  // Team owner ko backend ma invite request aayo → slot allocate + deliver.
   if (path === "/mm/team-invite-request" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -658,17 +525,12 @@ const server = http.createServer((req, res) => {
           teamNotifyAll(team);
         }
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          ok: delivered, delivered, slotIndex: result.slot,
-          message: delivered ? "" : "That friend is not online.",
-        }));
+        res.end(JSON.stringify({ ok: delivered, delivered, slotIndex: result.slot, message: delivered ? "" : "That friend is not online." }));
       });
     });
     return;
   }
 
-  // ── TEAM INVITE RELAY (peer → me) ──────────────────────
-  // Arko backend ma cha friend lai team invite forward garcha.
   if (path === "/mm/team-invite" && req.method === "POST") {
     let body = "";
     req.on("data", (c) => { body += c; });
@@ -679,13 +541,10 @@ const server = http.createServer((req, res) => {
       const payload = data.payload || {};
       let delivered = false;
       if (targetProfileId && payload && payload.type === "team_invite") {
-        // SAME profileId ko SABA socket lai pathau (2 window / 2 device same
-        // account ma pani popup auncha).
         for (const w of allClients) {
           if (w.readyState === 1 && w.chatProfileId && w.chatProfileId === targetProfileId) {
             send(w, payload);
             delivered = true;
-            console.log(`[TEAM-INVITE] relayed → friend (team ${payload.teamId})`);
           }
         }
       }
@@ -705,7 +564,6 @@ const server = http.createServer((req, res) => {
       const teamSize = Math.max(1, Math.min(4, Number(data.teamSize) || 1));
       const groupId = String(data.groupId || "");
       const now = Date.now();
-      // OLDEST candidate (FIFO) — claim garne player.
       let idx = -1;
       for (let i = 0; i < matchQueue.length; i++) {
         const q = matchQueue[i];
@@ -714,7 +572,7 @@ const server = http.createServer((req, res) => {
         if (q.mode !== mode || q.teamSize !== teamSize) continue;
         if ((q.groupId || "") !== groupId) continue;
         if (q.claimedBy) continue;
-        if (q.pairing) continue;          // busy pairing (nai claim garne)
+        if (q.pairing) continue;
         if (idx < 0 || q.queuedAt < matchQueue[idx].queuedAt) idx = i;
       }
       if (idx < 0) {
@@ -723,8 +581,6 @@ const server = http.createServer((req, res) => {
         return;
       }
       const entry = matchQueue[idx];
-      // HOST RULE (server-side authoritative): requester nai host hunuparcha
-      // (kam load / older player). Na bhaye yo claim deny — mutual claim rok.
       const reqKey = hostKeyOf(Number(data.myLoad) || 0, Number(data.myOldest) || 0, String(data.myId || ""));
       const myKey = hostKeyOf(livePlayerCount(), entry.queuedAt, SELF_ID);
       if (!hostKeyLess(reqKey, myKey)) {
@@ -734,17 +590,10 @@ const server = http.createServer((req, res) => {
       }
       entry.claimedBy = String(data.claimId || "");
       entry.claimedAt = now;
-      // Keep it in the queue but flagged — release removes the flag.
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        ok: true,
-        claimId: entry.claimedBy,
-        queuedAt: entry.queuedAt,
-        player: {
-          name: entry.playerName, characterId: entry.characterId,
-          loginType: entry.loginType, userId: entry.userId, profileId: entry.profileId,
-          device: entry.device, groupId: entry.groupId, region: entry.region,
-        },
+        ok: true, claimId: entry.claimedBy, queuedAt: entry.queuedAt,
+        player: { name: entry.playerName, characterId: entry.characterId, loginType: entry.loginType, userId: entry.userId, profileId: entry.profileId, device: entry.device, groupId: entry.groupId, region: entry.region },
       }));
     });
     return;
@@ -762,7 +611,6 @@ const server = http.createServer((req, res) => {
         if (q.claimedBy === claimId) { found = q; break; }
       }
       if (found && data.cancel) {
-        // Claim cancel — player afno queue ma nai badhne (lost hudaina)
         found.claimedBy = "";
         found.claimedAt = 0;
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -770,16 +618,10 @@ const server = http.createServer((req, res) => {
         return;
       }
       if (found) {
-        // Player is being migrated to the peer host → drop from our queue.
         matchQueue = matchQueue.filter((q) => q !== found);
-        // Tell that client to reconnect to the peer host.
         send(found.ws, {
-          type: "match_migrate",
-          roomCode: String(data.roomCode || ""),
-          hostUrl: String(data.hostUrl || ""),
-          playerId: Number(data.playerId) || 2,
-          mode: String(data.mode || found.mode),
-          maxPlayers: Number(data.maxPlayers) || (2 * found.teamSize),
+          type: "match_migrate", roomCode: String(data.roomCode || ""), hostUrl: String(data.hostUrl || ""),
+          playerId: Number(data.playerId) || 2, mode: String(data.mode || found.mode), maxPlayers: Number(data.maxPlayers) || (2 * found.teamSize),
         });
       }
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -788,7 +630,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── LIVEKIT VOICE TOKEN (same service — client yahii "/livekit-token" maagcha) ──
   if (path === "/livekit-token" && req.method === "POST") {
     let body = "";
     let size = 0;
@@ -810,16 +651,11 @@ const server = http.createServer((req, res) => {
           process.env.LIVEKIT_API_SECRET || "PzAp9nDJODsgi5MehfqBaLwjhyYaotJYeomslGvRDdOB",
           { identity: String(identity), name: name || String(identity), ttl: 86400 },
         );
-        at.addGrant({
-          roomJoin: true, room: String(room),
-          canPublish: true, canSubscribe: true, canPublishData: true,
-        });
+        at.addGrant({ roomJoin: true, room: String(room), canPublish: true, canSubscribe: true, canPublishData: true });
         const token = await at.toJwt();
-        console.log("[LIVEKIT] token issued: identity=" + identity + " room=" + room);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ token, url: process.env.LIVEKIT_URL || "wss://night-ward-tz4q970d.livekit.cloud" }));
       } catch (e) {
-        console.error("[LIVEKIT] token error:", e.message);
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "token generation failed" }));
       }
@@ -834,7 +670,6 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocketServer({ server });
 const rooms = {};
 const allClients = new Set();
-// ── QUICK MATCH queue: status-based pairing of any 2 eligible searching players ──
 let matchQueue = [];
 
 function genCode() {
@@ -848,7 +683,6 @@ function broadcast(code, data, exclude) {
   if (!rooms[code]) return;
   const msg = JSON.stringify(data);
   rooms[code].players.forEach((p) => {
-    // p.ws null huna sakincha — cross-server migrate huda reserved slot.
     if (!p.ws) return;
     if (p.ws !== exclude && p.ws.readyState === 1) p.ws.send(msg);
   });
@@ -858,7 +692,7 @@ function sendToAll(code, data) {
   if (!rooms[code]) return;
   const msg = JSON.stringify(data);
   rooms[code].players.forEach((p) => {
-    if (!p.ws) return;              // reserved (not yet migrated) slot
+    if (!p.ws) return;
     if (p.ws.readyState === 1) p.ws.send(msg);
   });
 }
@@ -870,34 +704,21 @@ function sendGlobal(data) {
   });
 }
 
-// ═══════════════════════════════════════════════════════════
-// WORLD CHAT ROOMS — player le afnai room create garcha
-// ═══════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════
-// AI BOT SYSTEM (server = authority for slot filling)
-//  · Match start pachi empty slot basyo bhaye BOT_FILL_DELAY_MS pachi
-//    server le bot add garcha (client ma haina).
-//  · Real player aayo bhaye bot hatera slot give garcha.
-//  · Bot ko behaviour HOST client le drive garcha (server relay garcha).
-// ═══════════════════════════════════════════════════════════
-// Bot fill delay: 30s..50s (random) — real player lai fair chance ✓
 const BOT_FILL_DELAY_MS = Math.max(2000, Number(process.env.BOT_FILL_DELAY_MS) || 30000);
 const BOT_FILL_DELAY_MAX_MS = Math.max(BOT_FILL_DELAY_MS, Number(process.env.BOT_FILL_DELAY_MAX_MS) || 50000);
-// Max bots per match — 4v4 (8 slots) puri fill garna 7 chahida ✓
 const BOT_MAX_PER_ROOM = Math.max(0, Number(process.env.BOT_MAX_PER_ROOM) || 7);
-const BOT_MODES = ["MUMMY_VS_HUMAN"];   // bots ye mode ma matra add hunchu
+const BOT_MODES = ["MUMMY_VS_HUMAN"];
 const BOT_NAMES = ["NOOB", "RAFA", "ZEKE", "VIPER", "GHOST", "BOLT", "FANG", "ROOK", "MIRA", "KANE"];
 const BOT_PERSONALITIES = ["aggressive", "balanced", "cautious", "berserker", "opportunist"];
 const BOT_CHARACTERS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 let botSeq = 0;
-const botTimers = new Map();   // roomCode -> setTimeout handle
+const botTimers = new Map();
 
 function botProfileId() {
   botSeq += 1;
   return "bot_" + Date.now().toString(36) + "_" + botSeq;
 }
 
-// Room ma bot add garo (empty slot fill).
 function addBotToRoom(code) {
   const room = rooms[code];
   if (!room) return null;
@@ -907,41 +728,31 @@ function addBotToRoom(code) {
   let id = 1;
   for (const p of room.players) id = Math.max(id, p.id + 1);
   const nm = BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)] + "_" + (botSeq + 1);
-  const skill = Math.round((0.25 + Math.random() * 0.7) * 100) / 100;   // 0.25..0.95
+  const skill = Math.round((0.25 + Math.random() * 0.7) * 100) / 100;
   const personality = BOT_PERSONALITIES[Math.floor(Math.random() * BOT_PERSONALITIES.length)];
   const bot = {
-    ws: null, id, name: nm,
-    characterId: BOT_CHARACTERS[Math.floor(Math.random() * BOT_CHARACTERS.length)],
+    ws: null, id, name: nm, characterId: BOT_CHARACTERS[Math.floor(Math.random() * BOT_CHARACTERS.length)],
     loginType: "bot", userId: "", profileId: botProfileId(),
     groupId: "", device: "", region: room.region || DEFAULT_SERVER_ID,
     ready: true, slot: id, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 },
     isBot: true, botSkill: skill, botPersonality: personality,
   };
   room.players.push(bot);
-  console.log(`[BOT] ${nm} (${personality}, skill ${skill}) filled slot ${id} of room ${code} (${room.players.length}/${room.maxPlayers})`);
-  broadcast(code, {
-    type: "player_joined", player: playerPublic(bot),
-    players: roomPlayers(code), hostId: hostIdOf(room),
-  }, null);
+  broadcast(code, { type: "player_joined", player: playerPublic(bot), players: roomPlayers(code), hostId: hostIdOf(room) }, null);
   return bot;
 }
 
-// ── QUEUE ma bot fill (match ko empty slot = yeti player aayena) ──
-// Real player aayena bhaye BOT_FILL_DELAY_MS pachi missing slots bots le fill.
 function scheduleQueueBotFill(entry) {
   if (!entry || entry.botFillTimer) return;
-  // Bots ONLY in MUMMY VS HUMAN mode (other modes: real players matra ✓)
   if (!BOT_MODES.includes(entry.mode)) return;
   const delay = BOT_FILL_DELAY_MS + Math.floor(Math.random() * Math.max(0, BOT_FILL_DELAY_MAX_MS - BOT_FILL_DELAY_MS));
   const h = setTimeout(() => {
     entry.botFillTimer = null;
-    if (!matchQueue.includes(entry)) return;      // already matched / cancelled
-    if (!BOT_MODES.includes(entry.mode)) return;  // bots only in mummy mode ✓
+    if (!matchQueue.includes(entry)) return;
+    if (!BOT_MODES.includes(entry.mode)) return;
     const required = 2 * entry.teamSize;
     const groupId = entry.groupId || "";
-    const local = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && q.mode === entry.mode
-      && q.teamSize === entry.teamSize && q.serverId === entry.serverId
-      && (q.groupId || "") === groupId && !q.claimedBy).length;
+    const local = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && q.mode === entry.mode && q.teamSize === entry.teamSize && q.serverId === entry.serverId && (q.groupId || "") === groupId && !q.claimedBy).length;
     let need = required - local;
     if (need <= 0) return;
     let added = 0;
@@ -952,16 +763,11 @@ function scheduleQueueBotFill(entry) {
       added += 1;
       need -= 1;
     }
-    if (added > 0) {
-      console.log(`[BOT] ${added} bot(s) filled empty slots (${entry.mode} ${required}p) on ${SELF_ID}`);
-      tryQuickPair(entry);
-    }
+    if (added > 0) tryQuickPair(entry);
   }, BOT_FILL_DELAY_MS);
   entry.botFillTimer = h;
 }
 
-
-// Bot queue entry (ws = null → real socket chhaina).
 function makeBotQueueEntry(src) {
   botSeq += 1;
   const skill = Math.round((0.25 + Math.random() * 0.7) * 100) / 100;
@@ -977,8 +783,6 @@ function makeBotQueueEntry(src) {
   };
 }
 
-
-// Empty slot ma bot fill (configurable delay pachi).
 function scheduleBotFill(code) {
   if (botTimers.has(code)) return;
   const h = setTimeout(() => {
@@ -998,7 +802,6 @@ function cancelBotFill(code) {
   botTimers.delete(code);
 }
 
-// Real player aayo → bot hatera (slot replace) — "smoothly replaced".
 function removeBotForRealPlayer(code) {
   const room = rooms[code];
   if (!room) return null;
@@ -1006,25 +809,14 @@ function removeBotForRealPlayer(code) {
   if (idx < 0) return null;
   const bot = room.players[idx];
   room.players.splice(idx, 1);
-  console.log(`[BOT] ${bot.name} replaced by a real player in room ${code}`);
-  broadcast(code, {
-    type: "player_left", playerId: bot.id,
-    players: roomPlayers(code), hostId: hostIdOf(room),
-  }, null);
+  broadcast(code, { type: "player_left", playerId: bot.id, players: roomPlayers(code), hostId: hostIdOf(room) }, null);
   return bot;
 }
 
-// ── TEAM SYSTEM (server = authoritative) ───────────────────
-// teamId -> { id, ownerProfileId, members: [{profileId, name, slot}],
-//              pending: [{profileId, name, slot, ts}] }
-// members = accepted players, pending = invite pathako but accept nai gareko.
-// Slot 0..3 = "TEAM 1..4". Slot khali huda free (reuse huncha).
 const teams = new Map();
 const TEAM_SLOTS = 4;
-// Team size = leader/member ko selection (1/2/4 ✓) — naya team default 4 ✓
 const TEAM_SIZE_DEFAULT = 4;
-const TEAM_INVITE_TTL_MS = Number(process.env.TEAM_INVITE_TTL_MS) || 120000;   // invite 2 minute pachi expire
-// Local mirror: teamId -> Set(profileId) — yai backend ma kun member cha.
+const TEAM_INVITE_TTL_MS = Number(process.env.TEAM_INVITE_TTL_MS) || 120000;
 const localTeams = new Map();
 
 function teamGet(teamId) {
@@ -1039,15 +831,12 @@ function teamGet(teamId) {
   return t;
 }
 
-// Yai slot occupy bhayo ki? (member ba pending — except pid chhudeu)
-// Team size cap (1 = Solo, 2 = Duo, 4 = Squad) — 0 = unset (legacy).
 function teamMaxSize(team) {
   const ts = Number(team.teamSize || 0);
   if (ts === 1 || ts === 2 || ts === 4) return ts;
-  return TEAM_SIZE_DEFAULT;   // default = 4 ✓
+  return TEAM_SIZE_DEFAULT;
 }
 
-// Team full? (members + pending ≥ cap) ✓
 function teamIsFull(team, exceptPid) {
   const cap = teamMaxSize(team);
   let n = 0;
@@ -1066,7 +855,6 @@ function teamSlotUsed(team, slot, exceptPid) {
   return false;
 }
 
-// First available slot (TEAM 1 bata) — server matra decide garcha.
 function teamFirstFreeSlot(team, exceptPid) {
   for (let i = 0; i < TEAM_SLOTS; i++) {
     if (!teamSlotUsed(team, i, exceptPid)) return i;
@@ -1074,7 +862,6 @@ function teamFirstFreeSlot(team, exceptPid) {
   return -1;
 }
 
-// Expired pending invites hataucha (ghost reservation rok).
 function teamPruneExpired(team) {
   const now = Date.now();
   const before = team.pending.length;
@@ -1083,45 +870,31 @@ function teamPruneExpired(team) {
 }
 
 function teamMembersPayload(team) {
-  return team.members.slice()
-    .sort((a, b) => (a.slot || 0) - (b.slot || 0))
-    .map((m) => ({
-      profileId: m.profileId,
-      name: m.name,
-      slot: m.slot,
-      isLeader: m.profileId === team.ownerProfileId,
-    }));
+  return team.members.slice().sort((a, b) => (a.slot || 0) - (b.slot || 0)).map((m) => ({
+    profileId: m.profileId, name: m.name, slot: m.slot, isLeader: m.profileId === team.ownerProfileId,
+  }));
 }
 
 function teamPendingPayload(team) {
-  return team.pending.slice()
-    .sort((a, b) => (a.slot || 0) - (b.slot || 0))
-    .map((p) => ({ profileId: p.profileId, name: p.name, slot: p.slot }));
+  return team.pending.slice().sort((a, b) => (a.slot || 0) - (b.slot || 0)).map((p) => ({ profileId: p.profileId, name: p.name, slot: p.slot }));
 }
 
 function teamStatePayload(team) {
   return {
-    teamId: team.id,
-    ownerProfileId: team.ownerProfileId || "",
-    teamSize: Number(team.teamSize || 0),
-    maxSize: teamMaxSize(team),
-    members: teamMembersPayload(team),
-    pending: teamPendingPayload(team),
+    teamId: team.id, ownerProfileId: team.ownerProfileId || "", teamSize: Number(team.teamSize || 0), maxSize: teamMaxSize(team),
+    members: teamMembersPayload(team), pending: teamPendingPayload(team),
   };
 }
 
-// Slot order matra — renumber hudaina (slot free bhayo bhane khali rahcha).
 function teamNormalize(team) {
   team.members.sort((a, b) => (a.slot || 0) - (b.slot || 0));
   team.pending.sort((a, b) => (a.slot || 0) - (b.slot || 0));
 }
 
-// Player ek matra ek team ma ✓ — arko team bata nikala (duplicate membership rok ✓)
 function teamRemovePlayerEverywhere(team, pid, exceptTeamId) {
   for (const [tid, t] of teams.entries()) {
     if (tid === exceptTeamId) continue;
-    const had = t.members.some((m) => m.profileId === pid)
-      || t.pending.some((p) => p.profileId === pid);
+    const had = t.members.some((m) => m.profileId === pid) || t.pending.some((p) => p.profileId === pid);
     if (!had) continue;
     teamRemoveMember(t, pid);
     teamNotifyAll(t, [pid]);
@@ -1129,7 +902,6 @@ function teamRemovePlayerEverywhere(team, pid, exceptTeamId) {
   }
 }
 
-// Player lai team ma register (slot choose) — free slot matra.
 function teamRegisterMember(team, pid, nm, wantSlot) {
   const existing = team.members.find((m) => m.profileId === pid);
   let slot = (Number.isInteger(wantSlot) && wantSlot >= 0 && wantSlot < TEAM_SLOTS) ? wantSlot : -1;
@@ -1141,34 +913,24 @@ function teamRegisterMember(team, pid, nm, wantSlot) {
   }
   if (slot < 0 || teamSlotUsed(team, slot, pid)) slot = teamFirstFreeSlot(team, pid);
   if (slot < 0) return -1;
-  // Kick gareko player feri join garna mildaina ✓
   if (team.kicked && team.kicked.includes(pid)) return -1;
-  // Size cap ✓ (Solo 1 / Duo 2 / Squad 4)
   if (teamIsFull(team, pid)) return -1;
   team.members.push({ profileId: pid, name: nm, slot });
-  // Leader = team banaera (creator ✓) — join gareko NEVER leader hudaina ✓
   if (!team.ownerProfileId) {
-    // Creator = leader ✓ (naya team → default size 4 ✓)
     team.ownerProfileId = pid;
     team.teamSize = TEAM_SIZE_DEFAULT;
   }
-  // Ek matra ek team ✓
   teamRemovePlayerEverywhere(team, pid, team.id);
   return slot;
 }
 
-// Player team bata nikla → usko slot free (future invite ma reuse huncha).
 function teamRemoveMember(team, pid) {
   const had = team.members.some((m) => m.profileId === pid);
   team.members = team.members.filter((m) => m.profileId !== pid);
-  // Target banaera rakheko pending invite ni hatau (ghost reservation rok).
   team.pending = team.pending.filter((p) => p.profileId !== pid);
-  // Kick gareko player lai group bata feri auna mildaina ✓ (kicked list ✓)
   if (!team.kicked.includes(pid)) team.kicked.push(pid);
-  // Owner gayo bhaye sab pending invite cancel (kasaai join na garna paune).
   if (team.ownerProfileId === pid) {
     team.pending = [];
-    // Leadership auto handoff → baki member ma kunai (first slot) ✓
     const rest = team.members.slice().sort((a, b) => (a.slot || 0) - (b.slot || 0));
     team.ownerProfileId = rest.length ? rest[0].profileId : "";
   }
@@ -1176,20 +938,16 @@ function teamRemoveMember(team, pid) {
   return had;
 }
 
-// Team accept apply — server matra slot decide garcha.
-// Returns { ok, message, slot, members, pending }
 function teamApplyAccept(team, pid, nm, preferSlot) {
   const pruned = teamPruneExpired(team);
   if (!pid) return { ok: false, message: "Team join failed — not logged in." };
   const already = team.members.find((m) => m.profileId === pid);
   if (already) {
-    // Dherai join (double click) — idempotent, error nai.
     team.pending = team.pending.filter((p) => p.profileId !== pid);
     teamNormalize(team);
     teamNotifyAll(team);
     return { ok: true, slot: already.slot, members: teamMembersPayload(team), pending: teamPendingPayload(team) };
   }
-  // Kick gareko player feri join garna mildaina ✓
   if (team.kicked && team.kicked.includes(pid)) {
     team.pending = team.pending.filter((p) => p.profileId !== pid);
     teamNotifyAll(team);
@@ -1209,7 +967,6 @@ function teamApplyAccept(team, pid, nm, preferSlot) {
     teamNotifyAll(team);
     return { ok: false, message: "Team is full (4/4)." };
   }
-  // Size cap (Duo=2 / Squad=4) ✓
   if (teamIsFull(team, pid)) {
     team.pending = team.pending.filter((p) => p.profileId !== pid);
     teamNotifyAll(team);
@@ -1217,16 +974,12 @@ function teamApplyAccept(team, pid, nm, preferSlot) {
   }
   team.pending = team.pending.filter((p) => p.profileId !== pid);
   team.members.push({ profileId: pid, name: nm || pend.name || "Player", slot });
-  // Join gareko → leader hudaina ✓ + team size (leader ko selection ✓) unchanged ✓
   teamNormalize(team);
-  // Ek matra ek team ✓
   teamRemovePlayerEverywhere(team, pid, team.id);
   teamNotifyAll(team);
-  console.log(`[TEAM] ${nm} joined team ${team.id} (${team.members.length}/${TEAM_SLOTS}) slot ${slot}`);
   return { ok: true, slot, members: teamMembersPayload(team), pending: teamPendingPayload(team) };
 }
 
-// Team state local sockets lai pathau (members + pending target).
 function teamNotifyLocal(members, pending, teamId, extraIds, stateExtras) {
   const ids = [];
   for (const m of members) ids.push(m.profileId);
@@ -1237,32 +990,23 @@ function teamNotifyLocal(members, pending, teamId, extraIds, stateExtras) {
     if (ids.includes(w.chatProfileId)) {
       const payload = Object.assign({ type: "team_state", teamId, members, pending }, stateExtras || {});
       send(w, payload);
-      // Purano client sanga compat (members matra).
       send(w, { type: "team_members", teamId, members });
     }
   }
 }
 
-// Team state sab backend lai pathau (local + peer relay).
 function teamNotifyAll(team, extraIds) {
   const members = teamMembersPayload(team);
   const pending = teamPendingPayload(team);
   const extras = {
-    ownerProfileId: team.ownerProfileId || "",
-    teamSize: Number(team.teamSize || 0),
-    maxSize: teamMaxSize(team),
+    ownerProfileId: team.ownerProfileId || "", teamSize: Number(team.teamSize || 0), maxSize: teamMaxSize(team),
   };
   teamNotifyLocal(members, pending, team.id, extraIds, extras);
   for (const peer of (PEERS || [])) {
-    httpPostJson(peer.url, "/mm/team-notify",
-      { teamId: team.id, members, pending, ownerProfileId: extras.ownerProfileId,
-        teamSize: extras.teamSize, maxSize: extras.maxSize,
-        extraIds: (extraIds || []).filter(Boolean) }, 3000);
+    httpPostJson(peer.url, "/mm/team-notify", { teamId: team.id, members, pending, ownerProfileId: extras.ownerProfileId, teamSize: extras.teamSize, maxSize: extras.maxSize, extraIds: (extraIds || []).filter(Boolean) }, 3000);
   }
 }
 
-// ── TEAM LIVE RELAY (emote / entry_anim / chat_room) ──────
-// Team members different backends/rooms ma hunchha — lobby ma ni relay chahincha.
 function teamIdOfProfileAny(pid) {
   const p = String(pid || "");
   if (!p) return "";
@@ -1300,73 +1044,40 @@ function teamBroadcastAll(teamId, payload, excludeProfileId, excludeWs) {
   if (!tid) return;
   teamBroadcastLocal(tid, payload, excludeProfileId, excludeWs);
   for (const peer of (PEERS || [])) {
-    httpPostJson(peer.url, "/mm/team-broadcast",
-      { teamId: tid, payload, excludeProfileId: String(excludeProfileId || "") }, 2000);
+    httpPostJson(peer.url, "/mm/team-broadcast", { teamId: tid, payload, excludeProfileId: String(excludeProfileId || "") }, 2000);
   }
 }
 
-// Invite process (server matra slot decide garcha).
-// wantSlot = client ko suggestion (free cha bhane use), nai bhaye first free.
-// Returns { ok, slot, message, resend }
 function teamProcessInvite(team, opts) {
   const targetProfileId = String(opts.targetProfileId || "");
   const targetName = String(opts.targetName || "");
-  // Jasto invite gareko = group LEADER ✓ (team naya cha bhaye ✓)
   const inviterPid = String(opts.inviterProfileId || "");
-  if (inviterPid && !team.ownerProfileId) {
-    team.ownerProfileId = inviterPid;
-  }
-  // Team size cap (Duo=2 / Squad=4) — full bhaye invite nai ✓
-  if (teamIsFull(team, targetProfileId)) {
-    return { ok: false, message: "Team is full." };
-  }
-  // Kick gareko player lai feri invite garna mildaina ✓
-  if (team.kicked && team.kicked.includes(targetProfileId)) {
-    return { ok: false, message: "That player was removed from this group." };
-  }
+  if (inviterPid && !team.ownerProfileId) team.ownerProfileId = inviterPid;
+  if (teamIsFull(team, targetProfileId)) return { ok: false, message: "Team is full." };
+  if (team.kicked && team.kicked.includes(targetProfileId)) return { ok: false, message: "That player was removed from this group." };
   const wantSlot = Number(opts.wantSlot);
   const ownerSlot = Number(opts.ownerSlot);
   const fromName = String(opts.fromName || "Player");
   const fromProfileId = String(opts.fromProfileId || "");
   teamPruneExpired(team);
-  // Inviter team ma register (afno chosen slot, nai bhaye first free).
   if (fromProfileId && !team.members.some((m) => m.profileId === fromProfileId)) {
-    const own = teamRegisterMember(team, fromProfileId, fromName,
-      Number.isInteger(ownerSlot) ? ownerSlot : -1);
+    const own = teamRegisterMember(team, fromProfileId, fromName, Number.isInteger(ownerSlot) ? ownerSlot : -1);
     if (own < 0) return { ok: false, message: "Team is full (4/4)." };
   }
-  // Target already member cha → re-invite (popup feri pathau, join idempotent).
   const already = team.members.find((m) => m.profileId === targetProfileId);
-  if (already) {
-    return { ok: true, slot: already.slot, resend: true };
-  }
-  // Target lai pending invite already cha? → naya reservation hudaina,
-  // matra tyo slot ko invite re-send (duplicate invite thap).
+  if (already) return { ok: true, slot: already.slot, resend: true };
   const dupe = team.pending.find((p) => p.profileId === targetProfileId);
-  if (dupe) {
-    return { ok: true, slot: dupe.slot, resend: true };
-  }
-  // Slot allocate — server matra.
+  if (dupe) return { ok: true, slot: dupe.slot, resend: true };
   let slot = (Number.isInteger(wantSlot) && wantSlot >= 0 && wantSlot < TEAM_SLOTS) ? wantSlot : -1;
-  if (slot < 0 || teamSlotUsed(team, slot, targetProfileId)) {
-    slot = teamFirstFreeSlot(team, targetProfileId);
-  }
+  if (slot < 0 || teamSlotUsed(team, slot, targetProfileId)) slot = teamFirstFreeSlot(team, targetProfileId);
   if (slot < 0) return { ok: false, message: "Team is full (4/4)." };
-  team.pending.push({
-    profileId: targetProfileId,
-    name: targetName || "Player",
-    slot,
-    ts: Date.now(),
-  });
+  team.pending.push({ profileId: targetProfileId, name: targetName || "Player", slot, ts: Date.now() });
   teamNormalize(team);
-  // Inviter lai state pathau (slot reserved + INVITED tag).
   teamNotifyAll(team);
   return { ok: true, slot, resend: false };
 }
 
-// Invite payload target lai deliver (local first, tarai peers ma).
 function teamDeliverInvite(targetProfileId, payload) {
-  // SAME profileId ko SABA local socket lai pathau (2 window / 2 device).
   let sent = false;
   for (const w of allClients) {
     if (w.readyState === 1 && w.chatProfileId && w.chatProfileId === targetProfileId) {
@@ -1377,9 +1088,7 @@ function teamDeliverInvite(targetProfileId, payload) {
   if (sent) return Promise.resolve(true);
   const peers = PEERS || [];
   if (!peers.length) return Promise.resolve(false);
-  return Promise.all(peers.map((peer) =>
-    httpPostJson(peer.url, "/mm/team-invite", { targetProfileId, payload }, 3000)
-  )).then((results) => results.some((r) => r && r.delivered));
+  return Promise.all(peers.map((peer) => httpPostJson(peer.url, "/mm/team-invite", { targetProfileId, payload }, 3000))).then((results) => results.some((r) => r && r.delivered));
 }
 
 function send(ws, data) {
@@ -1405,10 +1114,6 @@ function hostIdOf(room) {
   return h ? h.id : (room.players[0] ? room.players[0].id : 1);
 }
 
-// profile_id ("google_<uuid>") → online player (all rooms).
-// Exact profileId match first; fallback derives provider+uuid for older
-// clients that don't send profileId yet.
-// Online players (profileId + name) — yai backend ma connected.
 function localOnlinePlayers() {
   const out = [];
   const seen = new Set();
@@ -1442,9 +1147,6 @@ function findPlayerByProfileId(profileId) {
   return null;
 }
 
-// Same-GROUP players ekai team ma paraina banaune order.
-// Group members lai round-robin le banaucha → half-split (slice) ma
-// ekai group ko 2 player ekai side ma paraina.
 function interleaveGroups(players) {
   const buckets = new Map();
   for (const p of players) {
@@ -1452,7 +1154,6 @@ function interleaveGroups(players) {
     if (!buckets.has(g)) buckets.set(g, []);
     buckets.get(g).push(p);
   }
-  // Badi group pahile (spread garna best), tar baki
   const lists = [...buckets.values()].sort((a, b) => b.length - a.length);
   const out = [];
   let i = 0;
@@ -1467,48 +1168,36 @@ function interleaveGroups(players) {
   return out;
 }
 
-// ── GROUP FILL ───────────────────────────────────────────
-// Squad (4) ko group ma 3/4 cha + arko player le SADAI Squad select gareko
-// (tara usko group khali cha) → usko available squad ma 4th member banau ✓
-//   - Group "still waiting for matchmaking" cha matra ✓ (claimedBy nai)
-//   - Open slot matra ✓
-//   - Ek player ekchoti matra ek group ma ✓ (groupId reassign)
 function pumpQueueGroups() {
-  // Group fill rules → MUMMY VS HUMAN mode matra ✓ (other modes unchanged ✓)
   const groups = new Map();
   for (const q of matchQueue) {
     if (q.claimedBy) continue;
     if (!q.ws || q.ws.readyState !== 1) continue;
     const g = q.groupId || "";
-    if (!g) continue;                       // solo (no group) — skip
+    if (!g) continue;
     if (!groups.has(g)) groups.set(g, []);
     groups.get(g).push(q);
   }
   const all = [...groups.entries()];
-  // Badi group pahile (3/4 target ✓)
   all.sort((a, b) => b[1].length - a[1].length);
   const merged = new Set();
   for (const [gid, entries] of all) {
     if (merged.has(gid)) continue;
     const size = entries[0].teamSize || 4;
     if (size <= 1) continue;
-    if (entries.length >= size) continue;   // group already full ✓
+    if (entries.length >= size) continue;
     for (const [gid2, entries2] of all) {
       if (gid2 === gid || merged.has(gid2)) continue;
       if (entries2.length >= size) continue;
       if (entries2[0].mode !== entries[0].mode) continue;
       if (entries2[0].serverId !== entries[0].serverId) continue;
-      // Mode gate — MUMMY VS HUMAN matra ✓
       if (entries[0].mode !== "MUMMY_VS_HUMAN") continue;
-      // Merge — group2 ko members group1 ma (open slot fill ✓)
       for (const e of entries2) {
         e.groupId = gid;
         e.teamSize = size;
-        // Server-side team ma pani member banau (lobby 4/4 dekha ✓)
         const team = teams.get(gid);
         if (team && e.profileId) {
           teamRegisterMember(team, e.profileId, e.playerName, -1);
-          // Purano group bata nika (ek group ma matra ✓)
           const oldTeam = teams.get(gid2);
           if (oldTeam) {
             teamRemoveMember(oldTeam, e.profileId);
@@ -1519,25 +1208,18 @@ function pumpQueueGroups() {
         }
       }
       merged.add(gid2);
-      console.log(`[GROUP] ${gid2} (${entries2.length}) merged into ${gid} (${entries.length + entries2.length}/${size})`);
-      break;
     }
   }
 }
 
-// Queue ko same mode+teamSize wala haru lai progress count pathau
-// (client counter: 1/0 → 2/0 → … → X/X). Count required vanda badi garnaudaina.
 function progressTo(mode, teamSize, serverId, groupId) {
   const required = 2 * teamSize;
-  // Server isolation: queue ma same SERVER ko players matra.
-  const same = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && q.mode === mode
-    && q.teamSize === teamSize && q.serverId === serverId && !q.claimedBy);
+  const same = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && q.mode === mode && q.teamSize === teamSize && q.serverId === serverId && !q.claimedBy);
   const count = Math.min(same.length, required);
   same.forEach((q) => { if (q.ws) send(q.ws, { type: "match_progress", count, required }); });
   return same;
 }
 
-// ── FRIENDLY FIRE (same team = no damage ✓) ───────────────
 function teamIdOfProfile(pid) {
   const p = String(pid || "");
   if (!p) return "";
@@ -1547,7 +1229,6 @@ function teamIdOfProfile(pid) {
   return "";
 }
 
-// Same team? (attacker + target ✓)
 function sameTeam(attackerPid, targetPid) {
   const a = String(attackerPid || "");
   const b = String(targetPid || "");
@@ -1557,9 +1238,6 @@ function sameTeam(attackerPid, targetPid) {
   return !!(ta && tb && ta === tb);
 }
 
-// ── PARTY PICKING (team ek party ✓ — split hudaina ✗) ────
-// Group (team) ko ek party jasto whole pick huncha ✓.
-// Aa partial team (3/4) pani ek party ✓ (members split hudaina ✗).
 function pickParties(same, required) {
   const parties = new Map();
   for (const e of same) {
@@ -1570,26 +1248,17 @@ function pickParties(same, required) {
   const out = [];
   let total = 0;
   for (const [, list] of parties) {
-    if (total + list.length > required) continue;   // capacity ✓
+    if (total + list.length > required) continue;
     for (const e of list) out.push(e);
     total += list.length;
   }
   return out;
 }
 
-// ── CROSS-SERVER MATCHMAKING ───────────────────────────
-// Same pool ko arko backend (e.g. ASIA 2) bata ek player claim garcha.
-// Claimed player migrate huncha — room HOST backend ma bancha.
-//
-// RACE PROTECTION (7 peer ek satma):
-//   Ek matra side le claim garcha. Rule: "oldest waiting player le host
-//   banchha" — (myOldest, myId) < (peerOldest, peerId) bhaye matra ma
-//   peer bata pull garcha. Same timestamp bhaye server id le tie-break.
-//   Yette mutual claim (2 room, 2 player alag room) hudaina.
 function localOldestQueuedAt(mode, teamSize, groupId) {
   let oldest = 0;
   for (const q of matchQueue) {
-    if (q.ws) { if (q.ws.readyState !== 1) continue; } else if (!q.isBot) { continue; }
+    if (q.ws) { if (q.ws.readyState !== 1) continue; } else if (!q.isBot) continue;
     if (q.mode !== mode || q.teamSize !== teamSize) continue;
     if ((q.groupId || "") !== (groupId || "")) continue;
     if (q.claimedBy) continue;
@@ -1598,11 +1267,6 @@ function localOldestQueuedAt(mode, teamSize, groupId) {
   return oldest;
 }
 
-// HOST KEY — kun backend ma room bancha decide garcha.
-//   Priority: (1) kam load (load balancing), (2) oldest waiting player
-//   (FIFO), (3) server id (tie-break, deterministic).
-//   Dui tara le SAME key compute garcha → ek matra side le pull garcha
-//   (mutual claim hudaina).
 function hostKeyOf(load, oldest, id) {
   return [Number(load) || 0, Number(oldest) || 0, String(id || "")];
 }
@@ -1614,7 +1278,6 @@ function hostKeyLess(a, b) {
   return false;
 }
 
-// Round-robin: ekchoti sab peer scan nagarda (Render cold-start bachat).
 let peerScanCursor = 0;
 function nextPeers(count) {
   if (PEERS.length === 0) return [];
@@ -1629,12 +1292,9 @@ function nextPeers(count) {
 
 async function tryPeerPair(entry) {
   if (PEERS.length === 0) return false;
-  // Per-entry lock — ekai player ko 2 oparu tryPeerPair le claim huna hudaina.
   if (entry.pairing) return false;
   if (!matchQueue.includes(entry)) return false;
-  if (entry.ws) { if (entry.ws.readyState !== 1) return false; } else if (!entry.isBot) { return false; }
-  // CROSS-BACKEND pairing = 1v1 matra. Group (2v2/4v4) members SAME backend
-  // ma huncha — group lai split na garna cross claim hatauna.
+  if (entry.ws) { if (entry.ws.readyState !== 1) return false; } else if (!entry.isBot) return false;
   if (entry.teamSize !== 1) return false;
   entry.pairing = true;
   try {
@@ -1645,121 +1305,59 @@ async function tryPeerPair(entry) {
 }
 
 async function _tryPeerPairInner(entry) {
-  // Server full cha bhaye naya player yahii admit haina.
   if (isServerFull()) return false;
   const required = 2 * entry.teamSize;
   const groupId = entry.groupId || "";
-  // Already enough locally → no need to bother peers.
-  const localCount = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && q.mode === entry.mode
-    && q.teamSize === entry.teamSize && q.serverId === entry.serverId
-    && (q.groupId || "") === groupId && !q.claimedBy).length;
+  const localCount = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && q.mode === entry.mode && q.teamSize === entry.teamSize && q.serverId === entry.serverId && (q.groupId || "") === groupId && !q.claimedBy).length;
   if (localCount >= required) return false;
-
   const myOldest = localOldestQueuedAt(entry.mode, entry.teamSize, groupId);
-  const candidates = nextPeers(3);   // 3 peer per tick (sab 7 chhaina, chhaina 3 tick pachi)
-
-  // Peer status + claim PARALLEL (sequential 7×4s = 28s bhayo)
+  const candidates = nextPeers(3);
   const results = await Promise.all(candidates.map(async (peer) => {
-    const status = await httpPostJson(peer.url, "/mm/status", {
-      mode: entry.mode, teamSize: entry.teamSize, groupId,
-    }, 2500);
+    const status = await httpPostJson(peer.url, "/mm/status", { mode: entry.mode, teamSize: entry.teamSize, groupId }, 2500);
     if (!status || !status.ok) return null;
-    // Peer ko REAL live count cache (panel/logs ma dekhaune)
     cachePeerLive(peer.id, status.players);
     const peerOldest = Number(status.oldestQueuedAt) || 0;
     if (!peerOldest) return null;
-    // HOST RULE: kam-load backend (older player tie-break) ma room bancha.
     const myKey = hostKeyOf(livePlayerCount(), myOldest, SELF_ID);
     const peerKey = hostKeyOf(Number(status.players) || 0, peerOldest, peer.id);
-    if (!hostKeyLess(myKey, peerKey)) return null;   // peer nai host huncha
+    if (!hostKeyLess(myKey, peerKey)) return null;
     const claimId = "c" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-    const res = await httpPostJson(peer.url, "/mm/claim", {
-      claimId, mode: entry.mode, teamSize: entry.teamSize, groupId,
-      myOldest, myId: SELF_ID, myLoad: livePlayerCount(),
-    }, 3000);
+    const res = await httpPostJson(peer.url, "/mm/claim", { claimId, mode: entry.mode, teamSize: entry.teamSize, groupId, myOldest, myId: SELF_ID, myLoad: livePlayerCount() }, 3000);
     if (!res || !res.ok || !res.player) return null;
     return { peer, res, claimId };
   }));
-
   for (const hit of results) {
     if (!hit) continue;
-    const peer = hit.peer;
-    const res = hit.res;
-    const claimId = hit.claimId;
+    const { peer, res, claimId } = hit;
     const remote = res.player;
-    // Local player abhi kahile queue ma chha bhane feri check (double-claim guard).
-    // Arko peer le AAJULE claim gari sake bhane → hamro claim cancel.
-    // (Nai gare bhane player 2 room ma parcha — mutual claim rok.)
     if (!matchQueue.includes(entry) || (entry.ws ? entry.ws.readyState !== 1 : !entry.isBot) || entry.claimedBy) {
       await httpPostJson(peer.url, "/mm/release", { claimId, cancel: true }, 3000);
       return false;
     }
-
-    // Room banaa — host backend (yo) ma. Remote player ko reserved slot.
     const code = genCode();
-    const localPlayer = {
-      ws: entry.ws, id: 1, name: entry.playerName, characterId: entry.characterId,
-      loginType: entry.loginType, userId: entry.userId, profileId: entry.profileId || "",
-      groupId: groupId, device: entry.device, region: entry.region || "ASIA",
-      ready: false, slot: 1, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 },
-    };
-    const remotePlayer = {
-      ws: null, id: 2, name: remote.name || "Player", characterId: remote.characterId || 0,
-      loginType: remote.loginType || "guest", userId: remote.userId || "", profileId: remote.profileId || "",
-      groupId: remote.groupId || groupId, device: remote.device || "", region: remote.region || entry.region || "ASIA",
-      ready: false, slot: 2, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 },
-    };
-    rooms[code] = {
-      host: entry.ws, hostName: entry.playerName,
-      roomName: "Match", region: "GLOBAL",
-      mode: entry.mode, maxPlayers: required, loginType: entry.loginType,
-      players: [localPlayer, remotePlayer],
-      gameStarted: true, matchmadeAt: Date.now(),
-      matchLikes: {}, matchEliminated: [],
-      awaitingRemote: true,
-    };
-    // Reserved slot — remote player migrate garera yei room ma join garcha.
-    pendingClaims.set(code, {
-      roomCode: code, slotIndex: 1, player: remotePlayer,
-      mode: entry.mode, maxPlayers: required, claimId, at: Date.now(),
-    });
+    const localPlayer = { ws: entry.ws, id: 1, name: entry.playerName, characterId: entry.characterId, loginType: entry.loginType, userId: entry.userId, profileId: entry.profileId || "", groupId: groupId, device: entry.device, region: entry.region || "ASIA", ready: false, slot: 1, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 } };
+    const remotePlayer = { ws: null, id: 2, name: remote.name || "Player", characterId: remote.characterId || 0, loginType: remote.loginType || "guest", userId: remote.userId || "", profileId: remote.profileId || "", groupId: remote.groupId || groupId, device: remote.device || "", region: remote.region || entry.region || "ASIA", ready: false, slot: 2, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 } };
+    rooms[code] = { host: entry.ws, hostName: entry.playerName, roomName: "Match", region: "GLOBAL", mode: entry.mode, maxPlayers: required, loginType: entry.loginType, players: [localPlayer, remotePlayer], gameStarted: true, matchmadeAt: Date.now(), matchLikes: {}, matchEliminated: [], awaitingRemote: true };
+    pendingClaims.set(code, { roomCode: code, slotIndex: 1, player: remotePlayer, mode: entry.mode, maxPlayers: required, claimId, at: Date.now() });
     matchQueue = matchQueue.filter((q) => q !== entry);
-
-    // Local player lai turanti room_created
     if (entry.ws) entry.ws.setRoom(code);
-    send(entry.ws, {
-      type: "room_created", roomCode: code, roomName: "Match", region: "GLOBAL",
-      mode: entry.mode, playerId: 1, maxPlayers: required, hostId: 1,
-    });
-
-    // Peer lai batau: "yo player migrate gara, room code Y"
-    await httpPostJson(peer.url, "/mm/release", {
-      claimId, roomCode: code, hostUrl: peerHostUrl(), playerId: 2,
-      mode: entry.mode, maxPlayers: required,
-    }, 4000);
-
-    console.log(`[MATCH-X] ${entry.playerName} (${SELF_ID}) ↔ ${remote.name} (${peer.id}) → ${code} mode=${entry.mode} ${required}p`);
-    // Empty slot cha bhaye bot fill (server authority)
+    send(entry.ws, { type: "room_created", roomCode: code, roomName: "Match", region: "GLOBAL", mode: entry.mode, playerId: 1, maxPlayers: required, hostId: 1 });
+    await httpPostJson(peer.url, "/mm/release", { claimId, roomCode: code, hostUrl: peerHostUrl(), playerId: 2, mode: entry.mode, maxPlayers: required }, 4000);
     scheduleBotFill(code);
     return true;
   }
   return false;
 }
 
-// Server ko live load — capacity vs current players.
 function livePlayerCount() {
   let n = 0;
   for (const w of allClients) if (w.readyState === 1) n++;
   return n;
 }
 
-// ── PEER REAL LIVE COUNT CACHE ──────────────────────────
-// Har peer backend ko REAL connected player count (presence estimate ho chhaina).
-// /mm/status response ma peer le afno `players` pathauncha → tya bata cache update.
-// Cache stale (45s+) bhaye value lai skip garcha (galat number na dekhau).
-const peerLiveCache = new Map();   // peerId → { live, at }
-let lastConnectLog = 0;            // connect log throttle
-let lastLoggedCount = 0;           // 100-player milestone tracker
+const peerLiveCache = new Map();
+let lastConnectLog = 0;
+let lastLoggedCount = 0;
 const PEER_LIVE_TTL_MS = 45000;
 
 function cachePeerLive(peerId, live) {
@@ -1774,62 +1372,49 @@ function peerLiveCount(peerId) {
   return c.live;
 }
 
-// GLOBAL pool total — sab 8 backend ko REAL count sum.
 function poolLiveCount() {
   let total = livePlayerCount();
   for (const [pid] of peerLiveCache) total += peerLiveCount(pid);
   return total;
 }
 
-// Pool capacity — 8 backend × MAX_PLAYERS
 function poolCapacity() {
   return MAX_PLAYERS * Object.keys(BACKEND_HOSTS).length;
 }
 
-// Render logs ma real player count (dashboard → Logs ma dekhincha)
 function logPlayerCount(reason) {
   const live = livePlayerCount();
   console.log(`[POOL] ${SELF_ID} live=${live} pool=${poolLiveCount()}/${poolCapacity()} (${reason})`);
   return live;
 }
 
-// Server full cha? (capacity = MAX_PLAYERS, target 400)
 function isServerFull() {
   return livePlayerCount() >= MAX_PLAYERS;
 }
 
-// Ye backend ko public URL (remote player migrate garna chaina).
 function peerHostUrl() {
   if (SELF_URL) return SELF_URL;
   if (process.env.RENDER_SERVICE_URL) return "https://" + process.env.RENDER_SERVICE_URL;
   return "https://" + (SELF_ID === "ASIA" ? "dark-ward-sever.onrender.com" : (BACKEND_URLS[SELF_ID] || "dark-ward-sever.onrender.com").replace("https://", ""));
 }
 
-// Queue ma bhayeka eligible searching players lai JODIHAL — status-based
-// (dukai searching + readyState=1 + queue age < 3 min). Fake player banaudaina.
-// Team size respect garchha: 2 × teamSize pugyo bhane matra match start
-// (solo 1/1 → 2p, duo 2/2 → 4p, 3/3 → 6p, 4/4 → 8p).
 function tryQuickPair(entry) {
-  if (!matchQueue.includes(entry)) return; // cancel/expire bhaisakyo
-  if (entry.ws) { if (entry.ws.readyState !== 1) return; } else if (!entry.isBot) { return; }
+  if (!matchQueue.includes(entry)) return;
+  if (entry.ws) { if (entry.ws.readyState !== 1) return; } else if (!entry.isBot) return;
   matchQueue = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && Date.now() - q.queuedAt < 180000);
   if (!matchQueue.includes(entry)) return;
-  // X/X pugyo ki nai herna agadi nai count pathau (mode + teamSize EXACT ✓)
   const same = progressTo(entry.mode, entry.teamSize, entry.serverId);
   const required = 2 * entry.teamSize;
-  // PARTY pick — team (groupId) ek party jasto whole ✓ (members split hudaina ✗)
   const picked = pickParties(same, required);
   const partyCount = new Set(picked.map((q) => q.groupId || ("solo:" + (q.id || q.profileId || q.playerName)))).size;
-  // Euta party matra cha → arko party chahidaina (solo+duo / squad+squad match hudaina ✗)
   if (picked.length < required && partyCount < 2) {
     tryPeerPair(entry);
-    return; // ajhai partner chahincha — next join aayepachi feri try
+    return;
   }
   if (picked.length < 2) {
     tryPeerPair(entry);
     return;
   }
-  // Party order (badi party pahile ✓) — team members ekai side ma ✓
   const group = picked;
   for (const q of picked) {
     if (q.botFillTimer) { clearTimeout(q.botFillTimer); q.botFillTimer = null; }
@@ -1841,63 +1426,44 @@ function tryQuickPair(entry) {
     loginType: e.loginType, userId: e.userId, profileId: e.profileId || "",
     groupId: e.groupId || "", device: e.device, region: e.region || "ASIA",
     ready: false, slot: id, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 },
-    // AI bot flags (server authority — client lai batauncha)
-    isBot: !!e.isBot, botSkill: e.botSkill != null ? e.botSkill : 0.5,
-    botPersonality: e.botPersonality || "balanced",
+    isBot: !!e.isBot, botSkill: e.botSkill != null ? e.botSkill : 0.5, botPersonality: e.botPersonality || "balanced",
   });
   rooms[code] = {
-    host: group[0].ws, hostName: group[0].playerName,
-    roomName: "Match", region: "GLOBAL",
+    host: group[0].ws, hostName: group[0].playerName, roomName: "Match", region: "GLOBAL",
     mode: group[0].mode, maxPlayers: required, loginType: group[0].loginType,
     players: group.map((e, i) => mk(e, i + 1)),
-    gameStarted: true, matchmadeAt: Date.now(),
-    matchLikes: {}, matchEliminated: [],
+    gameStarted: true, matchmadeAt: Date.now(), matchLikes: {}, matchEliminated: [],
   };
-  // SAME match assignment — sabailai eutai code/mode/players + game_start
   group.forEach((e, i) => {
-    if (!e.ws) return;   // AI bot (no socket) — room ma already cha ✓
-    if (e.ws) e.ws.setRoom(code);
+    if (!e.ws) return;
+    e.ws.setRoom(code);
     if (i === 0) {
-      // Host lai players list pani (bots included ✓)
       send(e.ws, { type: "room_created", roomCode: code, roomName: "Match", region: "GLOBAL", mode: rooms[code].mode, playerId: 1, maxPlayers: required, players: roomPlayers(code), hostId: 1 });
     } else {
       send(e.ws, { type: "room_joined", roomCode: code, roomName: "Match", region: "GLOBAL", mode: rooms[code].mode, playerId: i + 1, maxPlayers: required, players: roomPlayers(code), hostId: 1 });
     }
   });
-  // Party match ma members < required huna sakinchha (3/4 squad + 4/4 squad = 7 ✓)
-  // → loop ma ACTUAL player count use ✓ (undefined crash ✓)
   for (let i = 1; i < rooms[code].players.length; i++) {
     broadcast(code, { type: "player_joined", player: playerPublic(rooms[code].players[i]), players: roomPlayers(code), hostId: 1 }, group[i].ws);
   }
   sendToAll(code, { type: "game_start", mode: rooms[code].mode, players: roomPlayers(code) });
-  console.log(`[MATCH] ${group.map((e) => e.playerName).join(" vs ")} → ${code} mode=${rooms[code].mode} ${required}p`);
-  // Empty slot cha bhaye bot fill (server authority)
   scheduleBotFill(code);
 }
 
 wss.on("connection", (ws, req) => {
   let currentRoom = null;
   allClients.add(ws);
-  // WS upgrade request bata pani identity detect garu (pehla HTTP hit nai bhayo bhaye)
   if (req && req.headers && req.headers.host) detectSelf(req.headers.host);
-  // ── RENDER LOGS: real player count (connect huda) ──
-  // 100 player cross bhayo bhaye alag line (milestone).
   const liveNow = livePlayerCount();
-  if (liveNow % 100 === 0) {
-    console.log(`[POOL] ${SELF_ID} reached ${liveNow} players — pool ${poolLiveCount()}/${poolCapacity()}`);
-  }
+  if (liveNow % 100 === 0) console.log(`[POOL] ${SELF_ID} reached ${liveNow} players — pool ${poolLiveCount()}/${poolCapacity()}`);
   if (Date.now() - lastConnectLog > 5000) {
     lastConnectLog = Date.now();
     logPlayerCount("connect");
   }
-  // Pairing (aanu ko socket ko handler bata pani) le yo socket ko currentRoom set garna sakos.
   ws.setRoom = (code) => { currentRoom = code; };
-  // ── WORLD CHAT identity (online players list + join target) ──
   ws.chatName = "";
   ws.chatProfileId = "";
-  // Which match server this client is on (live player counts)
   ws.__serverId = null;
-  // Player ko selected mode (set_mode le set huncha) — queue fallback
   ws.__mode = "";
 
   ws.on("message", (raw, isBinary) => {
@@ -1910,7 +1476,6 @@ wss.on("connection", (ws, req) => {
       }
       return;
     }
-
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
@@ -1918,10 +1483,6 @@ wss.on("connection", (ws, req) => {
       const code = (msg.roomCode || "").toUpperCase().trim();
       if (!rooms[code]) { send(ws, { type: "error", message: "Room not found." }); return; }
       const room = rooms[code];
-
-      // ── CROSS-SERVER MIGRATION ──────────────────────────
-      // Ye player arko backend bata migrate gareko ho (match_migrate).
-      // Room ma afno reserved slot already cha — socket badau settle garna.
       const reserved = pendingClaims.get(code);
       if (reserved && reserved.slotIndex < room.players.length) {
         const slot = room.players[reserved.slotIndex];
@@ -1936,118 +1497,67 @@ wss.on("connection", (ws, req) => {
           pendingClaims.delete(code);
           room.awaitingRemote = false;
           currentRoom = code;
-          send(ws, {
-            type: "room_joined", roomCode: code,
-            roomName: room.roomName, region: room.region,
-            mode: room.mode, playerId: slot.id,
-            maxPlayers: room.maxPlayers, players: roomPlayers(code),
-            hostId: hostIdOf(room),
-          });
-          broadcast(code, {
-            type: "player_joined", player: playerPublic(slot),
-            players: roomPlayers(code), hostId: hostIdOf(room),
-          }, ws);
-          // Room complete (host + migrated player) → game start
+          send(ws, { type: "room_joined", roomCode: code, roomName: room.roomName, region: room.region, mode: room.mode, playerId: slot.id, maxPlayers: room.maxPlayers, players: roomPlayers(code), hostId: hostIdOf(room) });
+          broadcast(code, { type: "player_joined", player: playerPublic(slot), players: roomPlayers(code), hostId: hostIdOf(room) }, ws);
           sendToAll(code, { type: "game_start", mode: room.mode, players: roomPlayers(code) });
-          console.log(`[MATCH-X] ${slot.name} migrated into ${code} (${SELF_ID})`);
           return;
         }
       }
-
-      // Real player aayo → bot hatera slot free (replace) — full check AGAA
       if (room.players.some((p) => p.isBot)) {
         cancelBotFill(code);
         removeBotForRealPlayer(code);
       }
       if (room.players.length >= room.maxPlayers) { send(ws, { type: "error", message: "Room is full." }); return; }
-
       const joinLoginType = msg.loginType || "guest";
       const hostLoginType = room.loginType || "guest";
       if ((joinLoginType === "guest") !== (hostLoginType === "guest")) {
         send(ws, { type: "error", message: joinLoginType === "guest" ? "Guests can only play with other guests." : "This room only accepts logged-in players." });
         return;
       }
-
       const joinUserId = msg.userId || "";
       const joinDevice = msg.deviceId || "";
-      // Same account: reject only when SAME device (real duplicate login).
-      // Android + Mac ek account le khelna mildo — device farak chha.
       const sameDeviceAs = (p) => {
-        if (!joinDevice || !p.device) return true; // purana client / device info chhaina → strict
+        if (!joinDevice || !p.device) return true;
         return p.device === joinDevice;
       };
       if (joinUserId) {
         const dupHere = room.players.find((p) => p.userId === joinUserId);
-        if (dupHere && sameDeviceAs(dupHere)) {
-          send(ws, { type: "error", message: "This account is already in the room." }); return;
-        }
+        if (dupHere && sameDeviceAs(dupHere)) { send(ws, { type: "error", message: "This account is already in the room." }); return; }
       }
       if (joinUserId) {
         for (const [rCode, r] of Object.entries(rooms)) {
           if (rCode === code) continue;
           const other = r.players.find((p) => p.userId === joinUserId);
-          if (other && sameDeviceAs(other)) {
-            send(ws, { type: "error", message: "This account is already in another room." }); return;
-          }
+          if (other && sameDeviceAs(other)) { send(ws, { type: "error", message: "This account is already in another room." }); return; }
         }
       }
-
       const pid = room.players.length + 1;
-      const player = {
-        ws, id: pid, name: msg.playerName || "Player",
-        characterId: msg.characterId || 0,
-        loginType: joinLoginType, userId: joinUserId,
-        profileId: msg.profileId || "",
-        device: joinDevice,
-        ready: false, slot: pid,
-        position: { x: 0, y: 0, z: 0 },
-        rotation: { x: 0, y: 0, z: 0, w: 1 },
-      };
+      const player = { ws, id: pid, name: msg.playerName || "Player", characterId: msg.characterId || 0, loginType: joinLoginType, userId: joinUserId, profileId: msg.profileId || "", device: joinDevice, ready: false, slot: pid, position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 } };
       room.players.push(player);
       currentRoom = code;
-      // Socket identity persist (room join garera arko backend ma gya bhane pani
-      // team invite / online list ma profileId chahida).
       if (msg.profileId) ws.chatProfileId = String(msg.profileId);
       if (msg.playerName) ws.chatName = String(msg.playerName).slice(0, 24);
-
-      send(ws, {
-        type: "room_joined", roomCode: code,
-        roomName: room.roomName, region: room.region,
-        mode: room.mode, playerId: pid,
-        maxPlayers: room.maxPlayers, players: roomPlayers(code),
-        hostId: hostIdOf(room),
-      });
+      send(ws, { type: "room_joined", roomCode: code, roomName: room.roomName, region: room.region, mode: room.mode, playerId: pid, maxPlayers: room.maxPlayers, players: roomPlayers(code), hostId: hostIdOf(room) });
       broadcast(code, { type: "player_joined", player: playerPublic(player), players: roomPlayers(code), hostId: hostIdOf(room) }, ws);
-      console.log(`[JOIN] ${player.name} (${joinLoginType}) → ${code} as #${pid}`);
       return;
     }
 
     if (msg.type === "ping") { send(ws, { type: "pong", room: currentRoom }); return; }
-
-    // ── WORLD CHAT ──
-    // hello: client le afno name + profileId pathauncha (online list + join target)
     if (msg.type === "chat_identity") {
       ws.chatName = String(msg.name || "Player").substring(0, 40);
       ws.chatProfileId = String(msg.profileId || "");
       return;
     }
-
-    // online list: kun friends online cha (invite button online matra dekhaune)
     if (msg.type === "online_list") {
       const local = localOnlinePlayers();
       send(ws, { type: "online_list", players: local, scope: "local" });
-      // Arko backend ko online players ni (cross-backend friend)
       for (const peer of (PEERS || [])) {
         httpPostJson(peer.url, "/mm/online-list", {}, 3000).then((res) => {
-          if (res && Array.isArray(res.players) && res.players.length) {
-            send(ws, { type: "online_list", players: res.players, scope: "peer" });
-          }
+          if (res && Array.isArray(res.players) && res.players.length) send(ws, { type: "online_list", players: res.players, scope: "peer" });
         });
       }
       return;
     }
-
-    // dm: direct message — target player lai matra (sender lai pani dekhauncha)
     if (msg.type === "chat_dm") {
       const targetId = String(msg.targetProfileId || "").trim();
       const text = String(msg.text || "").substring(0, 200);
@@ -2056,32 +1566,16 @@ wss.on("connection", (ws, req) => {
       for (const w of allClients) {
         if (w.readyState === 1 && w.chatProfileId && w.chatProfileId === targetId) { target = w; break; }
       }
-      if (!target) {
-        send(ws, { type: "error", message: "That player is not online." });
-        return;
-      }
-      const dm = {
-        type: "chat_dm",
-        sender: ws.chatName || "Player",
-        senderProfileId: ws.chatProfileId || "",
-        text,
-        ts: Date.now(),
-      };
+      if (!target) { send(ws, { type: "error", message: "That player is not online." }); return; }
+      const dm = { type: "chat_dm", sender: ws.chatName || "Player", senderProfileId: ws.chatProfileId || "", text, ts: Date.now() };
       send(target, dm);
       send(ws, dm);
       return;
     }
-
-    // ── TEAM SYSTEM (server = authoritative) ──
-    // team_sync / team_slot_select: player afno slot choose garcha
-    // (Team 1..4) → server ma register + sab lai state pathau.
     if (msg.type === "team_sync" || msg.type === "team_slot_select") {
       const teamId = String(msg.teamId || "").trim();
       const pid = (ws.chatProfileId || String(msg.profileId || "")).trim();
-      if (!teamId || !pid) {
-        send(ws, { type: "team_error", message: "Team sync failed — not logged in." });
-        return;
-      }
+      if (!teamId || !pid) { send(ws, { type: "team_error", message: "Team sync failed — not logged in." }); return; }
       const nm = ws.chatName || String(msg.name || "Player");
       const wantSlot = Number(msg.slotIndex);
       const teamExisted = teams.has(teamId);
@@ -2089,131 +1583,68 @@ wss.on("connection", (ws, req) => {
       const wantSize = Number(msg.teamSize || 0);
       const validSize = (wantSize === 1 || wantSize === 2 || wantSize === 4);
       const isOwner = !team.ownerProfileId || team.ownerProfileId === pid;
-      const slot = teamRegisterMember(team, pid, nm,
-        Number.isInteger(wantSlot) ? wantSlot : -1);
+      const slot = teamRegisterMember(team, pid, nm, Number.isInteger(wantSlot) ? wantSlot : -1);
       if (slot < 0) {
-        const errMsg = (team.kicked && team.kicked.includes(pid))
-          ? "You were removed from this group by the leader."
-          : "Team is full.";
+        const errMsg = (team.kicked && team.kicked.includes(pid)) ? "You were removed from this group by the leader." : "Team is full.";
         send(ws, { type: "team_error", message: errMsg });
         return;
       }
-      // ── SIZE RULES (leader only ✓) ──
-      //  • Member le size change garna mildaina ✗
-      //  • 4 → 2/1 allowed chhaina (team chhodna parcha ✓)
-      //  • 2 → 4 allowed ✓
-      //  • Member count > size allowed chhaina ✗
       if (validSize && isOwner) {
         const cur = Number(team.teamSize || TEAM_SIZE_DEFAULT);
-        if (!teamExisted) {
-          // NAYA team → leader ko selection apply ✓ (1/2/4 ✓)
-          team.teamSize = wantSize;
-        } else if (wantSize === 1 || wantSize === 2) {
+        if (!teamExisted) team.teamSize = wantSize;
+        else if (wantSize === 1 || wantSize === 2) {
           if (cur === 4) {
-            // 4 → chhoto: allowed chhaina (exit/disband garna parcha ✓)
             send(ws, { type: "team_error", message: "Exit or disband the team before switching to a smaller size." });
             team.teamSize = cur;
           } else if (team.members.length > wantSize) {
             send(ws, { type: "team_error", message: "Too many members for that team size." });
             team.teamSize = cur;
-          } else {
-            team.teamSize = wantSize;
-          }
-        } else {
-          team.teamSize = wantSize;   // 2 → 4 ✓ (ya 4 → 4 ✓)
-        }
-      }
-      if (slot < 0) {
-        const wasKicked = team.kicked && team.kicked.includes(pid);
-        const errMsg = wasKicked ? "You were removed from this group by the leader." : "Team is full.";
-        send(ws, { type: "team_error", message: errMsg });
-        return;
+          } else team.teamSize = wantSize;
+        } else team.teamSize = wantSize;
       }
       teamPruneExpired(team);
       teamNormalize(team);
       teamNotifyAll(team);
       send(ws, Object.assign({ type: "team_state" }, teamStatePayload(team)));
-      console.log(`[TEAM] ${nm} took slot ${slot} of team ${teamId}`);
       return;
     }
-
-    // team invite: friend lai mero team (Team 1..4) ma invite
     if (msg.type === "team_invite") {
       const targetProfileId = String(msg.targetProfileId || "").trim();
       const teamId = String(msg.teamId || "").trim();
       const targetName = String(msg.targetName || "").trim();
       const wantSlot = Number(msg.slotIndex);
       const ownerSlot = Number(msg.ownerSlot);
-      // Free Fire style: invitee le accept garera SAME room ma join garna sake
       const roomCode = String(msg.roomCode || "").trim().toUpperCase();
       const roomUrl = String(msg.roomUrl || "").trim();
-      if (!targetProfileId || !teamId) {
-        send(ws, { type: "team_error", message: "Team invite failed — bad request." });
-        return;
-      }
+      if (!targetProfileId || !teamId) { send(ws, { type: "team_error", message: "Team invite failed — bad request." }); return; }
       const myId = (ws.chatProfileId || String(msg.profileId || msg.fromProfileId || "")).trim();
-      if (targetProfileId === myId) {
-        send(ws, { type: "team_error", message: "You cannot invite yourself." });
-        return;
-      }
+      if (targetProfileId === myId) { send(ws, { type: "team_error", message: "You cannot invite yourself." }); return; }
       const fromName = ws.chatName || "Player";
       const team = teams.get(teamId);
-      // Team arko backend ma cha (owner tara) → request tara forward garcha
-      // (slot allocation owner backend matra decide garcha).
       if (!team) {
         const peers = PEERS || [];
-        if (!peers.length) {
-          send(ws, { type: "team_error", message: "Team not found." });
-          return;
-        }
+        if (!peers.length) { send(ws, { type: "team_error", message: "Team not found." }); return; }
         let pending = peers.length;
         let done = false;
         let lastErr = "Team not found.";
         for (const peer of peers) {
-          httpPostJson(peer.url, "/mm/team-invite-request", {
-            teamId, targetProfileId, targetName, ownerSlot, roomCode, roomUrl,
-            fromName, fromProfileId: myId,
-          }, 3000).then((res) => {
+          httpPostJson(peer.url, "/mm/team-invite-request", { teamId, targetProfileId, targetName, ownerSlot, roomCode, roomUrl, fromName, fromProfileId: myId }, 3000).then((res) => {
             if (res && res.ok) {
               done = true;
-              send(ws, {
-                type: "team_invite_sent", targetProfileId, name: targetName,
-                slotIndex: Number(res.slotIndex || 0),
-              });
-            } else if (res && res.message) {
-              lastErr = res.message;
-            }
+              send(ws, { type: "team_invite_sent", targetProfileId, name: targetName, slotIndex: Number(res.slotIndex || 0) });
+            } else if (res && res.message) lastErr = res.message;
             pending -= 1;
             if (pending === 0 && !done) send(ws, { type: "team_error", message: lastErr });
           });
         }
         return;
       }
-      // Team yai backend ma cha → inviter register + slot reserve + deliver.
-      const result = teamProcessInvite(team, {
-        targetProfileId, targetName, wantSlot, ownerSlot, fromName, fromProfileId: myId,
-        inviterProfileId: myId,
-      });
-      if (!result.ok) {
-        send(ws, { type: "team_error", message: result.message });
-        return;
-      }
-      const payload = {
-        type: "team_invite",
-        teamId,
-        slotIndex: result.slot,
-        fromName,
-        fromProfileId: myId,
-        roomCode: roomCode,
-        roomUrl: roomUrl,
-        ts: Date.now(),
-      };
+      const result = teamProcessInvite(team, { targetProfileId, targetName, wantSlot, ownerSlot, fromName, fromProfileId: myId, inviterProfileId: myId });
+      if (!result.ok) { send(ws, { type: "team_error", message: result.message }); return; }
+      const payload = { type: "team_invite", teamId, slotIndex: result.slot, fromName, fromProfileId: myId, roomCode: roomCode, roomUrl: roomUrl, ts: Date.now() };
       teamDeliverInvite(targetProfileId, payload).then((delivered) => {
-        if (delivered) {
-          send(ws, { type: "team_invite_sent", targetProfileId, name: targetName, slotIndex: result.slot });
-          console.log(`[TEAM-INVITE] ${fromName} → friend (team ${teamId} slot ${result.slot})`);
-        } else {
-          // Target offline → reservation release (slot free).
+        if (delivered) send(ws, { type: "team_invite_sent", targetProfileId, name: targetName, slotIndex: result.slot });
+        else {
           team.pending = team.pending.filter((p) => p.profileId !== targetProfileId);
           teamNotifyAll(team);
           send(ws, { type: "team_error", message: "That friend is not online." });
@@ -2221,221 +1652,132 @@ wss.on("connection", (ws, req) => {
       });
       return;
     }
-
-    // team accept: friend le team join gare
     if (msg.type === "team_accept") {
       const teamId = String(msg.teamId || "").trim();
       const slotIndex = Number(msg.slotIndex);
-      if (!teamId) {
-        send(ws, { type: "team_error", message: "Team join failed — bad request." });
-        return;
-      }
+      if (!teamId) { send(ws, { type: "team_error", message: "Team join failed — bad request." }); return; }
       const pid = (ws.chatProfileId || String(msg.profileId || "")).trim();
-      if (!pid) {
-        send(ws, { type: "team_error", message: "Team join failed — not logged in." });
-        return;
-      }
+      if (!pid) { send(ws, { type: "team_error", message: "Team join failed — not logged in." }); return; }
       const nm = ws.chatName || String(msg.name || "Player");
       const team = teams.get(teamId);
       if (team) {
-        // Team yai backend ma cha → validate + add + notify
         const result = teamApplyAccept(team, pid, nm, slotIndex);
-        if (!result.ok) {
-          send(ws, { type: "team_error", message: result.message });
-          return;
-        }
+        if (!result.ok) { send(ws, { type: "team_error", message: result.message }); return; }
         send(ws, { type: "team_state", teamId, members: result.members, pending: result.pending });
         return;
       }
-      // Team owner arko backend ma cha → peer ma forward
-      // Local mirror (disconnect bhaye owner lai bataune)
       if (!localTeams.has(teamId)) localTeams.set(teamId, new Set());
       localTeams.get(teamId).add(pid);
       const peers = PEERS || [];
       let pending = peers.length;
       let ok = false;
       let lastErr = "Team not found.";
-      if (pending === 0) {
-        send(ws, { type: "team_error", message: lastErr });
-        return;
-      }
+      if (pending === 0) { send(ws, { type: "team_error", message: lastErr }); return; }
       for (const peer of peers) {
-        httpPostJson(peer.url, "/mm/team-accept", {
-          teamId, profileId: pid, name: nm, slotIndex,
-        }, 3000).then((res) => {
+        httpPostJson(peer.url, "/mm/team-accept", { teamId, profileId: pid, name: nm, slotIndex }, 3000).then((res) => {
           if (res && res.delivered) {
             ok = true;
-            // Peer le handle gareko state → joiner lai direct pathau.
-            if (res && Array.isArray(res.members)) {
-              send(ws, {
-                type: "team_state",
-                teamId,
-                members: res.members,
-                pending: Array.isArray(res.pending) ? res.pending : [],
-              });
-            }
-          } else if (res && res.message) {
-            lastErr = res.message;
-          }
+            if (res && Array.isArray(res.members)) send(ws, { type: "team_state", teamId, members: res.members, pending: Array.isArray(res.pending) ? res.pending : [] });
+          } else if (res && res.message) lastErr = res.message;
           pending -= 1;
-          if (pending === 0 && !ok) {
-            send(ws, { type: "team_error", message: lastErr });
-          }
+          if (pending === 0 && !ok) send(ws, { type: "team_error", message: lastErr });
         });
       }
       return;
     }
-
-    // team kick: LEADER matra member kick garna sakinchha ✓
     if (msg.type === "team_kick") {
       const teamId = String(msg.teamId || "").trim();
       const targetId = String(msg.targetProfileId || "").trim();
       const pid = (ws.chatProfileId || String(msg.profileId || "")).trim();
-      if (!teamId || !targetId) {
-        send(ws, { type: "team_error", message: "Kick failed — bad request." });
-        return;
-      }
+      if (!teamId || !targetId) { send(ws, { type: "team_error", message: "Kick failed — bad request." }); return; }
       const team = teams.get(teamId);
       if (!team) {
-        // Arko backend ma cha → peer ma forward ✓
-        for (const peer of (PEERS || [])) {
-          httpPostJson(peer.url, "/mm/team-kick",
-            { teamId, targetProfileId: targetId, profileId: pid }, 3000);
-        }
+        for (const peer of (PEERS || [])) httpPostJson(peer.url, "/mm/team-kick", { teamId, targetProfileId: targetId, profileId: pid }, 3000);
         return;
       }
-      if (!pid || team.ownerProfileId !== pid) {
-        send(ws, { type: "team_error", message: "Only the group leader can kick players." });
-        return;
-      }
-      if (targetId === pid) {
-        send(ws, { type: "team_error", message: "You cannot kick yourself." });
-        return;
-      }
+      if (!pid || team.ownerProfileId !== pid) { send(ws, { type: "team_error", message: "Only the group leader can kick players." }); return; }
+      if (targetId === pid) { send(ws, { type: "team_error", message: "You cannot kick yourself." }); return; }
       const had = teamRemoveMember(team, targetId);
-      if (!had) {
-        send(ws, { type: "team_error", message: "That player is not in your group." });
-        return;
-      }
-      // Sabai lai update (kicked player pani ✓ → member count ghata ✓)
+      if (!had) { send(ws, { type: "team_error", message: "That player is not in your group." }); return; }
       teamNotifyAll(team, [targetId]);
       for (const w of allClients) {
         if (w.readyState !== 1 || !w.chatProfileId) continue;
         if (w.chatProfileId === targetId) {
           send(w, { type: "team_removed", teamId, reason: "kicked" });
-          send(w, { type: "team_state", teamId, ownerProfileId: team.ownerProfileId || "",
-            teamSize: Number(team.teamSize || 0), maxSize: teamMaxSize(team),
-            members: [], pending: [] });
+          send(w, { type: "team_state", teamId, ownerProfileId: team.ownerProfileId || "", teamSize: Number(team.teamSize || 0), maxSize: teamMaxSize(team), members: [], pending: [] });
         }
       }
-      console.log(`[TEAM] ${pid} kicked ${targetId} from team ${teamId} (${team.members.length}/${teamMaxSize(team)})`);
       return;
     }
-
-    // team decline: invite LATER (slot free hoyo — ghost reservation nai rakhne)
     if (msg.type === "team_decline") {
       const teamId = String(msg.teamId || "").trim();
       const pid = (ws.chatProfileId || String(msg.profileId || "")).trim();
       if (!teamId || !pid) return;
       const team = teams.get(teamId);
       if (team) {
-        const had = team.pending.some((p) => p.profileId === pid);
-        if (had) {
+        if (team.pending.some((p) => p.profileId === pid)) {
           team.pending = team.pending.filter((p) => p.profileId !== pid);
           teamNormalize(team);
           teamNotifyAll(team);
         }
       } else {
-        for (const peer of (PEERS || [])) {
-          httpPostJson(peer.url, "/mm/team-decline", { teamId, profileId: pid }, 3000);
-        }
+        for (const peer of (PEERS || [])) httpPostJson(peer.url, "/mm/team-decline", { teamId, profileId: pid }, 3000);
       }
       return;
     }
-
-    // team leave: team bata nikal
-    // ── GROUP MATCHING STATE (leader start/cancel → sab group member lai ✓)
     if (msg.type === "group_mm") {
       const teamId = String(msg.teamId || "").trim();
       const op = String(msg.op || "").trim();
       const pid = (ws.chatProfileId || String(msg.profileId || "")).trim();
       if (!teamId) return;
       const team = teams.get(teamId);
-      // Auth check — group member matra ✓
       const isMember = team ? team.members.some((m) => m.profileId === pid) : false;
       const isLeader = team ? team.ownerProfileId === pid : false;
-      if (op === "start" && !isLeader) {
-        // Start = leader matra ✓
-        return;
-      }
-      if (op === "cancel" && !isMember) {
-        // Cancel = group member matra ✓ (outsider garna hudaina ✗)
-        return;
-      }
-      // Group ma kasaile press garna sakinchha (cancel sab lai jauncha ✓)
+      if (op === "start" && !isLeader) return;
+      if (op === "cancel" && !isMember) return;
       if (op === "cancel") {
-        // Group ko sab queue entry hatau (member le cancel gare bhaye ✓)
-        const before = matchQueue.length;
         matchQueue = matchQueue.filter((q) => (q.groupId || "") !== teamId);
-        if (matchQueue.length !== before) {
-          console.log(`[GROUP] ${pid} cancelled group ${teamId} matching`);
-        }
       }
-      // Group ko sab member lai pathau ✓
       const ids = team ? team.members.map((m) => m.profileId) : (pid ? [pid] : []);
       for (const w of allClients) {
         if (w.readyState !== 1 || !w.chatProfileId) continue;
-        if (ids.includes(w.chatProfileId)) {
-          send(w, { type: "group_mm", op, teamId });
-        }
+        if (ids.includes(w.chatProfileId)) send(w, { type: "group_mm", op, teamId });
       }
       return;
     }
-
     if (msg.type === "team_leave") {
       const teamId = String(msg.teamId || "").trim();
       const pid = (ws.chatProfileId || String(msg.profileId || "")).trim();
       const team = teams.get(teamId);
       if (team && pid) {
         teamRemoveMember(team, pid);
-        // Leaver lai pani state pathau (stale member list avoid ✓ — silent ✓)
         teamNotifyAll(team, [pid]);
-        // Leaver ko "removed" → client Solo ma reset ✓ (koi message hudaina ✗ ✓)
         for (const w of allClients) {
           if (w.readyState !== 1 || !w.chatProfileId) continue;
           if (w.chatProfileId === pid) {
             send(w, { type: "team_removed", teamId, reason: "left" });
-            send(w, { type: "team_state", teamId, ownerProfileId: team.ownerProfileId || "",
-              teamSize: Number(team.teamSize || 0), maxSize: teamMaxSize(team),
-              members: [], pending: [] });
+            send(w, { type: "team_state", teamId, ownerProfileId: team.ownerProfileId || "", teamSize: Number(team.teamSize || 0), maxSize: teamMaxSize(team), members: [], pending: [] });
           }
         }
         if (team.members.length === 0) teams.delete(teamId);
       } else if (pid) {
-        // Owner arko backend ma cha → peer ma forward
-        for (const peer of (PEERS || [])) {
-          httpPostJson(peer.url, "/mm/team-member-left", { teamId, profileId: pid }, 3000);
-        }
+        for (const peer of (PEERS || [])) httpPostJson(peer.url, "/mm/team-member-left", { teamId, profileId: pid }, 3000);
       }
       if (localTeams.has(teamId)) localTeams.get(teamId).delete(pid);
       return;
     }
-
-    // msg: room bhitra message (members lai matra)
     if (msg.type === "chat_global") {
       const text = (msg.text || "").substring(0, 200);
       if (text.length === 0) return;
       sendGlobal({ type: "chat_global", sender: msg.sender || "Player", text, ts: Date.now() });
       return;
     }
-
     if (msg.type === "chat_room") {
       const text = (msg.text || "").substring(0, 200);
       if (text.length === 0) return;
       const pid = ws.chatProfileId || "";
       const tid = pid ? teamIdOfProfileAny(pid) : "";
       const payload = { type: "chat_room", sender: msg.sender || "Player", text, ts: Date.now() };
-      // Group/team chat — lobby ma room nai hudaina, so team members lai pathau.
       if (tid) {
         const teamMsg = Object.assign({ teamId: tid }, payload);
         teamBroadcastAll(tid, teamMsg, "", ws);
@@ -2446,126 +1788,71 @@ wss.on("connection", (ws, req) => {
       broadcast(currentRoom, payload);
       return;
     }
-
-    // ── ROOM INVITE (friends drawer "+" button) ──
     if (msg.type === "room_invite") {
       const targetProfileId = (msg.targetProfileId || "").trim();
       const code = (msg.roomCode || "").toUpperCase().trim();
-      if (!targetProfileId || !code || !rooms[code]) {
-        send(ws, { type: "error", message: "Invite failed — no room." });
-        return;
-      }
+      if (!targetProfileId || !code || !rooms[code]) { send(ws, { type: "error", message: "Invite failed — no room." }); return; }
       const room = rooms[code];
-      if (!room.players.some((p) => p.ws === ws)) {
-        send(ws, { type: "error", message: "Invite failed — you are not in a room." });
-        return;
-      }
+      if (!room.players.some((p) => p.ws === ws)) { send(ws, { type: "error", message: "Invite failed — you are not in a room." }); return; }
       const target = findPlayerByProfileId(targetProfileId);
-      if (!target) {
-        send(ws, { type: "error", message: "That friend is not online." });
-        return;
-      }
-      if (target.ws === ws) {
-        send(ws, { type: "error", message: "You cannot invite yourself." });
-        return;
-      }
-      if (room.players.length >= room.maxPlayers) {
-        send(ws, { type: "error", message: "Room is full." });
-        return;
-      }
+      if (!target) { send(ws, { type: "error", message: "That friend is not online." }); return; }
+      if (target.ws === ws) { send(ws, { type: "error", message: "You cannot invite yourself." }); return; }
+      if (room.players.length >= room.maxPlayers) { send(ws, { type: "error", message: "Room is full." }); return; }
       const fromName = (room.players.find((p) => p.ws === ws) || {}).name || "Player";
-      send(target.ws, {
-        type: "room_invite",
-        roomCode: code,
-        roomName: room.roomName,
-        fromName,
-        fromProfileId: msg.fromProfileId || "",
-        ts: Date.now(),
-      });
-      console.log(`[INVITE] ${fromName} → ${target.name} (room ${code})`);
+      send(target.ws, { type: "room_invite", roomCode: code, roomName: room.roomName, fromName, fromProfileId: msg.fromProfileId || "", ts: Date.now() });
       return;
     }
-
-    // ── QUICK MATCHMAKING — status-based pairing (2 real players, no fakes) ──
     if (msg.type === "quick_match") {
-      // Socket identity (quick match pachi pani team/online list kaam garna)
       if (msg.profileId) ws.chatProfileId = String(msg.profileId);
       if (msg.playerName) ws.chatName = String(msg.playerName).slice(0, 24);
-      if (matchQueue.some((q) => q.ws === ws)) return; // duplicate request guard
-      // Server full cha bhaye naya player admit hudaina (client lai popup dekhau).
-      if (isServerFull()) {
-        send(ws, { type: "error", message: "This server's traffic is full. Please try in a later or choose another server." });
-        return;
-      }
-      // Pahile room ma thiyo bhane niskin (solo host START → matchmaking)
+      if (matchQueue.some((q) => q.ws === ws)) return;
+      if (isServerFull()) { send(ws, { type: "error", message: "This server's traffic is full. Please try in a later or choose another server." }); return; }
       if (currentRoom && rooms[currentRoom]) {
         const old = rooms[currentRoom];
         old.players = old.players.filter((p) => p.ws !== ws);
-        if (old.players.length === 0) {
-          delete rooms[currentRoom];
-        } else {
+        if (old.players.length === 0) delete rooms[currentRoom];
+        else {
           if (old.host === ws) { old.host = old.players[0].ws; old.hostName = old.players[0].name; }
           broadcast(currentRoom, { type: "player_left", playerId: null, players: roomPlayers(currentRoom), hostId: hostIdOf(old) });
         }
         currentRoom = null;
       }
-      // Expired (>3 min) / dead entries hatau
       matchQueue = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && Date.now() - q.queuedAt < 180000);
       const entry = {
         ws, playerName: msg.playerName || "Player", characterId: msg.characterId | 0,
         mode: msg.mode || ws.__mode || "MUMMY_VS_HUMAN", loginType: msg.loginType || "guest",
-        userId: msg.userId || "", profileId: msg.profileId || "",
-        groupId: String(msg.groupId || ""),
+        userId: msg.userId || "", profileId: msg.profileId || "", groupId: String(msg.groupId || ""),
         device: msg.deviceId || "", region: msg.region || DEFAULT_SERVER_ID,
         serverId: msg.serverId || msg.region || DEFAULT_SERVER_ID,
         queuedAt: Date.now(),
         teamSize: (Number(msg.teamSize) >= 1 ? Math.min(4, Number(msg.teamSize)) : 2),
       };
-      // DUPLICATE guard — ek player ek matra queue ma ✓
-      // (ws reconnect hunda hai → profileId bata match ✓)
       const qPid = String(msg.profileId || ws.chatProfileId || "");
       matchQueue = matchQueue.filter((q) => q.ws !== ws && !(qPid && q.profileId === qPid));
       matchQueue.push(entry);
-      // Group fill (3/4 squad + lone squad player → 4/4 ✓)
       pumpQueueGroups();
-      // Cancel (X) pachi pair hudaina bhanera microtask ma queue re-check
       setTimeout(() => tryQuickPair(entry), 0);
-      // Empty slot (missing player) → bot fill schedule ✓
       scheduleQueueBotFill(entry);
       return;
     }
-
-    // Player le server select gare (lobby ma) → live count ra live status
     if (msg.type === "set_server") {
       const sid = String(msg.serverId || "");
-      if (serverById(sid)) {
-        ws.__serverId = sid;
-        console.log(`[SERVER] client on ${sid}`);
-      }
+      if (serverById(sid)) ws.__serverId = sid;
       return;
     }
-
     if (msg.type === "quick_match_cancel") {
-      // NOTE: quick_match le ws reconnect garcha → entry ko ws purano huncha ✗
-      //       → profileId bata match garo ✓
       const cancelPid = String(msg.profileId || ws.chatProfileId || "");
       let entry = matchQueue.find((q) => q.ws === ws);
       if (!entry && cancelPid) entry = matchQueue.find((q) => q.profileId === cancelPid);
       if (entry && entry.botFillTimer) { clearTimeout(entry.botFillTimer); entry.botFillTimer = null; }
-      // Entry (purano ws wala ✓) + naya ws dono hatau ✓
       matchQueue = matchQueue.filter((q) => q !== entry && q.ws !== ws);
-      console.log(`[CANCEL] ${cancelPid || "?"} → removed=${!!entry} queue=${matchQueue.length}`);
-      // Baki queue members ko count refresh (1/0 → … counter nai satik rahanos)
       if (entry) progressTo(entry.mode, entry.teamSize);
-      // Cancel pachi fresh matchmade room (seal bhako <3s) ma chha → turunti nikal:
-      // duplicate/fake match state bachau, arko player lai player_left janchha.
       if (entry && currentRoom && rooms[currentRoom]) {
         const r = rooms[currentRoom];
         if (r.matchmadeAt && Date.now() - r.matchmadeAt < 3000) {
           r.players = r.players.filter((p) => p.ws !== ws);
-          if (r.players.length === 0) {
-            delete rooms[currentRoom];
-          } else {
+          if (r.players.length === 0) delete rooms[currentRoom];
+          else {
             if (r.host === ws) { r.host = r.players[0].ws; r.hostName = r.players[0].name; }
             broadcast(currentRoom, { type: "player_left", playerId: null, players: roomPlayers(currentRoom), hostId: hostIdOf(r) });
           }
@@ -2574,10 +1861,6 @@ wss.on("connection", (ws, req) => {
       }
       return;
     }
-
-    // ── SET MODE (room chahe na ho) ──────────────────────
-    // Player le mode select gare — server le track garcha (per-mode matching
-    // ko laagi). Room ma bhayo bhaye host ko mode update + broadcast.
     if (msg.type === "set_mode") {
       const m = String(msg.mode || "");
       if (m) {
@@ -2597,22 +1880,13 @@ wss.on("connection", (ws, req) => {
     const room = rooms[currentRoom];
     const player = findPlayer(currentRoom, ws);
 
-    // ── EMOTE / ENTRY ANIM (room + team/lobby) ─────────────
-    // Lobby group members same room ma hudainan → team broadcast ni chahincha.
     if (msg.type === "emote" || msg.type === "entry_anim") {
       const anim = String(msg.anim || "").slice(0, 64);
       if (!anim) return;
       const isEmote = msg.type === "emote";
       const pid = ws.chatProfileId || (player && player.profileId) || "";
       const tid = pid ? teamIdOfProfileAny(pid) : "";
-      if (tid) {
-        teamBroadcastAll(tid, {
-          type: isEmote ? "team_emote" : "team_entry_anim",
-          senderProfileId: pid,
-          anim,
-          ts: Date.now(),
-        }, pid);
-      }
+      if (tid) teamBroadcastAll(tid, { type: isEmote ? "team_emote" : "team_entry_anim", senderProfileId: pid, anim, ts: Date.now() }, pid);
       if (player) {
         const teamIds = tid ? teamLocalRecipientIds(tid) : new Set();
         const payload = { type: msg.type, playerId: player.id, anim, senderProfileId: pid };
@@ -2624,29 +1898,22 @@ wss.on("connection", (ws, req) => {
       }
       return;
     }
-
     if (msg.type === "check_game") {
       if (room.gameStarted) send(ws, { type: "game_start", mode: room.mode, players: roomPlayers(currentRoom) });
       return;
     }
-
-    // Lobby self-heal: client return-to-lobby / panel open ma authoritative
-    // room list magcha (stale 1/4 count fix).
     if (msg.type === "sync_room") {
       if (player) send(ws, { type: "lobby_update", players: roomPlayers(currentRoom), hostId: hostIdOf(room) });
       return;
     }
-
     if (msg.type === "set_character") {
       if (player) { player.characterId = msg.characterId; broadcast(currentRoom, { type: "lobby_update", players: roomPlayers(currentRoom), hostId: hostIdOf(room) }); }
       return;
     }
-
     if (msg.type === "set_ready") {
       if (player) { player.ready = !!msg.ready; broadcast(currentRoom, { type: "lobby_update", players: roomPlayers(currentRoom), hostId: hostIdOf(room) }); }
       return;
     }
-
     if (msg.type === "kick_player") {
       if (ws === room.host) {
         const target = room.players.find((p) => p.id === msg.targetId);
@@ -2655,135 +1922,88 @@ wss.on("connection", (ws, req) => {
           target.ws.close();
           room.players = room.players.filter((p) => p.id !== msg.targetId);
           sendToAll(currentRoom, { type: "player_left", playerId: msg.targetId, players: roomPlayers(currentRoom), hostId: hostIdOf(room) });
-          console.log(`[KICK] ${target.name} kicked from ${currentRoom}`);
         }
       }
       return;
     }
-
     if (msg.type === "start_game") {
       if (ws === room.host) {
         room.gameStarted = true;
-        room.matchLikes = {};       // naya match = naya like state
+        room.matchLikes = {};
         room.matchEliminated = [];
-        console.log(`[START] ${currentRoom} mode=${room.mode} players=${room.players.length}`);
         sendToAll(currentRoom, { type: "game_start", mode: room.mode, players: roomPlayers(currentRoom) });
       }
       return;
     }
-
-    // Match pachi lobby farke: gameStarted clear (late joiner lobby ma nai aaos)
     if (msg.type === "game_ended") {
       if (room) room.gameStarted = false;
       return;
     }
-
     if (msg.type === "player_move") {
       if (player) {
         player.position = msg.position || player.position;
         player.rotation = msg.rotation || player.rotation;
-        broadcast(currentRoom, {
-          type: "player_moved", id: player.id,
-          position: player.position, rotation: player.rotation,
-        }, ws);
+        broadcast(currentRoom, { type: "player_moved", id: player.id, position: player.position, rotation: player.rotation }, ws);
       }
       return;
     }
-
-    // ── BOT MOVE (host drives the bot) ──
     if (msg.type === "bot_move") {
-      if (!room || !player || !room.host || room.host !== ws) return;  // only host
+      if (!room || !player || !room.host || room.host !== ws) return;
       const bot = room.players.find((p) => p.isBot && p.id === (msg.playerId | 0));
       if (!bot) return;
       bot.position = msg.position || bot.position;
       bot.rotation = msg.rotation || bot.rotation;
-      broadcast(currentRoom, {
-        type: "player_moved", id: bot.id,
-        position: bot.position, rotation: bot.rotation,
-      }, null);
+      broadcast(currentRoom, { type: "player_moved", id: bot.id, position: bot.position, rotation: bot.rotation }, null);
       return;
     }
-
-    // ── BOT HIT (host-driven bot attacked someone) ──
     if (msg.type === "bot_hit") {
       if (!room || !player || !room.host || room.host !== ws) return;
       const bot = room.players.find((p) => p.isBot && p.id === (msg.playerId | 0));
       if (!bot) return;
       const target = room.players.find((p) => p.id === (msg.targetPlayerId | 0) && !p.isBot);
       if (!target) return;
-      // Bot ko team chhaina ✓ → bots le always damage garna sakinchha ✓
-      broadcast(currentRoom, {
-        type: "player_hit", targetPlayerId: target.id,
-        fromPlayerId: bot.id, isBot: true, dmg: Number(msg.dmg) || 30,
-      }, null);
+      broadcast(currentRoom, { type: "player_hit", targetPlayerId: target.id, fromPlayerId: bot.id, isBot: true, dmg: Number(msg.dmg) || 30 }, null);
       return;
     }
-
     if (msg.type === "ghost_move") {
-      broadcast(currentRoom, {
-        type: "ghost_moved",
-        position: msg.position,
-        rotation: msg.rotation,
-        state: msg.state,
-      }, ws);
+      broadcast(currentRoom, { type: "ghost_moved", position: msg.position, rotation: msg.rotation, state: msg.state }, ws);
       return;
     }
-
     if (msg.type === "door_sync") {
-      broadcast(currentRoom, {
-        type: "door_update",
-        doorId: msg.doorId,
-        isOpen: msg.isOpen,
-        playerId: player?.id,
-      }, ws);
+      broadcast(currentRoom, { type: "door_update", doorId: msg.doorId, isOpen: msg.isOpen, playerId: player?.id }, ws);
       return;
     }
-
     if (msg.type === "ghost_jumpscare") {
       broadcast(currentRoom, { type: "ghost_jumpscare", targetPlayerId: msg.targetPlayerId | 0 }, ws);
       return;
     }
-
     if (msg.type === "player_hit") {
-      // FRIENDLY FIRE OFF ✓ — same team = damage haina (server-authoritative ✓)
       const targetId = msg.targetPlayerId | 0;
-      if (player && sameTeam(ws.chatProfileId, targetId)) {
-        console.log(`[DMG] blocked friendly fire ${ws.chatProfileId} → ${targetId}`);
-        return;
-      }
+      if (player && sameTeam(ws.chatProfileId, targetId)) return;
       broadcast(currentRoom, { type: "player_hit", targetPlayerId: targetId }, ws);
       return;
     }
-
     if (msg.type === "ritual_pickup") {
       broadcast(currentRoom, { type: "ritual_pickup", itemId: msg.itemId | 0, playerId: player ? player.id : null }, ws);
       return;
     }
-
     if (msg.type === "ritual_place") {
       broadcast(currentRoom, { type: "ritual_place", itemId: msg.itemId | 0, slotIndex: msg.slotIndex | 0, playerId: player ? player.id : null }, ws);
       return;
     }
-
     if (msg.type === "ritual_drop") {
       broadcast(currentRoom, { type: "ritual_drop", itemId: msg.itemId | 0, playerId: player ? player.id : null }, ws);
       return;
     }
-
     if (msg.type === "ritual_win") {
       broadcast(currentRoom, { type: "ritual_win", winnerId: msg.winnerId | 0 }, ws);
       return;
     }
-
-    // ── MUMMY VS HUMAN — generic round/hit/dead/result sync (room relay) ──
     if (msg.type === "mummy_sync") {
       if (!player || !currentRoom) return;
       broadcast(currentRoom, { type: "mummy_sync", from: player.id, data: msg.data || {} }, ws);
       return;
     }
-
-    // ── SPECTATOR LIKE SYSTEM (server-authoritative) ──
-    // 1 spectator → 1 like per player per match. 3 likes = target eliminated.
     if (msg.type === "spectate_like") {
       if (!player) return;
       const targetId = msg.targetId | 0;
@@ -2794,22 +2014,19 @@ wss.on("connection", (ws, req) => {
       if (room.matchEliminated.includes(targetId)) return;
       if (!room.matchLikes[targetId]) room.matchLikes[targetId] = { likedBy: [] };
       const entry = room.matchLikes[targetId];
-      if (entry.likedBy.includes(player.id)) return; // duplicate like — server rejects
+      if (entry.likedBy.includes(player.id)) return;
       entry.likedBy.push(player.id);
       const count = entry.likedBy.length;
       sendToAll(currentRoom, { type: "spectate_like_update", targetId, count, fromId: player.id });
-      console.log(`[LIKE] #${player.id} ${player.name} → #${targetId} (${count}/3) in ${currentRoom}`);
       if (count >= 3) {
         room.matchEliminated.push(targetId);
         sendToAll(currentRoom, { type: "spectate_eliminated", targetId });
-        console.log(`[ELIM] #${targetId} eliminated by 3 likes in ${currentRoom}`);
       }
       return;
     }
   });
 
   ws.on("close", () => {
-    // Team bata hataucha (slot free + ghost hatau) + bachelai batau
     const pid = ws.chatProfileId || "";
     if (pid) {
       for (const team of teams.values()) {
@@ -2821,13 +2038,10 @@ wss.on("connection", (ws, req) => {
           if (team.members.length === 0) teams.delete(team.id);
         }
       }
-      // Local mirror (team owner arko backend ma cha) → peer ma forward
       for (const [tid, set] of localTeams.entries()) {
         if (set.has(pid)) {
           set.delete(pid);
-          for (const peer of (PEERS || [])) {
-            httpPostJson(peer.url, "/mm/team-member-left", { teamId: tid, profileId: pid }, 3000);
-          }
+          for (const peer of (PEERS || [])) httpPostJson(peer.url, "/mm/team-member-left", { teamId: tid, profileId: pid }, 3000);
         }
       }
     }
@@ -2835,29 +2049,22 @@ wss.on("connection", (ws, req) => {
     for (const q of matchQueue) {
       if (q.ws === ws && q.botFillTimer) { clearTimeout(q.botFillTimer); q.botFillTimer = null; }
     }
-    matchQueue = matchQueue.filter((q) => q.ws !== ws); // queue bata turunti hata
-    // Bot fill timer cancel (leak + ghost bot rok)
+    matchQueue = matchQueue.filter((q) => q.ws !== ws);
     if (currentRoom) cancelBotFill(currentRoom);
     if (!currentRoom || !rooms[currentRoom]) return;
     const room = rooms[currentRoom];
     room.players = room.players.filter((p) => p.ws !== ws);
-    // Connected player na bache bhaye (migrate huda reserved slot matra cha) → room delete
     const connected = room.players.filter((p) => p.ws);
-    if (connected.length === 0) { delete rooms[currentRoom]; console.log(`[DELETE] Room ${currentRoom}`); return; }
+    if (connected.length === 0) { delete rooms[currentRoom]; return; }
     if (room.host === ws) {
-      // New host = first CONNECTED player (reserved slot null huna sakincha)
       const next = connected[0];
       room.host = next.ws;
       room.hostName = next.name;
-      console.log(`[HOST] ${room.hostName} → new host of ${currentRoom}`);
     }
     broadcast(currentRoom, { type: "player_left", playerId: null, players: roomPlayers(currentRoom), hostId: hostIdOf(room) });
   });
 });
 
-// ── QUEUE PUMP (2s) ───────────────────────────────────────
-// Party-wise matching retry — sabai queue huna sammaha try ✓
-// (mode + teamSize EXACT ✓, group ek party ✓)
 setInterval(() => {
   for (const q of matchQueue.slice()) {
     if (!q || q.claimedBy) continue;
@@ -2866,21 +2073,16 @@ setInterval(() => {
 }, 2000);
 
 setInterval(() => {
-  // Stale presence (client gayo) nikal
   const nowP = Date.now();
   for (const [pid, p] of presence) {
     if (nowP - p.ts >= PRESENCE_TTL) presence.delete(pid);
   }
-  // Queue bata expired/dead entries nikal (180s timeout client-side le pani cancel garchha)
   matchQueue = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && Date.now() - q.queuedAt < 180000);
   Object.keys(rooms).forEach((code) => {
-    // Reserved slot (ws null) lai gayab na gara — migrate huda pugcha.
-    const alive = rooms[code].players.filter((p) => p.ws && p.ws.readyState === 1);
     const connected = rooms[code].players.filter((p) => p.ws);
     if (connected.length === 0) delete rooms[code];
     else rooms[code].players = rooms[code].players.filter((p) => !p.ws || p.ws.readyState === 1);
   });
-  // Expired cross-server claims hatau (migrate nai bhayo)
   const nowC = Date.now();
   for (const [code, c] of pendingClaims) {
     if (nowC - c.at > CLAIM_TTL_MS) {
@@ -2888,20 +2090,16 @@ setInterval(() => {
       if (rooms[code]) delete rooms[code];
     }
   }
-  // Stuck claims clear (claimer crash bhayo bhane player block na hos)
   for (const q of matchQueue) {
     if (q.claimedBy && nowC - (q.claimedAt || 0) > 20000) {
       q.claimedBy = "";
       q.claimedAt = 0;
     }
   }
-  // Expired team invites hatau (slot free + ghost reservation nai rakhne)
   for (const team of teams.values()) {
     if (teamPruneExpired(team)) teamNotifyAll(team);
   }
-  // Group fill (late joiner → open squad slot ✓)
   pumpQueueGroups();
-  // ── RENDER LOGS: periodic real player count ──
   const live = livePlayerCount();
   if (live >= lastLoggedCount + 100) {
     lastLoggedCount = Math.floor(live / 100) * 100;
@@ -2910,39 +2108,29 @@ setInterval(() => {
   logPlayerCount("tick");
 }, 30000);
 
-// ── PEER STATS POLL (real online count) ─────────────────
-// Dusro backend ko REAL player count kina chahincha → panel ma dekhaune.
-// Aafno backend ma kunai player cha bhane matra poll (free tier ma sleeping
-// instance na jaag-chau).
 setInterval(async () => {
   if (PEERS.length === 0) return;
-  if (livePlayerCount() === 0) return;   // kunai chaina → poll nai garne
+  if (livePlayerCount() === 0) return;
   await Promise.all(PEERS.map(async (peer) => {
     const st = await httpPostJson(peer.url, "/mm/status", { mode: "", teamSize: 0, groupId: "" }, 3000);
     if (st && st.ok) cachePeerLive(peer.id, st.players);
   }));
 }, 20000);
 
-// ── MATCHMAKING RETRY TICK ──────────────────────────────
-// Waiting player lai periodic feri peer scan — stale scan le deadlock na hos.
-// 2.5s interval, ekchoti 3 peer (round-robin) — Render cold-start bachat.
 setInterval(() => {
   if (PEERS.length === 0) return;
   if (isServerFull()) return;
-  // Local ma already pair bhayo bhane peer scan garna pardaina
   for (const entry of matchQueue.slice()) {
-    if (entry.ws) { if (entry.ws.readyState !== 1) continue; } else if (!entry.isBot) { continue; }
+    if (entry.ws) { if (entry.ws.readyState !== 1) continue; } else if (!entry.isBot) continue;
     if (entry.claimedBy) continue;
-    const localCount = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && q.mode === entry.mode
-      && q.teamSize === entry.teamSize && q.serverId === entry.serverId
-      && (q.groupId || "") === (entry.groupId || "") && !q.claimedBy).length;
+    const localCount = matchQueue.filter((q) => (q.ws ? q.ws.readyState === 1 : !!q.isBot) && q.mode === entry.mode && q.teamSize === entry.teamSize && q.serverId === entry.serverId && (q.groupId || "") === (entry.groupId || "") && !q.claimedBy).length;
     if (localCount >= 2 * entry.teamSize) continue;
-    if (entry.teamSize !== 1) continue;   // group = local match matra
+    if (entry.teamSize !== 1) continue;
     tryPeerPair(entry);
   }
 }, 2500);
 
 server.listen(PORT, () => {
   console.log(`Night Ward Server v4.5 on port ${PORT} (${SELF_ID})`);
-console.log(`[BOT] AI bot system ON — fill delay ${BOT_FILL_DELAY_MS}ms, max ${BOT_MAX_PER_ROOM}/match (env: BOT_FILL_DELAY_MS, BOT_MAX_PER_ROOM)`);
+  console.log(`[BOT] AI bot system ON — fill delay ${BOT_FILL_DELAY_MS}ms, max ${BOT_MAX_PER_ROOM}/match`);
 });
