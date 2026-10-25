@@ -1,7 +1,8 @@
 const http = require("http");
 const { WebSocketServer } = require("ws");
 
-const PORT = process.env.PORT || 7777;
+// Render uses PORT 10000 by default, but we allow override
+const PORT = process.env.PORT || 10000;
 
 // ── OAuth relay store (Google/Facebook login — no localhost) ──
 const pendingAuth = new Map();
@@ -81,7 +82,7 @@ const POOL_OF = {
   "OCEANIA": "GLOBAL", "NORTH AMERICA": "GLOBAL", "SOUTH AMERICA": "GLOBAL", "MIDDLE EAST": "GLOBAL",
 };
 
-let SELF_ID = (process.env.SERVER_ID || "").trim();
+let SELF_ID = (process.env.SERVER_ID || DEFAULT_SERVER_ID).trim();
 let SELF_URL = (process.env.PUBLIC_URL || "").trim();
 let PEERS = [];
 let ENV_PEERS = [];
@@ -181,7 +182,7 @@ const server = http.createServer((req, res) => {
         const state = String(data.state || "");
         const at = String(data.access_token || "");
         
-        // FIXED: Allow hyphens and underscores to support UUIDs and URL-safe OAuth states
+        // FIXED: Adjusted regex to support hyphens and underscores commonly found in UUIDs/OAuth states
         if (/^[a-zA-Z0-9\-_]{16,128}$/.test(state) && at.length > 20 && at.length < 16384) {
           pendingAuth.set(state, { at, rt: String(data.refresh_token || ""), ts: Date.now() });
           console.log("[AUTH] tokens stored for state", state.slice(0, 8));
@@ -361,7 +362,7 @@ const server = http.createServer((req, res) => {
       const nm = String(data.name || "Player");
       const slotIdx = Number(data.slotIndex);
       const result = teamApplyAccept(team, pid, nm, slotIdx);
-      res.writeHead(200, { "Content-Type": "application/json" });
+      res.writeHead(200, { "Content, type": "application/json" });
       res.end(JSON.stringify(Object.assign({ ok: true, delivered: true }, result)));
     });
     return;
