@@ -1,41 +1,62 @@
 const http = require("http");
 const { WebSocketServer } = require("ws");
 
-// Render uses PORT 10000 by default, but we allow override
+// Render uses PORT 10000 by default
 const PORT = process.env.PORT || 10000;
 
-// ── OAuth relay store (Google/Facebook login — no localhost) ──
+// ── OAuth relay store ──
 const pendingAuth = new Map();
-const AUTH_TTL_MS = 5 * 60 * 1000;
+const AUTH_TTL_MS = 10 * 60 * 1000; // Increased to 10 mins for testing
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of pendingAuth) if (now - v.ts > AUTH_TTL_MS) pendingAuth.delete(k);
 }, 60000);
 
-const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>FLAME STRIKE</title>
-<style>body{background:#0b070c;color:#e7d8c4;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.c{text-align:center;padding:40px}h1{color:#ff7a1a;font-size:30px;letter-spacing:4px;margin:0 0 16px}p{color:#8a7a72;font-size:15px}#st{color:#c43b4a;margin-top:16px}</style></head>
+// UPDATED: Added a Manual Button in case the auto-script is blocked by the browser
+const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>FLAME STRIKE AUTH</title>
+<style>body{background:#0b070c;color:#e7d8c4;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.c{text-align:center;padding:40px}h1{color:#ff7a1a;font-size:30px;letter-spacing:4px;margin:0 0 16px}p{color:#8a7a72;font-size:15px}#st{color:#c43b4a;margin-top:16px}button{background:#ff7a1a;border:none;color:white;padding:10px 20px;font-size:16px;cursor:pointer;margin-top:20px;border-radius:5px;display:none}</style></head>
 <body><div class="c"><h1>&#10003; FLAME STRIKE</h1><p id="st">Completing login...</p>
+<button id="btn" onclick="sendTokens()">Manual Send Tokens</button>
 <script>
 (function() {
   var st = document.getElementById('st');
+  var btn = document.getElementById('btn');
   var state = new URLSearchParams(location.search).get('state') || '';
   var hash = location.hash.substring(1);
-  if (!hash) { st.textContent = 'No auth data. Please try again.'; return; }
+  if (!hash) { st.textContent = 'No auth data found in URL. Please try again.'; btn.style.display='none'; return; }
   var p = new URLSearchParams(hash);
   var at = p.get('access_token') || '';
   var rt = p.get('refresh_token') || '';
-  if (!at) { st.textContent = 'No access token. Please try again.'; return; }
+  if (!at) { st.textContent = 'No access token found. Please try again.'; btn.style.display='none'; return; }
+
+  window.sendTokens = function() {
+    st.textContent = 'Sending tokens...';
+    fetch('/auth/receive', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({state: state, access_token: at, refresh_token: rt})
+    }).then(function(res) {
+      if(res.ok) {
+        st.textContent = 'SUCCESS! Return to FLAME STRIKE.';
+        try { window.location.href = 'nightward://login'; } catch (e) {}
+      } else {
+        st.textContent = 'Server rejected tokens. Check logs.';
+      }
+    }).catch(function(e) {
+      st.textContent = 'Network Error: ' + e;
+    });
+  };
+
   st.textContent = 'Logging you in...';
-  fetch('/auth/receive', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({state: state, access_token: at, refresh_token: rt})
-  }).then(function() {
-    st.textContent = 'Login successful! Return to FLAME STRIKE.';
-    try { window.location.href = 'nightward://login'; } catch (e) {}
-  }).catch(function(e) {
-    st.textContent = 'Error sending tokens: ' + e;
-  });
+  sendTokens();
+
+  // If it takes more than 5 seconds, show the manual button
+  setTimeout(function() {
+    if (st.textContent === 'Logging you in...') {
+      st.textContent = 'Automatic login is taking too long...';
+      btn.style.display = 'inline-block';
+    }
+  }, 5000);
 })();
 </script></div></body></html>`;
 
@@ -118,9 +139,6 @@ if (process.env.SERVER_ID) {
 }
 rebuildPeers();
 
-const pendingClaims = new Map();
-const CLAIM_TTL_MS = 60000;
-
 function httpPostJson(url, path, bodyObj, timeoutMs) {
   return new Promise((resolve) => {
     let target;
@@ -184,7 +202,7 @@ const server = http.createServer((req, res) => {
         
         console.log(`[AUTH-RECEIVE] Attempting to store tokens. State: ${state.slice(0, 10)}... Token length: ${at.length}`);
 
-        if (state.length > 5 && at.length > 20) {
+        if (state.length > 2 && at.length > 10) {
           pendingAuth.set(state, { at, rt: String(data.refresh_token || ""), ts: Date.now() });
           console.log(`[AUTH-SUCCESS] Tokens stored for state: ${state.slice(0, 10)}...`);
           res.writeHead(200, { "Content-Type": "application/json" });
