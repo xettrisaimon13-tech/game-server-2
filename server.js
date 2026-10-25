@@ -1,12 +1,13 @@
 const http = require("http");
 const { WebSocketServer } = require("ws");
 
-// Render uses PORT 10000 by default
 const PORT = process.env.PORT || 10000;
 
 // ── OAuth relay store ──
 const pendingAuth = new Map();
-const AUTH_TTL_MS = 20 * 60 * 1000; // 20 mins
+const pollingQueue = []; // Track who is polling in order
+
+const AUTH_TTL_MS = 20 * 60 * 1000;
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of pendingAuth) if (now - v.ts > AUTH_TTL_MS) pendingAuth.delete(k);
@@ -20,11 +21,11 @@ const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><ti
 (function() {
   var st = document.getElementById('st');
   var btn = document.getElementById('btn');
-  var state = new URLSearchParams(location.search).get('state') || 'fallback_state_' + Math.random();
+  var state = new URLSearchParams(location.search).get('state') || 'fallback_state';
   var hash = location.hash.substring(1);
   if (!hash) { st.textContent = 'No auth data found in URL.'; btn.style.display='inline-block'; return; }
   var p = new URLSearchParams(hash);
-  var at = p.get('access_token') || 'no_token';
+  var at = p.get('access_token') || 'none';
   var rt = p.get('refresh_token') || '';
 
   window.sendTokens = function() {
@@ -38,7 +39,7 @@ const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><ti
         st.textContent = 'SUCCESS! Return to FLAME STRIKE.';
         try { window.location.href = 'nightward://login'; } catch (e) {}
       } else {
-        st.textContent = 'Server rejected tokens. Check logs.';
+        st.textContent = 'Server rejected tokens.';
       }
     }).catch(function(e) {
       st.textContent = 'Network Error: ' + e;
@@ -158,15 +159,21 @@ const server = http.createServer((req, res) => {
         const data = JSON.parse(body);
         const state = String(data.state || "unknown");
         const at = String(data.access_token || "none");
-        console.log(`[AUTH-RECEIVE] Store attempt. State: ${state}, Token: ${at.slice(0,5)}...`);
         
-        // REMOVED ALL VALIDATION: Accept anything as long as it exists
+        console.log(`[AUTH-RECEIVE] Received Tokens. State: ${state}`);
+
+        // UNIFIED FIX: Store tokens under the requested state AND the first person in the polling queue
         pendingAuth.set(state, { at, rt: String(data.refresh_token || ""), ts: Date.now() });
-        console.log(`[AUTH-SUCCESS] Tokens stored for state: ${state}`);
+        
+        if (pollingQueue.length > 0) {
+          const firstPollingState = pollingQueue[0];
+          pendingAuth.set(firstPollingState, { at, rt: String(data.refresh_token || ""), ts: Date.now() });
+          console.log(`[AUTH-UNIFIED] Also linked to first polling state: ${firstPollingState}`);
+        }
+
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ ok: true }));
       } catch (e) {
-        console.log(`[AUTH-ERROR] ${e.message}`);
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "invalid json" }));
       }
@@ -176,11 +183,22 @@ const server = http.createServer((req, res) => {
 
   if (path === "/auth/poll") {
     const state = gParams.get("state") || "";
-    console.log(`[AUTH-POLL] State: ${state}`);
+    
+    // Add to polling queue if not already there
+    if (!pollingQueue.includes(state)) {
+      pollingQueue.push(state);
+      if (pollingQueue.length > 10) pollingQueue.shift(); // keep it small
+    }
+
+    console.log(`[AUTH-POLL] Polling state: ${state}`);
     const entry = pendingAuth.get(state);
     if (entry) {
-      console.log(`[AUTH-POLL-HIT] ${state}`);
+      console.log(`[AUTH-POLL-HIT] Found tokens for ${state}`);
       pendingAuth.delete(state);
+      // Clean up polling queue
+      const idx = pollingQueue.indexOf(state);
+      if (idx > -1) pollingQueue.splice(idx, 1);
+      
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ access_token: entry.at, refresh_token: entry.rt }));
     } else {
