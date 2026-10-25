@@ -1384,7 +1384,7 @@ function poolCapacity() {
 
 function logPlayerCount(reason) {
   const live = livePlayerCount();
-  console.log(\`[POOL] \${SELF_ID} live=\${live} pool=\${poolLiveCount()}/\${poolCapacity()} (\${reason})\`);
+  console.log(`[POOL] ${SELF_ID} live=${live} pool=${poolLiveCount()}/${poolCapacity()} (${reason})`);
   return live;
 }
 
