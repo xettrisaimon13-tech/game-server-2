@@ -1,206 +1,276 @@
-const http = require("http");
-const { WebSocketServer } = require("ws");
+const express = require('express');
+const http = require('http');
+const { WebSocketServer, WebSocket } = require('ws');
+const cors = require('cors');
 
-const PORT = process.env.PORT || 10000;
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-// ── OAuth Relay Store (Zero-State) ──
-let currentGlobalLogin = null; 
-const AUTH_TTL_MS = 20 * 60 * 1000;
-setInterval(() => {
-  if (currentGlobalLogin && (Date.now() - currentGlobalLogin.ts > AUTH_TTL_MS)) {
-    currentGlobalLogin = null;
-  }
-}, 60000);
+const PORT = process.env.PORT || 3000;
 
-const AUTH_CALLBACK_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>FLAME STRIKE AUTH</title>
-<style>body{background:#0b070c;color:#e7d8c4;font-family:system-ui,sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.c{text-align:center;padding:40px}h1{color:#ff7a1a;font-size:30px;letter-spacing:4px;margin:0 0 16px}p{color:#8a7a72;font-size:15px}#st{color:#c43b4a;margin-top:16px}button{background:#ff7a1a;border:none;color:white;padding:10px 20px;font-size:16px;cursor:pointer;margin-top:20px;border-radius:5px;display:none}</style></head>
-<body><div class="c"><h1>&#10003; FLAME STRIKE</h1><p id="st">Completing login...</p>
-<button id="btn" onclick="sendTokens()">Manual Send Tokens</button>
-<script>
-(function() {
-  var st = document.getElementById('st');
-  var btn = document.getElementById('btn');
-  var hash = location.hash.substring(1);
-  if (!hash) { st.textContent = 'No auth data found.'; btn.style.display='inline-block'; return; }
-  var p = new URLSearchParams(hash);
-  var at = p.get('access_token') || '';
-  var rt = p.get('refresh_token') || '';
-  window.sendTokens = function() {
-    st.textContent = 'Sending tokens...';
-    fetch('/auth/receive', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ access_token: at, refresh_token: rt })
-    }).then(function(res) {
-      if(res.ok) {
-        st.textContent = 'SUCCESS! Return to FLAME STRIKE.';
-        try { window.location.href = 'nightward://login'; } catch (e) {}
-      } else { st.textContent = 'Server rejected tokens.'; }
-    }).catch(function(e) { st.textContent = 'Network Error: ' + e; });
-  };
-  st.textContent = 'Logging you in...';
-  sendTokens();
-  setTimeout(function() {
-    if (st.textContent === 'Logging you in...') {
-      st.textContent = 'Automatic login is taking too long...';
-      btn.style.display = 'inline-block';
-    }
-  }, 5000);
-})();
-</script></div></body></html>`;
+// ==========================================
+// 1. OAUTH TOKEN MEMORY STORE
+// ==========================================
+const oauthTokens = new Map();
 
-const server = http.createServer((req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
-
-  const qIdx = req.url.indexOf("?");
-  const path = qIdx === -1 ? req.url : req.url.slice(0, qIdx);
-
-  if (path === "/auth/callback") {
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(AUTH_CALLBACK_HTML);
-    return;
-  }
-
-  if (path === "/auth/receive" && req.method === "POST") {
-    let body = "";
-    req.on("data", (chunk) => { body += chunk.toString(); });
-    req.on("end", () => {
-      try {
-        const data = JSON.parse(body);
-        currentGlobalLogin = { at: String(data.access_token), rt: String(data.refresh_token || ""), ts: Date.now() };
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (e) { res.writeHead(400).end(); }
+// Health check endpoint
+app.get('/', (req, res) => {
+    res.json({
+        status: "online",
+        service: "Flame Strike Game Server",
+        timestamp: new Date().toISOString()
     });
-    return;
-  }
-
-  if (path === "/auth/poll") {
-    if (currentGlobalLogin) {
-      const token = currentGlobalLogin;
-      currentGlobalLogin = null; 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ access_token: token.at, refresh_token: token.rt }));
-    } else {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ pending: true }));
-    }
-    return;
-  }
-
-  if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok" }));
-    return;
-  }
-
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("Flame Strike Lobby Server Live");
 });
 
+// OAuth Callback from Supabase / Google
+app.get('/auth/callback', (req, res) => {
+    res.send(`
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Logging in...</title>
+    <style>
+        body { background: #0b0f19; color: #38bdf8; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        .box { text-align: center; background: #131d31; padding: 30px; border-radius: 12px; border: 1px solid #1e293b; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>Flame Strike Authentication</h2>
+        <p>Logging in, please return to your game...</p>
+    </div>
+    <script>
+        const hash = window.location.hash.substring(1);
+        const params = new URLSearchParams(hash || window.location.search);
+        const accessToken = params.get('access_token');
+        const refreshToken = params.get('refresh_token');
+        const state = params.get('state');
+
+        if (state && accessToken) {
+            fetch('/auth/save-token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ state, access_token: accessToken, refresh_token: refreshToken })
+            }).then(() => {
+                document.querySelector('p').innerText = "Logged in successfully! You can switch back to the game.";
+                setTimeout(() => window.close(), 1500);
+            });
+        }
+    </script>
+</body>
+</html>
+    `);
+});
+
+// Internal endpoint to store extracted token
+app.post('/auth/save-token', (req, res) => {
+    const { state, access_token, refresh_token } = req.body;
+    if (state && access_token) {
+        oauthTokens.set(state, {
+            access_token,
+            refresh_token,
+            created_at: Date.now()
+        });
+        setTimeout(() => oauthTokens.delete(state), 5 * 60 * 1000);
+        return res.json({ success: true });
+    }
+    res.status(400).json({ error: "Missing state or token" });
+});
+
+// Godot polls this endpoint during login
+app.get('/auth/poll', (req, res) => {
+    const state = req.query.state;
+    if (!state) {
+        return res.status(400).json({ error: "Missing state query param" });
+    }
+
+    if (oauthTokens.has(state)) {
+        const tokenData = oauthTokens.get(state);
+        oauthTokens.delete(state);
+        return res.json({
+            access_token: tokenData.access_token,
+            refresh_token: tokenData.refresh_token,
+            pending: false
+        });
+    }
+
+    res.json({ pending: true });
+});
+
+// ==========================================
+// 2. WEBSOCKET REAL-TIME 2-PLAYER MATCHMAKING
+// ==========================================
+const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
-const rooms = {}; // { roomCode: { players: [], mode: "" } }
-const allClients = new Set();
 
-function genCode() {
-  const c = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let code = "";
-  for (let i = 0; i < 4; i++) code += c[Math.floor(Math.random() * c.length)];
-  return rooms[code] ? genCode() : code;
-}
+// Mode queues: array of { ws, teamSize }
+const queues = {
+    "MUMMY_VS_HUMAN": [],
+    "ZOMBIE_ECLIPSE": []
+};
 
-function broadcast(code, data) {
-  if (!rooms[code]) return;
-  const msg = JSON.stringify(data);
-  rooms[code].players.forEach((p) => {
-    if (p.ws && p.ws.readyState === 1) p.ws.send(msg);
-  });
-}
+// Active match rooms: matchId -> { players: [ws1, ws2], mode }
+const matches = new Map();
+let matchCounter = 1000;
 
-wss.on("connection", (ws) => {
-  ws.chatProfileId = "";
-  ws.chatName = "";
-  ws.currentRoom = null;
-  allClients.add(ws);
-
-  ws.on("message", (msg) => {
-    try {
-      const data = JSON.parse(msg);
-      const { type } = data;
-
-      if (type === "auth") {
-        ws.chatProfileId = String(data.profileId);
-        ws.chatName = String(data.name || "Player");
-        send(ws, { type: "auth_ok", profileId: ws.chatProfileId });
-      } 
-      
-      else if (type === "join_lobby") {
-        // 1. Find an existing room with space (max 4 players)
-        let roomCode = null;
-        for (const [code, room] of Object.entries(rooms)) {
-          if (room.mode === data.mode && room.players.length < 4) {
-            roomCode = code;
-            break;
-          }
+function removeFromAllQueues(ws) {
+    for (const mode of Object.keys(queues)) {
+        const idx = queues[mode].findIndex(p => p.ws === ws);
+        if (idx !== -1) {
+            queues[mode].splice(idx, 1);
+            console.log(`[QUEUE] Player removed from ${mode}. Queue size: ${queues[mode].length}`);
         }
-        
-        // 2. If no room found, create new one
-        if (!roomCode) {
-          roomCode = genCode();
-          rooms[roomCode] = { players: [], mode: data.mode };
-        }
-
-        ws.currentRoom = roomCode;
-        const playerObj = { ws, id: rooms[roomCode].players.length + 1, name: ws.chatName, profileId: ws.chatProfileId };
-        rooms[roomCode].players.push(playerObj);
-
-        // Notify the player they joined
-        send(ws, { type: "lobby_joined", roomCode: roomCode, mode: data.mode });
-        
-        // Notify everyone in the lobby that a new player joined
-        broadcast(roomCode, { type: "player_joined", player: playerObj, total: rooms[roomCode].players.length });
-      }
-
-      else if (type === "start_game") {
-        const roomCode = ws.currentRoom;
-        if (!roomCode || !rooms[roomCode]) return;
-        
-        // Only the first player (Host) can start the game
-        const room = rooms[roomCode];
-        if (room.players[0].ws === ws) {
-          console.log(`Room ${roomCode} starting game...`);
-          
-          // Determine scene based on mode
-          const scene = room.mode === "MUMMY_VS_HUMAN" ? "res://mumuy_vs_human.tscn" : "res://main_scene.tscn";
-          
-          broadcast(roomCode, { type: "game_start", scene: scene });
-          
-          // Delete room after starting
-          delete rooms[roomCode];
-          room.players.forEach(p => { p.ws.currentRoom = null; });
-        }
-      }
-    } catch {}
-  });
-
-  ws.on("close", () => {
-    if (ws.currentRoom) {
-      const room = rooms[ws.currentRoom];
-      if (room) {
-        room.players = room.players.filter(p => p.ws !== ws);
-        broadcast(ws.currentRoom, { type: "player_left", total: room.players.length });
-        if (room.players.length === 0) delete rooms[ws.currentRoom];
-      }
     }
-    allClients.delete(ws);
-  });
+}
+
+wss.on('connection', (ws) => {
+    console.log('[WS] New player connected');
+    ws.isAlive = true;
+
+    // Ping-pong heartbeat to prevent Render idle disconnects
+    ws.on('pong', () => {
+        ws.isAlive = true;
+    });
+
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message.toString());
+            handleClientMessage(ws, data);
+        } catch (err) {
+            console.error('[WS ERROR] Failed to parse message:', err);
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('[WS] Player disconnected');
+        removeFromAllQueues(ws);
+
+        // Notify opponent if player disconnects during match
+        if (ws.matchId && matches.has(ws.matchId)) {
+            const match = matches.get(ws.matchId);
+            for (const otherWs of match.players) {
+                if (otherWs !== ws && otherWs.readyState === WebSocket.OPEN) {
+                    otherWs.send(JSON.stringify({ type: "player_disconnected" }));
+                }
+            }
+            matches.delete(ws.matchId);
+        }
+    });
 });
 
-function send(ws, data) { if (ws.readyState === 1) ws.send(JSON.stringify(data)); }
+function handleClientMessage(ws, data) {
+    const type = data.type;
 
+    switch (type) {
+        case 'quick_match': {
+            const mode = data.mode || "MUMMY_VS_HUMAN";
+            const teamSize = data.team_size || 1;
+
+            if (!queues[mode]) {
+                queues[mode] = [];
+            }
+
+            // Remove if already queued
+            removeFromAllQueues(ws);
+
+            // Add player to queue
+            queues[mode].push({ ws, teamSize });
+            console.log(`[QUEUE] Player joined ${mode} queue. Current waiting: ${queues[mode].length}`);
+
+            // ⚠️ 2 PLAYERS COMPLETE BHAYE PACHI MATRA MATCH START GARNE!
+            if (queues[mode].length >= 2) {
+                const player1 = queues[mode].shift();
+                const player2 = queues[mode].shift();
+
+                const matchId = `match_${matchCounter++}`;
+                player1.ws.matchId = matchId;
+                player2.ws.matchId = matchId;
+
+                matches.set(matchId, {
+                    players: [player1.ws, player2.ws],
+                    mode: mode
+                });
+
+                console.log(`[MATCH FOUND] Paired 2 players for ${mode} in ${matchId}!`);
+
+                // Send match_found to Player 1 -> Spawn 0 (Spawn 1 in Godot)
+                if (player1.ws.readyState === WebSocket.OPEN) {
+                    player1.ws.send(JSON.stringify({
+                        type: "match_found",
+                        mode: mode,
+                        spawn_index: 0,
+                        match_id: matchId,
+                        total_players: 2
+                    }));
+                }
+
+                // Send match_found to Player 2 -> Spawn 1 (Spawn 2 in Godot)
+                if (player2.ws.readyState === WebSocket.OPEN) {
+                    player2.ws.send(JSON.stringify({
+                        type: "match_found",
+                        mode: mode,
+                        spawn_index: 1,
+                        match_id: matchId,
+                        total_players: 2
+                    }));
+                }
+            } else {
+                // Only 1 player in queue -> tell them waiting for opponent
+                ws.send(JSON.stringify({
+                    type: "player_joined",
+                    player_count: 1,
+                    required_players: 2
+                }));
+            }
+            break;
+        }
+
+        case 'quick_match_cancel': {
+            removeFromAllQueues(ws);
+            ws.send(JSON.stringify({ type: "match_cancelled" }));
+            break;
+        }
+
+        // Real-time In-game Action & Position Relay
+        case 'player_move':
+        case 'player_action':
+        case 'player_anim': {
+            if (ws.matchId && matches.has(ws.matchId)) {
+                const match = matches.get(ws.matchId);
+                for (const otherWs of match.players) {
+                    if (otherWs !== ws && otherWs.readyState === WebSocket.OPEN) {
+                        otherWs.send(JSON.stringify(data));
+                    }
+                }
+            }
+            break;
+        }
+
+        default:
+            console.log('[WS] Unknown message type:', type);
+    }
+}
+
+// Keep-alive ping interval every 25s (prevents Render idle sleep on free instances)
+const interval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (!ws.isAlive) {
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 25000);
+
+wss.on('close', () => {
+    clearInterval(interval);
+});
+
+// Start listening
 server.listen(PORT, () => {
-  console.log(`Flame Strike Lobby Server Live on port ${PORT}`);
+    console.log(`===========================================`);
+    console.log(`🔥 Flame Strike Server listening on port ${PORT}`);
+    console.log(`WebSocket: ws://localhost:${PORT}`);
+    console.log(`===========================================`);
 });
