@@ -86,13 +86,11 @@ app.post('/auth/save-token', (req, res) => {
             refresh_token,
             created_at: Date.now()
         });
-        // Also store under global_fallback for Zero-State bridge
         oauthTokens.set('global_fallback', {
             access_token,
             refresh_token,
             created_at: Date.now()
         });
-        // Auto cleanup after 5 minutes
         setTimeout(() => {
             oauthTokens.delete(finalState);
             oauthTokens.delete('global_fallback');
@@ -110,7 +108,6 @@ app.get('/auth/poll', (req, res) => {
         return res.status(400).json({ error: "Missing state query param" });
     }
 
-    // Try exact state match first
     if (oauthTokens.has(state)) {
         const tokenData = oauthTokens.get(state);
         oauthTokens.delete(state);
@@ -121,7 +118,6 @@ app.get('/auth/poll', (req, res) => {
         });
     }
 
-    // Zero-State fallback: if global_fallback exists, use it
     if (oauthTokens.has('global_fallback')) {
         const tokenData = oauthTokens.get('global_fallback');
         oauthTokens.delete('global_fallback');
