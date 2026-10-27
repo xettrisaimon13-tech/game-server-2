@@ -39,23 +39,34 @@ app.get('/auth/callback', (req, res) => {
     <div class="box">
         <h2>Flame Strike Authentication</h2>
         <p>Logging in, please return to your game...</p>
+        <p id="debug" style="font-size: 12px; color: #666;"></p>
     </div>
     <script>
         const hash = window.location.hash.substring(1);
-        const params = new URLSearchParams(hash || window.location.search);
+        const search = window.location.search.substring(1);
+        const params = new URLSearchParams(hash || search);
+        
         const accessToken = params.get('access_token');
         const refreshToken = params.get('refresh_token');
         const state = params.get('state');
-
-        if (state && accessToken) {
+        
+        document.getElementById('debug').innerText = 'State: ' + (state || 'none') + ' | Token: ' + (accessToken ? 'found' : 'missing');
+        
+        if (accessToken) {
+            const finalState = state || 'global_fallback';
+            
             fetch('/auth/save-token', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ state, access_token: accessToken, refresh_token: refreshToken })
+                body: JSON.stringify({ state: finalState, access_token: accessToken, refresh_token: refreshToken })
             }).then(() => {
                 document.querySelector('p').innerText = "Logged in successfully! You can switch back to the game.";
                 setTimeout(() => window.close(), 1500);
+            }).catch(err => {
+                document.querySelector('p').innerText = "Error: " + err.message;
             });
+        } else {
+            document.querySelector('p').innerText = "No token found. Please try again.";
         }
     </script>
 </body>
@@ -66,16 +77,30 @@ app.get('/auth/callback', (req, res) => {
 // Internal endpoint to store extracted token
 app.post('/auth/save-token', (req, res) => {
     const { state, access_token, refresh_token } = req.body;
-    if (state && access_token) {
-        oauthTokens.set(state, {
+    console.log('[AUTH] Save-token called. State:', state, 'Token present:', !!access_token);
+    
+    if (access_token) {
+        const finalState = state || 'global_fallback';
+        oauthTokens.set(finalState, {
             access_token,
             refresh_token,
             created_at: Date.now()
         });
-        setTimeout(() => oauthTokens.delete(state), 5 * 60 * 1000);
+        // Also store under global_fallback for Zero-State bridge
+        oauthTokens.set('global_fallback', {
+            access_token,
+            refresh_token,
+            created_at: Date.now()
+        });
+        // Auto cleanup after 5 minutes
+        setTimeout(() => {
+            oauthTokens.delete(finalState);
+            oauthTokens.delete('global_fallback');
+        }, 5 * 60 * 1000);
+        console.log('[AUTH] Token saved successfully for state:', finalState);
         return res.json({ success: true });
     }
-    res.status(400).json({ error: "Missing state or token" });
+    res.status(400).json({ error: "Missing token" });
 });
 
 // Godot polls this endpoint during login
@@ -85,9 +110,21 @@ app.get('/auth/poll', (req, res) => {
         return res.status(400).json({ error: "Missing state query param" });
     }
 
+    // Try exact state match first
     if (oauthTokens.has(state)) {
         const tokenData = oauthTokens.get(state);
         oauthTokens.delete(state);
+        return res.json({
+            access_token: tokenData.access_token,
+            refresh_token: tokenData.refresh_token,
+            pending: false
+        });
+    }
+
+    // Zero-State fallback: if global_fallback exists, use it
+    if (oauthTokens.has('global_fallback')) {
+        const tokenData = oauthTokens.get('global_fallback');
+        oauthTokens.delete('global_fallback');
         return res.json({
             access_token: tokenData.access_token,
             refresh_token: tokenData.refresh_token,
@@ -99,18 +136,16 @@ app.get('/auth/poll', (req, res) => {
 });
 
 // ==========================================
-// 2. WEBSOCKET REAL-TIME 2-PLAYER MATCHMAKING
+// 2. WEBSOCKET REAL-TIME MATCHMAKING
 // ==========================================
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Mode queues: array of { ws, teamSize }
 const queues = {
     "MUMMY_VS_HUMAN": [],
     "ZOMBIE_ECLIPSE": []
 };
 
-// Active match rooms: matchId -> { players: [ws1, ws2], mode }
 const matches = new Map();
 let matchCounter = 1000;
 
@@ -128,7 +163,6 @@ wss.on('connection', (ws) => {
     console.log('[WS] New player connected');
     ws.isAlive = true;
 
-    // Ping-pong heartbeat to prevent Render idle disconnects
     ws.on('pong', () => {
         ws.isAlive = true;
     });
@@ -146,7 +180,6 @@ wss.on('connection', (ws) => {
         console.log('[WS] Player disconnected');
         removeFromAllQueues(ws);
 
-        // Notify opponent if player disconnects during match
         if (ws.matchId && matches.has(ws.matchId)) {
             const match = matches.get(ws.matchId);
             for (const otherWs of match.players) {
@@ -166,19 +199,19 @@ function handleClientMessage(ws, data) {
         case 'quick_match': {
             const mode = data.mode || "MUMMY_VS_HUMAN";
             const teamSize = data.team_size || 1;
+            const characterId = data.character_id || 1;
+            const username = data.username || "Player";
+            const playerUid = data.player_uid || "";
 
             if (!queues[mode]) {
                 queues[mode] = [];
             }
 
-            // Remove if already queued
             removeFromAllQueues(ws);
 
-            // Add player to queue
-            queues[mode].push({ ws, teamSize });
+            queues[mode].push({ ws, teamSize, characterId, username, playerUid });
             console.log(`[QUEUE] Player joined ${mode} queue. Current waiting: ${queues[mode].length}`);
 
-            // ⚠️ 2 PLAYERS COMPLETE BHAYE PACHI MATRA MATCH START GARNE!
             if (queues[mode].length >= 2) {
                 const player1 = queues[mode].shift();
                 const player2 = queues[mode].shift();
@@ -194,29 +227,38 @@ function handleClientMessage(ws, data) {
 
                 console.log(`[MATCH FOUND] Paired 2 players for ${mode} in ${matchId}!`);
 
-                // Send match_found to Player 1 -> Spawn 0 (Spawn 1 in Godot)
                 if (player1.ws.readyState === WebSocket.OPEN) {
                     player1.ws.send(JSON.stringify({
                         type: "match_found",
                         mode: mode,
                         spawn_index: 0,
                         match_id: matchId,
-                        total_players: 2
+                        total_players: 2,
+                        opponent: {
+                            character_id: player2.characterId,
+                            username: player2.username,
+                            player_uid: player2.playerUid,
+                            spawn_index: 1
+                        }
                     }));
                 }
 
-                // Send match_found to Player 2 -> Spawn 1 (Spawn 2 in Godot)
                 if (player2.ws.readyState === WebSocket.OPEN) {
                     player2.ws.send(JSON.stringify({
                         type: "match_found",
                         mode: mode,
                         spawn_index: 1,
                         match_id: matchId,
-                        total_players: 2
+                        total_players: 2,
+                        opponent: {
+                            character_id: player1.characterId,
+                            username: player1.username,
+                            player_uid: player1.playerUid,
+                            spawn_index: 0
+                        }
                     }));
                 }
             } else {
-                // Only 1 player in queue -> tell them waiting for opponent
                 ws.send(JSON.stringify({
                     type: "player_joined",
                     player_count: 1,
@@ -232,7 +274,6 @@ function handleClientMessage(ws, data) {
             break;
         }
 
-        // Real-time In-game Action & Position Relay
         case 'player_move':
         case 'player_action':
         case 'player_anim': {
@@ -252,7 +293,6 @@ function handleClientMessage(ws, data) {
     }
 }
 
-// Keep-alive ping interval every 25s (prevents Render idle sleep on free instances)
 const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
         if (!ws.isAlive) {
@@ -267,10 +307,9 @@ wss.on('close', () => {
     clearInterval(interval);
 });
 
-// Start listening
 server.listen(PORT, () => {
     console.log(`===========================================`);
-    console.log(`🔥 Flame Strike Server listening on port ${PORT}`);
+    console.log(`Flame Strike Server listening on port ${PORT}`);
     console.log(`WebSocket: ws://localhost:${PORT}`);
     console.log(`===========================================`);
 });
