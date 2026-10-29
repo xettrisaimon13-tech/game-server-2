@@ -163,7 +163,7 @@ let matchCounter = 1000;
 
 // ---- Authoritative team (party) state ----
 const clientsByUid = new Map();   // player_uid -> ws (last connection wins)
-const teams = new Map();          // team_id -> { id, leaderUid, maxSize, members: [{ws, uid, username, characterId}] }
+const teams = new Map();          // team_id -> { id, leaderUid, maxSize, members: [{ws, uid, username, characterId, bundleId}] }
 let teamCounter = 5000;
 
 // Supabase hands UIDs back as floats, so the same player can arrive as
@@ -193,8 +193,25 @@ function teamOf(ws) {
     return ws.teamId && teams.has(ws.teamId) ? teams.get(ws.teamId) : null;
 }
 
+function bundleOf(row) {
+    // -1 means "wearing the character's own default look". The client maps any
+    // slot it does not have to the same fallback, so an unknown number is only
+    // ever cosmetic, never a crash.
+    return row.bundleId === undefined || row.bundleId === null ? -1 : row.bundleId;
+}
+
+function bundleIdOf(data) {
+    const v = parseInt(data && data.bundle_id, 10);
+    return isNaN(v) || v < -1 ? -1 : v;
+}
+
 function memberInfo(m) {
-    return { player_uid: m.uid, username: m.username, character_id: m.characterId };
+    return {
+        player_uid: m.uid,
+        username: m.username,
+        character_id: m.characterId,
+        bundle_id: bundleOf(m)
+    };
 }
 
 // Clients attach their identity (UID, name, equipped character) to every team
@@ -205,9 +222,11 @@ function refreshIdentity(uid, data) {
     if (!uid) return;
     const name = String(data.username || "").trim();
     const charId = parseInt(data.character_id, 10);
+    const bundleId = parseInt(data.bundle_id, 10);
     const patch = (row) => {
         if (name !== "") row.username = name;
         if (!isNaN(charId) && charId > 0) row.characterId = charId;
+        if (!isNaN(bundleId) && bundleId >= -1) row.bundleId = bundleId;
     };
     for (const team of teams.values()) {
         const member = team.members.find(m => m.uid === uid);
@@ -249,13 +268,13 @@ function broadcastTeam(team) {
     for (const m of team.members) sendJson(m.ws, payload);
 }
 
-function createTeam(ws, uid, username, characterId, maxSize) {
+function createTeam(ws, uid, username, characterId, bundleId, maxSize) {
     const id = "team_" + (teamCounter++);
     const team = {
         id: id,
         leaderUid: uid,
         maxSize: maxSize,
-        members: [{ ws: ws, uid: uid, username: username, characterId: characterId }]
+        members: [{ ws: ws, uid: uid, username: username, characterId: characterId, bundleId: bundleId }]
     };
     teams.set(id, team);
     ws.teamId = id;
@@ -446,6 +465,7 @@ function makeRoom(mode, sides) {
                 uid: m.playerUid || "",
                 username: (live && live.username) || m.username || "Player",
                 characterId: (live && live.characterId) || m.characterId || 1,
+                bundleId: live && live.bundleId !== undefined ? live.bundleId : bundleOf(m),
                 teamId: group.teamId || "",
                 side: sideIndex,
                 spawnIndex: base + i
@@ -477,6 +497,7 @@ function makeRoom(mode, sides) {
                 player_uid: e.uid,
                 username: e.username,
                 character_id: e.characterId,
+                bundle_id: bundleOf(e),
                 spawn_index: e.spawnIndex,
                 team_id: e.teamId
             })),
@@ -525,6 +546,7 @@ function queueTeam(mode, team) {
         members: team.members.map(m => ({
             ws: m.ws,
             characterId: m.characterId,
+            bundleId: bundleOf(m),
             username: m.username,
             playerUid: m.uid,
             teamId: team.id,
@@ -546,12 +568,17 @@ function queueTeam(mode, team) {
 
 // ---- Mummy vs Human: server-authoritative 1v1 / 2v2 / 3v3 / 4v4 match ----
 // The clients only report proximity; every role, timer tick, knockdown, revive,
-// elimination, round point and the final result is decided here so all screens agree.
+// elimination, point and the final result is decided here so all screens agree.
 const MUMMY_MODE = "MUMMY_VS_HUMAN";
-const MUMMY_ROUNDS = 4;
+// The two teams are the two sides of the arena. A team wins the match, not a
+// round, so the point table is indexed by side and every client draws the same
+// two names from it.
+const MUMMY_TEAM_NAMES = ["TEAM TIGER", "TEAM LION"];
+const MUMMY_WIN_POINTS = parseInt(process.env.MUMMY_WIN_POINTS, 10) || 4;
 // The knockdown bar: once downed, a Human bleeds this whole HP away over
 // MUMMY_DOWN_SECONDS and is eliminated when it empties.
-const MUMMY_HP = 100;
+const MUMMY_HP = 400;
+const MUMMY_DAMAGE_PER_HIT = 67;  // 6 hits to defeat (6 * 67 = 402, capped at 400)
 const MUMMY_DOWN_SECONDS = parseInt(process.env.MUMMY_DOWN_SECONDS, 10) || 30;
 const MUMMY_REVIVE_SECONDS = parseInt(process.env.MUMMY_REVIVE_SECONDS, 10) || 5;
 const MUMMY_DOWN_MS = MUMMY_DOWN_SECONDS * 1000;
@@ -561,6 +588,24 @@ const MUMMY_REVIVE_MS = MUMMY_REVIVE_SECONDS * 1000;
 const MUMMY_REVIVE_HEARTBEAT_MS = 2000;
 // The gap that lets a fully-eliminated side be confirmed before the next round.
 const MUMMY_BREAK_MS = (parseInt(process.env.MUMMY_BREAK_SECONDS, 10) || 3) * 1000;
+
+// ---- Human side ability: Holographic Clones ----
+// Which character owns which ability is decided here, not in the client's CATALOG,
+// so a tampered message cannot hand a player an ability they never equipped. Keep
+// this table and character_manager.gd's CATALOG "ability" rows in step.
+const CHARACTER_ABILITIES = { 2: "clone" };
+const CLONE_COUNT = 2;
+const CLONE_LIFETIME_MS = 10000;   // then it fades out on its own
+const CLONE_MAX_HITS = 3;          // or a Mummy lands three swings first
+const ABILITY_COOLDOWN_MS = 70000;
+// Mirrors ATTACK_RANGE in mummy_match.gd: the reach a catcher actually swings.
+const MUMMY_ATTACK_RANGE = parseFloat(process.env.MUMMY_ATTACK_RANGE) || 2.6;
+// How far either side of the Human's facing a clone stands.
+const CLONE_FLANK_METRES = 1.6;
+// A hologram can only be knocked once this often, however many reports arrive. A
+// Mummy standing in a crowd of four Humans used to be able to spend a whole swing
+// on one clone per target it reached.
+const CLONE_HIT_GAP_MS = 300;
 
 // 1v1 runs three minutes, every team size runs five.
 function mummyRoundMs(sideSize) {
@@ -584,16 +629,21 @@ function initMummyMatch(room) {
         round: 0,
         sideSize: sideSize,
         roundMs: mummyRoundMs(sideSize),
-        mummyScore: 0,
-        humanScore: 0,
+        // One score per team, indexed by side: 0 = TEAM TIGER, 1 = TEAM LION.
+        sideScore: [0, 0],
+        hunterSide: 0,             // the team hunting this round; it flips every round
+        winnerSide: -1,            // -1 while the match is still live
         roles: {},                 // id -> "mummy" | "human"
-        combat: {},                // id -> { hp, downed, downedSince, eliminated, reviveMs, revivers }
+        combat: {},                // id -> { hp, downed, downedSince, eliminated, scored, reviveMs, revivers }
         settled: false,            // one result per round, however it ends
         roundOutcome: "",
-        matchWinner: null,         // "mummy" | "human" | "draw"
+        abilities: {},             // id -> { cooldownUntil } for the equipped character's ability
+        clones: {},                // clone id -> { owner, x, y, z, hits, expiresAt }
+        cloneSeq: 0,
         endsAt: 0
     };
     resetMummyCombat(room);
+    resetMummyAbilities(room);
     broadcastMummyState(room, true);
 }
 
@@ -608,11 +658,169 @@ function resetMummyCombat(room) {
             downed: false,
             downedSince: 0,
             eliminated: false,
+            // One player can only ever be paid out once per round, however many
+            // times the bleed-out tick, a duplicate report or a reconnect lands
+            // on the same elimination.
+            scored: false,
             reviveMs: 0,
             reviveAt: 0,
             revivers: {}
         };
     }
+}
+
+// A fresh round also clears every clone and restarts every cooldown, so nobody
+// carries a distraction or a locked button across a round boundary.
+function resetMummyAbilities(room) {
+    const g = room.game;
+    g.abilities = {};
+    g.clones = {};
+    g.cloneSeq = 0;
+    for (const e of room.entries) {
+        g.abilities[mummyIdOf(e)] = { cooldownUntil: 0 };
+    }
+}
+
+function abilityFor(entry) {
+    return CHARACTER_ABILITIES[String(entry.characterId)] || "none";
+}
+
+// Ground distance only - the arena is played on one floor and a jump should not
+// put a body out of reach.
+function flatDistance(a, b) {
+    if (!a || !b) return Infinity;
+    const dx = Number(a.x) - Number(b.x);
+    const dz = Number(a.z) - Number(b.z);
+    return Math.sqrt(dx * dx + dz * dz);
+}
+
+function clonePayload(g, now) {
+    return Object.keys(g.clones).map(id => {
+        const c = g.clones[id];
+        return {
+            id: id,
+            owner: c.owner,
+            x: c.x,
+            y: c.y,
+            z: c.z,
+            yaw: c.yaw,
+            hits: c.hits,
+            seconds_left: Math.max(0, Math.ceil((c.expiresAt - now) / 1000))
+        };
+    });
+}
+
+function destroyMummyClones(room, ids) {
+    const g = room.game;
+    const live = ids.filter(id => !!g.clones[id]);
+    if (live.length === 0) return false;
+    for (const id of live) delete g.clones[id];
+    for (const e of room.entries) {
+        sendJson(e.ws, { type: "clone_destroy", match_id: room.matchId, clone_ids: live });
+    }
+    return true;
+}
+
+// A clone belongs to a live Human. Whatever takes that player out - the clock, a
+// knockdown, a dropped socket - takes their holograms with it, so the arena never
+// keeps a distraction that nobody can still be defending.
+function tickMummyClones(room, now) {
+    const g = room.game;
+    const dead = [];
+    for (const id of Object.keys(g.clones)) {
+        const c = g.clones[id];
+        const state = g.combat[c.owner];
+        const stillHere = room.entries.some(e => mummyIdOf(e) === c.owner);
+        if (c.expiresAt <= now || !stillHere || !state || state.downed || state.eliminated || g.roles[c.owner] !== "human") {
+            dead.push(id);
+        }
+    }
+    return destroyMummyClones(room, dead);
+}
+
+function activateMummyAbility(room, entry, now) {
+    const g = room.game;
+    const self = mummyIdOf(entry);
+    const mine = g.abilities[self] || (g.abilities[self] = { cooldownUntil: 0 });
+    if (mine.cooldownUntil > now) return "cooldown";
+
+    // The holograms flank the body that cast them, turned the way that body is
+    // already facing, so a clone never appears behind a player who has just
+    // spun around to run.
+    const at = entry.pos || { x: 0, y: 0, z: 0, yaw: 0 };
+    const yaw = Number(at.yaw) || 0;
+    const right = { x: Math.cos(yaw), z: -Math.sin(yaw) };
+    const created = [];
+    for (let i = 0; i < CLONE_COUNT; i++) {
+        const side = i === 0 ? 1 : -1;
+        const id = `${self}#${g.cloneSeq++}`;
+        const clone = {
+            owner: self,
+            x: Number(at.x) + right.x * CLONE_FLANK_METRES * side,
+            y: Number(at.y),
+            z: Number(at.z) + right.z * CLONE_FLANK_METRES * side,
+            yaw: yaw,
+            hits: 0,
+            lastHitAt: 0,
+            expiresAt: now + CLONE_LIFETIME_MS
+        };
+        g.clones[id] = clone;
+        created.push({ id: id, owner: self, x: clone.x, y: clone.y, z: clone.z, yaw: yaw });
+    }
+    mine.cooldownUntil = now + ABILITY_COOLDOWN_MS;
+    for (const e of room.entries) {
+        sendJson(e.ws, {
+            type: "ability_spawn",
+            match_id: room.matchId,
+            player_id: self,
+            ability_type: "clone",
+            clones: created
+        });
+    }
+    console.log(`[MUMMY] ${self} spawned ${created.length} clones in ${room.matchId}`);
+    return "";
+}
+
+// One swing landed on one hologram. The catcher reports it the same way it
+// reports a hit on a body, and the server owns the count to three. A clone can
+// only be knocked once every CLONE_HIT_GAP_MS, however many reports arrive, so a
+// catcher swinging through a crowd cannot spend one swing on every body it
+// reaches.
+function landCloneHit(room, cloneId, now) {
+    const g = room.game;
+    const clone = g.clones[cloneId];
+    if (!clone) return false;
+    if (now - (clone.lastHitAt || 0) < CLONE_HIT_GAP_MS) return false;
+    clone.lastHitAt = now;
+    clone.hits += 1;
+    for (const e of room.entries) {
+        sendJson(e.ws, {
+            type: "clone_hit",
+            match_id: room.matchId,
+            clone_id: cloneId,
+            hits: clone.hits,
+            hits_left: Math.max(0, CLONE_MAX_HITS - clone.hits)
+        });
+    }
+    if (clone.hits >= CLONE_MAX_HITS) destroyMummyClones(room, [cloneId]);
+    return true;
+}
+
+// The closest hologram within reach, and only if it really is closer than the
+// Human the swing was aimed at - that gap is the entire distraction.
+function cloneAbsorbing(room, fromPos, humanPos) {
+    const g = room.game;
+    const humanDistance = flatDistance(fromPos, humanPos);
+    let bestId = "";
+    let bestDistance = humanDistance;
+    for (const id of Object.keys(g.clones)) {
+        const d = flatDistance(fromPos, g.clones[id]);
+        if (d <= MUMMY_ATTACK_RANGE && d < bestDistance) {
+            bestDistance = d;
+            bestId = id;
+        }
+    }
+    return bestId;
 }
 
 // ---- Knockdown state, all of it decided here ----
@@ -662,7 +870,57 @@ function eliminateMummyPlayer(room, id) {
     c.reviveMs = 0;
     c.reviveAt = 0;
     c.revivers = {};
+    // The elimination is the point: whoever went out hands a point to the team on
+    // the other side of the arena, which is the team that put them there.
+    awardMummyPoint(room, id);
     return true;
+}
+
+// ---- Points, and only ever one per elimination ----
+// A team is a side, so the hunting side and the hunted side are always opposed:
+// a point can never be paid to the eliminated player's own team, and a point can
+// never be paid twice for the same body.
+function awardMummyPoint(room, victimId) {
+    const g = room.game;
+    // Only a live round pays. A drop-out during the countdown between rounds is
+    // still an exit from that round, but it must not buy a point nobody fought for.
+    if (!g || g.phase !== "playing") return false;
+
+    const c = g.combat[victimId];
+    if (c && c.scored) return false;
+
+    const entry = room.entries.find(e => mummyIdOf(e) === victimId);
+    if (!entry) return false;
+
+    if (c) c.scored = true;
+    const scorer = 1 - entry.side;
+    g.sideScore[scorer] += 1;
+    console.log(`[MUMMY] ${MUMMY_TEAM_NAMES[scorer]} +1 (${victimId} out) -> TIGER ${g.sideScore[0]} - LION ${g.sideScore[1]}`);
+
+    if (g.sideScore[scorer] >= MUMMY_WIN_POINTS) {
+        endMummyMatch(room, scorer);
+    } else {
+        // Instant: every phone gets the new score on the same tick it happened.
+        broadcastMummyState(room, true);
+    }
+    return true;
+}
+
+// The match stops where it is: no clock, no further scoring, and the sockets are
+// released so the same players can queue a new match without clearing anything.
+function endMummyMatch(room, winningSide) {
+    const g = room.game;
+    g.phase = "finished";
+    g.settled = true;
+    g.endsAt = 0;
+    g.winnerSide = winningSide;
+    g.roundOutcome = "match";
+    console.log(`[MUMMY] match over in ${room.matchId}: ${MUMMY_TEAM_NAMES[winningSide]} wins ${g.sideScore[0]}-${g.sideScore[1]}`);
+    broadcastMummyState(room, true);
+    // The result has been delivered, so nobody stays parked in a dead room:
+    // these sockets are free to queue again.
+    for (const e of room.entries) e.ws.matchId = null;
+    matches.delete(room.matchId);
 }
 
 // The Mummy side only wins once every Human is out. Downed-but-still-bleeding
@@ -704,18 +962,8 @@ function tickMummyCombat(room, now) {
     }
 }
 
-function shuffled(list) {
-    const out = list.slice();
-    for (let i = out.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [out[i], out[j]] = [out[j], out[i]];
-    }
-    return out;
-}
-
 function beginMummyRound(room, roundNumber) {
     const g = room.game;
-    const ids = room.entries.map(mummyIdOf);
 
     g.round = roundNumber;
     g.settled = false;
@@ -723,44 +971,32 @@ function beginMummyRound(room, roundNumber) {
     g.phase = "playing";
     g.endsAt = Date.now() + g.roundMs;
     resetMummyCombat(room);
+    resetMummyAbilities(room);
 
-    if (roundNumber === 1 || roundNumber === 3) {
-        // Random sides, but never a lopsided split: exactly half become mummies.
-        const mummies = shuffled(ids).slice(0, Math.ceil(ids.length / 2));
-        g.roles = {};
-        for (const id of ids) g.roles[id] = mummies.includes(id) ? "mummy" : "human";
-    } else {
-        // Swap rounds: the previous humans inherit the mummy role and vice versa.
-        const flipped = {};
-        for (const id of ids) flipped[id] = g.roles[id] === "mummy" ? "human" : "mummy";
-        g.roles = flipped;
+    // One team hunts per round, and the teams are the arena sides, so a Mummy can
+    // only ever knock out a player from the other team - which is what makes
+    // "elimination = +1 for the other side" true every time. Round 1's hunters are
+    // a coin flip; every following round hands the hunt to the other team, so both
+    // sides get the same number of turns at scoring.
+    g.hunterSide = roundNumber === 1 ? (Math.random() < 0.5 ? 0 : 1) : 1 - g.hunterSide;
+    g.roles = {};
+    for (const e of room.entries) {
+        g.roles[mummyIdOf(e)] = e.side === g.hunterSide ? "mummy" : "human";
     }
 
     console.log(`[MUMMY] ${room.mode} round ${roundNumber}: ${Object.entries(g.roles).map(([id, r]) => `${id}=${r}`).join(" ")}`);
     broadcastMummyState(room, true);
 }
 
+// A round only ever *stops*: the points were already paid by the eliminations
+// that ended it, and the match itself ends in awardMummyPoint the moment a team
+// reaches the win line. Nothing is awarded here, so a wipe can never be counted
+// once per body and then once again as a round point.
 function settleMummyRound(room, winner) {
     const g = room.game;
-    if (g.settled) return;
+    if (g.settled || g.phase === "finished") return;
     g.settled = true;
     g.roundOutcome = winner;
-    if (winner === "mummy") g.mummyScore += 1;
-    else if (winner === "human") g.humanScore += 1;
-
-    if (g.round >= MUMMY_ROUNDS) {
-        g.phase = "finished";
-        g.endsAt = 0;
-        const diff = g.mummyScore - g.humanScore;
-        g.matchWinner = diff > 0 ? "mummy" : diff < 0 ? "human" : "draw";
-        console.log(`[MUMMY] match over: mummies ${g.mummyScore} - ${g.humanScore} humans (${g.matchWinner})`);
-        broadcastMummyState(room, true);
-        // The result has been delivered, so nobody stays parked in a dead room:
-        // these sockets are free to queue again.
-        for (const e of room.entries) e.ws.matchId = null;
-        matches.delete(room.matchId);
-        return;
-    }
 
     g.phase = "round_break";
     g.endsAt = Date.now() + MUMMY_BREAK_MS;
@@ -770,27 +1006,46 @@ function settleMummyRound(room, winner) {
 function mummyStatePayload(room, self) {
     const g = room.game;
     const now = Date.now();
+    const myId = mummyIdOf(self);
+    const mine = g.abilities[myId] || { cooldownUntil: 0 };
+    const cooldownLeft = Math.max(0, mine.cooldownUntil - now);
     return {
         type: "match_state",
         match_id: room.matchId,
         mode: room.mode,
         phase: g.phase,
         round: g.round,
-        rounds_total: MUMMY_ROUNDS,
         side_size: g.sideSize,
         round_seconds: Math.round(g.roundMs / 1000),
         remaining_seconds: g.endsAt > 0 ? Math.max(0, Math.ceil((g.endsAt - now) / 1000)) : 0,
-        mummy_score: g.mummyScore,
-        human_score: g.humanScore,
+        // The scoreboard is a team board, not a role board: names, one score per
+        // team, the line to win on and which team is hunting right now.
+        team_names: MUMMY_TEAM_NAMES,
+        side_score: g.sideScore.slice(),
+        win_points: MUMMY_WIN_POINTS,
+        hunter_side: g.hunterSide,
+        winner_side: g.winnerSide,
         roles: g.roles,
         hp_max: MUMMY_HP,
         down_seconds: MUMMY_DOWN_SECONDS,
         revive_seconds: MUMMY_REVIVE_SECONDS,
         round_outcome: g.roundOutcome,
-        match_winner: g.matchWinner,
         ready_count: g.ready.size,
         required_players: room.entries.length,
-        self_id: mummyIdOf(self),
+        self_id: myId,
+        // The button on the Human's screen counts down from the server's clock, so
+        // a reconnect or a laggy phone cannot invent a shorter cooldown.
+        ability: {
+            type: abilityFor(self),
+            left_ms: cooldownLeft,
+            ready: g.phase === "playing" && cooldownLeft === 0,
+            cooldown_ms: ABILITY_COOLDOWN_MS,
+            duration_ms: CLONE_LIFETIME_MS,
+            hits_to_destroy: CLONE_MAX_HITS
+        },
+        // Every client rebuilds the holograms from this list, so a spawn or a
+        // destroy that lands on one phone and not another self-corrects.
+        clones: clonePayload(g, now),
         players: room.entries.map(e => {
             const id = mummyIdOf(e);
             const c = g.combat[id] || { hp: MUMMY_HP, downed: false, eliminated: false, reviveMs: 0, revivers: {} };
@@ -800,6 +1055,7 @@ function mummyStatePayload(room, self) {
                 player_uid: e.uid,
                 username: e.username,
                 character_id: e.characterId,
+                bundle_id: bundleOf(e),
                 spawn_index: e.spawnIndex,
                 side: e.side,
                 role: g.roles[id] || "",
@@ -831,6 +1087,10 @@ function tickMummyMatches() {
     for (const room of matches.values()) {
         const g = room.game;
         if (!g) continue;
+
+        // Holograms are on the server's clock, so their 10 seconds end on every
+        // phone at the same tick even if a hit report went astray.
+        if (g.phase !== "finished") tickMummyClones(room, now);
 
         if (g.phase === "playing" && !g.settled) {
             tickMummyCombat(room, now);
@@ -914,7 +1174,7 @@ function handleClientMessage(ws, data) {
             if (!team) {
                 const maxSize = Math.min(4, Math.max(1, parseInt(data.max_size, 10) || 1));
                 if (maxSize < 2) { teamError(ws, "Pick Duo (2) or Squad (4) before inviting"); break; }
-                team = createTeam(ws, uid, data.username || "Player", data.character_id || 1, maxSize);
+                team = createTeam(ws, uid, data.username || "Player", data.character_id || 1, bundleIdOf(data), maxSize);
             } else if (team.leaderUid !== uid) {
                 teamError(ws, "Only the team leader can invite players"); break;
             }
@@ -967,7 +1227,8 @@ function handleClientMessage(ws, data) {
                 ws: ws,
                 uid: uid,
                 username: data.username || "Player",
-                characterId: data.character_id || 1
+                characterId: data.character_id || 1,
+                bundleId: bundleIdOf(data)
             });
             console.log(`[TEAM] ${uid} joined ${team.id} (${team.members.length}/${team.maxSize})`);
             broadcastTeam(team);
@@ -1010,6 +1271,7 @@ function handleClientMessage(ws, data) {
 
             const mode = data.mode || "MUMMY_VS_HUMAN";
             const characterId = data.character_id || 1;
+            const bundleId = bundleIdOf(data);
             const username = data.username || "Player";
             const playerUid = uid || "";
 
@@ -1033,7 +1295,7 @@ function handleClientMessage(ws, data) {
 
             removeFromAllQueues(ws);
 
-            queues[mode].push({ ws, teamSize: 1, characterId, username, playerUid });
+            queues[mode].push({ ws, teamSize: 1, characterId, bundleId, username, playerUid });
             console.log(`[QUEUE] Player joined ${mode} queue. Current waiting: ${queues[mode].length}`);
 
             if (queues[mode].length >= 2) {
@@ -1076,6 +1338,20 @@ function handleClientMessage(ws, data) {
         case 'player_anim': {
             const room = ws.matchId && matches.get(ws.matchId);
             if (!room) break;
+            if (type === "player_move") {
+                // The relay alone used to be the server's only knowledge of where
+                // anybody stood. Abilities and clone hits are sized in metres, so
+                // the room now keeps the last position each socket reported.
+                const mover = room.entries.find(e => e.ws === ws);
+                if (mover) {
+                    mover.pos = {
+                        x: Number(data.x) || 0,
+                        y: Number(data.y) || 0,
+                        z: Number(data.z) || 0,
+                        yaw: Number(data.yaw) || 0
+                    };
+                }
+            }
             // Tag the relay so a room of up to 8 clients can tell who moved.
             const frame = Object.assign({}, data, {
                 player_uid: ws.matchUid || "",
@@ -1128,15 +1404,93 @@ function handleClientMessage(ws, data) {
             if (!room.entries.some(e => mummyIdOf(e) === targetId)) break;
             if (targetId === attackerId || g.roles[targetId] !== "human") break;
 
-            // false = this Human is already down or already out, so the report is a
-            // duplicate rather than a second elimination.
-            if (!downMummyPlayer(room, targetId)) break;
-            console.log(`[MUMMY] ${attackerId} knocked ${targetId} down in ${room.matchId}`);
+            const target = g.combat[targetId];
+            if (!target || target.downed || target.eliminated) break;
 
-            // 1v1 has no remaining teammate to wait for: the round ends on the down
-            // and both players come back at full health, so nobody spectates.
-            if (g.sideSize <= 1) settleMummyRound(room, "mummy");
-            else broadcastMummyState(room, true);
+            // A hologram standing between the catcher and the body it swung at
+            // takes the blow. Deciding it here rather than on the catcher's phone
+            // is what makes all eight screens agree on who was actually hit.
+            const targetEntry = room.entries.find(e => mummyIdOf(e) === targetId);
+            const baitId = cloneAbsorbing(room, attacker.pos, targetEntry ? targetEntry.pos : null);
+            if (baitId !== "") {
+                landCloneHit(room, baitId, Date.now());
+                console.log(`[MUMMY] ${attackerId} hit clone ${baitId} instead of ${targetId} in ${room.matchId}`);
+                break;
+            }
+
+            // Apply damage
+            target.hp = Math.max(0, target.hp - MUMMY_DAMAGE_PER_HIT);
+            console.log(`[MUMMY] ${attackerId} hit ${targetId} for ${MUMMY_DAMAGE_PER_HIT} damage, HP now ${target.hp}`);
+
+            // Check if HP reached zero
+            if (target.hp <= 0) {
+                if (g.sideSize <= 1) {
+                    // 1v1: HP=0 ends the round immediately
+                    if (!eliminateMummyPlayer(room, targetId)) break;
+                    console.log(`[MUMMY] ${attackerId} caught ${targetId} out in ${room.matchId}`);
+                    if (g.phase !== "finished") settleMummyRound(room, "mummy");
+                } else {
+                    // 2v2+: HP=0 knocks down instead of eliminating
+                    if (!downMummyPlayer(room, targetId)) break;
+                    console.log(`[MUMMY] ${attackerId} knocked ${targetId} down in ${room.matchId}`);
+                    broadcastMummyState(room, true);
+                }
+            } else {
+                // Just damage, HP still > 0
+                broadcastMummyState(room, true);
+            }
+            break;
+        }
+
+        // Only a Human whose equipped character actually owns this ability, on a
+        // live round, still standing and off cooldown, gets holograms - and the
+        // server places them, numbers them and starts the clock.
+        case 'ability_activate': {
+            const room = ws.matchId && matches.get(ws.matchId);
+            if (!room || !room.game) break;
+
+            const g = room.game;
+            if (g.phase !== "playing" || g.settled) break;
+
+            const caster = room.entries.find(e => e.ws === ws);
+            if (!caster) break;
+            const casterId = mummyIdOf(caster);
+            if (g.roles[casterId] !== "human") break;
+
+            const state = g.combat[casterId];
+            if (!state || state.downed || state.eliminated) break;
+            if (abilityFor(caster) !== String(data.ability_type || "")) break;
+
+            if (activateMummyAbility(room, caster, Date.now()) === "cooldown") {
+                // Refused, but the phone gets the real remaining time so its
+                // countdown snaps back to the server's instead of sitting on zero.
+                broadcastMummyState(room, true);
+            }
+            break;
+        }
+
+        // The catcher reports the hologram its own reach test landed on, in the
+        // same spirit as mummy_attack; the server re-checks the distance from the
+        // positions both sides send and owns the count of three.
+        case 'clone_hit': {
+            const room = ws.matchId && matches.get(ws.matchId);
+            if (!room || !room.game) break;
+
+            const g = room.game;
+            if (g.phase !== "playing" || g.settled) break;
+
+            const attacker = room.entries.find(e => e.ws === ws);
+            if (!attacker) break;
+            const attackerId = mummyIdOf(attacker);
+            if (g.roles[attackerId] !== "mummy") break;
+            if (!mummyAlive(room, attackerId)) break;
+
+            const cloneId = String(data.clone_id || "");
+            const clone = g.clones[cloneId];
+            if (!clone) break;
+            if (flatDistance(attacker.pos, clone) > MUMMY_ATTACK_RANGE) break;
+
+            landCloneHit(room, cloneId, Date.now());
             break;
         }
 
