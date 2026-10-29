@@ -593,7 +593,7 @@ const MUMMY_BREAK_MS = (parseInt(process.env.MUMMY_BREAK_SECONDS, 10) || 3) * 10
 // Which character owns which ability is decided here, not in the client's CATALOG,
 // so a tampered message cannot hand a player an ability they never equipped. Keep
 // this table and character_manager.gd's CATALOG "ability" rows in step.
-const CHARACTER_ABILITIES = { 2: "clone" };
+const CHARACTER_ABILITIES = { 2: "clone", 3: "aura" };
 const CLONE_COUNT = 2;
 const CLONE_LIFETIME_MS = 10000;   // then it fades out on its own
 const CLONE_MAX_HITS = 3;          // or a Mummy lands three swings first
@@ -602,10 +602,24 @@ const ABILITY_COOLDOWN_MS = 70000;
 const MUMMY_ATTACK_RANGE = parseFloat(process.env.MUMMY_ATTACK_RANGE) || 2.6;
 // How far either side of the Human's facing a clone stands.
 const CLONE_FLANK_METRES = 1.6;
+// Clones then walk straight ahead like bots, so they pull the Mummy's swing.
+// Both ends use these two numbers: the phone draws the body on this line, and
+// the server moves its own copy down the same line, so a swing at what a player
+// sees is a swing on the body the server is counting.
+const CLONE_WALK_SPEED = 5.0;      // metres per second, straight ahead (a player walks at 5.5)
+const CLONE_WALK_LIMIT = 20.0;     // metres from where the clone appeared
 // A hologram can only be knocked once this often, however many reports arrive. A
 // Mummy standing in a crowd of four Humans used to be able to spend a whole swing
 // on one clone per target it reached.
 const CLONE_HIT_GAP_MS = 300;
+// The green aura also patches its caster up: HP is server-owned, so the trickle is
+// counted here over the same 10 seconds the client draws the aura for. 120 of the
+// 400 HP bar is roughly two swings' worth, slow enough to read as a heal.
+const AURA_HEAL_MS = 10000;
+const AURA_HEAL_TOTAL = 120;
+// Mirrors aura_radius in green_aura.gd: a teammate standing inside the drawn
+// circle gains the same HP trickle (HP only - the speed buff stays on the caster).
+const AURA_RADIUS = 4.0;
 
 // 1v1 runs three minutes, every team size runs five.
 function mummyRoundMs(sideSize) {
@@ -638,6 +652,7 @@ function initMummyMatch(room) {
         settled: false,            // one result per round, however it ends
         roundOutcome: "",
         abilities: {},             // id -> { cooldownUntil } for the equipped character's ability
+        swingSeq: {},              // mummy id -> swings so far, so sword/jab alternate on every screen
         clones: {},                // clone id -> { owner, x, y, z, hits, expiresAt }
         cloneSeq: 0,
         endsAt: 0
@@ -677,7 +692,7 @@ function resetMummyAbilities(room) {
     g.clones = {};
     g.cloneSeq = 0;
     for (const e of room.entries) {
-        g.abilities[mummyIdOf(e)] = { cooldownUntil: 0 };
+        g.abilities[mummyIdOf(e)] = { cooldownUntil: 0, healUntil: 0, healAt: 0 };
     }
 }
 
@@ -733,6 +748,17 @@ function tickMummyClones(room, now) {
         const stillHere = room.entries.some(e => mummyIdOf(e) === c.owner);
         if (c.expiresAt <= now || !stillHere || !state || state.downed || state.eliminated || g.roles[c.owner] !== "human") {
             dead.push(id);
+            continue;
+        }
+        // Straight ahead, on the heading the clone was placed with - the phone
+        // draws the same step, so the two stay on one line.
+        const dt = Math.min(0.5, Math.max(0, (now - c.movedAt) / 1000));
+        c.movedAt = now;
+        const step = Math.min(CLONE_WALK_SPEED * dt, CLONE_WALK_LIMIT - c.walked);
+        if (step > 0) {
+            c.x -= Math.sin(c.yaw) * step;
+            c.z -= Math.cos(c.yaw) * step;
+            c.walked += step;
         }
     }
     return destroyMummyClones(room, dead);
@@ -741,8 +767,36 @@ function tickMummyClones(room, now) {
 function activateMummyAbility(room, entry, now) {
     const g = room.game;
     const self = mummyIdOf(entry);
+    const kind = abilityFor(entry);
+    if (kind === "none") return "none";
     const mine = g.abilities[self] || (g.abilities[self] = { cooldownUntil: 0 });
     if (mine.cooldownUntil > now) return "cooldown";
+
+    // The green aura is a burst on the spot: no body to track, no countdown beyond
+    // the cooldown. Everyone is told where it bloomed so the phones agree.
+    if (kind === "aura") {
+        const at = entry.pos || { x: 0, y: 0, z: 0, yaw: 0 };
+        mine.cooldownUntil = now + ABILITY_COOLDOWN_MS;
+        // The caster's HP is healed from the server's clock for the aura's whole
+        // window, so every screen sees the same green climb instead of each phone
+        // inventing its own.
+        mine.healUntil = now + AURA_HEAL_MS;
+        mine.healAt = now;
+        for (const e of room.entries) {
+            sendJson(e.ws, {
+                type: "ability_spawn",
+                match_id: room.matchId,
+                player_id: self,
+                ability_type: "aura",
+                x: Number(at.x),
+                y: Number(at.y),
+                z: Number(at.z),
+                yaw: Number(at.yaw) || 0
+            });
+        }
+        console.log(`[MUMMY] ${self} burst a green aura in ${room.matchId}`);
+        return "";
+    }
 
     // The holograms flank the body that cast them, turned the way that body is
     // already facing, so a clone never appears behind a player who has just
@@ -762,6 +816,8 @@ function activateMummyAbility(room, entry, now) {
             yaw: yaw,
             hits: 0,
             lastHitAt: 0,
+            walked: 0,
+            movedAt: now,
             expiresAt: now + CLONE_LIFETIME_MS
         };
         g.clones[id] = clone;
@@ -930,8 +986,47 @@ function mummyHumansWiped(room) {
     return humans.length > 0 && humans.every(id => room.game.combat[id].eliminated);
 }
 
+// The aura's heal runs on wall-clock deltas rather than a fixed step, so a slow
+// tick does not quietly hand out less HP than the aura promised. A downed, out or
+// full-HP caster just burns its window without gaining anything.
+function tickMummyAuraHeal(room, now) {
+    const g = room.game;
+    for (const id of Object.keys(g.abilities)) {
+        const a = g.abilities[id];
+        if (!a || !(a.healUntil > 0)) continue;
+
+        const until = Math.min(a.healUntil, now);
+        const dt = (until - a.healAt) / 1000;
+        a.healAt = until;
+        if (now >= a.healUntil) a.healUntil = 0;
+        if (dt <= 0) continue;
+
+        const caster = room.entries.find(e => mummyIdOf(e) === id);
+        if (!caster) continue;
+
+        const heal = Math.max(1, Math.round((AURA_HEAL_TOTAL / (AURA_HEAL_MS / 1000)) * dt));
+        for (const e of room.entries) {
+            const target = mummyIdOf(e);
+            if (g.roles[target] !== "human") continue;
+
+            const c = g.combat[target];
+            if (!c || c.downed || c.eliminated) continue;
+            if (c.hp >= MUMMY_HP) continue;
+
+            // The caster always heals; a teammate only while standing in the cloud
+            // the others are drawing, which is why this uses the same radius.
+            const inCloud = target === id
+                || (e.side === caster.side && flatDistance(e.pos, caster.pos) <= AURA_RADIUS);
+            if (!inCloud) continue;
+
+            c.hp = Math.min(MUMMY_HP, c.hp + heal);
+        }
+    }
+}
+
 function tickMummyCombat(room, now) {
     const g = room.game;
+    tickMummyAuraHeal(room, now);
     for (const id of Object.keys(g.combat)) {
         const c = g.combat[id];
         if (!c.downed) continue;
@@ -1381,6 +1476,35 @@ function handleClientMessage(ws, data) {
             console.log(`[MUMMY] ${mummyIdOf(self)} ready in ${room.matchId} (${g.ready.size}/${room.entries.length})`);
             if (g.ready.size >= room.entries.length) beginMummyRound(room, 1);
             else broadcastMummyState(room, true);
+            break;
+        }
+
+        // Every swing is drawn on every phone. The catcher's own phone plays it the
+        // moment the fist is pressed; this broadcast is what the other screens
+        // follow, and the clip alternates sword / left jab so a combo reads as one.
+        case 'swing_start': {
+            const room = ws.matchId && matches.get(ws.matchId);
+            if (!room || !room.game) break;
+
+            const g = room.game;
+            if (g.phase !== "playing" || g.settled) break;
+
+            const attacker = room.entries.find(e => e.ws === ws);
+            if (!attacker) break;
+            const attackerId = mummyIdOf(attacker);
+            if (g.roles[attackerId] !== "mummy") break;
+            if (!mummyAlive(room, attackerId)) break;
+
+            const swing = (g.swingSeq[attackerId] = (g.swingSeq[attackerId] || 0) + 1);
+            const clip = swing % 2 === 1 ? "Sword_Attack" : "Fighting_Left_Jab";
+            for (const e of room.entries) {
+                sendJson(e.ws, {
+                    type: "attack_anim",
+                    match_id: room.matchId,
+                    player_id: attackerId,
+                    clip: clip
+                });
+            }
             break;
         }
 
