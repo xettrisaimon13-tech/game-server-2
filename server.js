@@ -165,6 +165,12 @@ const TEAM_SLOTS = [1, 2, 3, 4];
 const matches = new Map();
 let matchCounter = 1000;
 
+// A phone that drops mid-match gets this long to come back before the match is
+// forfeited: mobile nets flap for seconds at a time, so an instant loss on the
+// first closed socket was punishing a wobble like a rage-quit. The harness
+// shortens it via RECONNECT_GRACE_MS so forfeit tests do not wait 15 real seconds.
+const RECONNECT_GRACE_MS = Number(process.env.RECONNECT_GRACE_MS) || 15000;
+
 // ---- Authoritative team (party) state ----
 const clientsByUid = new Map();   // player_uid -> ws (last connection wins)
 const teams = new Map();          // team_id -> { id, leaderUid, maxSize, members: [{ws, uid, username, characterId, bundleId}] }
@@ -431,10 +437,22 @@ wss.on('connection', (ws) => {
                 }
                 // Walking out of a live match is a forfeit, whatever the round was
                 // doing: the side still in the arena takes the match outright, so
-                // nobody is left fighting a ghost until the clock runs out.
+                // nobody is left fighting a ghost until the clock runs out. But a
+                // dropped phone is not necessarily a walk-out - mobile nets flap -
+                // so the entry stays seated, marked gone, for RECONNECT_GRACE_MS.
+                // The room forfeits only if the player never comes back.
                 if (gone) {
-                    if (room.game.kind === "zombie") endZombieMatch(room, 1 - gone.side);
-                    else endMummyMatch(room, 1 - gone.side);
+                    gone.gone = true;
+                    room.players = room.players.filter(other => other !== ws);
+                    const txt = JSON.stringify({
+                        type: "player_disconnected",
+                        player_uid: gone.uid,
+                        spawn_index: gone.spawnIndex
+                    });
+                    for (const otherWs of room.players) {
+                        if (otherWs.readyState === WebSocket.OPEN) otherWs.send(txt);
+                    }
+                    armGraceTimer(room);
                     return;
                 }
             }
@@ -1298,6 +1316,31 @@ function awardMummyPoint(room, victimId) {
 
 // The match stops where it is: no clock, no further scoring, and the sockets are
 // released so the same players can queue a new match without clearing anything.
+// The grace window for a dropped player just closed. If any entry is still
+// marked gone the match cannot wait for it any longer; the other side takes it
+// outright, the same as a walk-out.
+function forfeitGone(room) {
+    if (!matches.has(room.matchId)) return;
+    clearTimeout(room.graceTimer);
+    for (const e of room.entries) {
+        if (!e.gone) continue;
+        if (room.game.kind === "zombie") endZombieMatch(room, 1 - e.side);
+        else endMummyMatch(room, 1 - e.side);
+        return;
+    }
+}
+
+// One timer per room, not per dropper: it re-arms whenever a socket closes so
+// every still-gone entry is covered, and a rejoin only cancels it once no entry
+// is gone any more (a returning player must not wipe a teammate's window).
+function armGraceTimer(room) {
+    clearTimeout(room.graceTimer);
+    room.graceTimer = null;
+    if (room.entries.some(e => e.gone)) {
+        room.graceTimer = setTimeout(() => forfeitGone(room), RECONNECT_GRACE_MS);
+    }
+}
+
 function endMummyMatch(room, winningSide) {
     const g = room.game;
     g.phase = "finished";
@@ -2060,6 +2103,35 @@ function handleClientMessage(ws, data) {
                     otherWs.send(txt);
                 }
             }
+            break;
+        }
+
+        // A phone that dropped mid-match comes back on a new socket: the same
+        // UID plus the match id it already has re-seats it on its old entry, and
+        // a forced full state repaint puts the returnee's body back on every
+        // screen - its own included - so the whole room moves again.
+        case 'match_rejoin': {
+            const uid = bindUid(ws, data);
+            const room = data.match_id ? matches.get(String(data.match_id)) : null;
+            if (!room || !room.game || room.game.phase === "finished") {
+                sendJson(ws, { type: "match_cancelled", reason: "no_match" });
+                break;
+            }
+            const entry = room.entries.find(e => e.gone && uidKey(e.uid) === uid);
+            if (!entry) {
+                sendJson(ws, { type: "match_cancelled", reason: "no_seat" });
+                break;
+            }
+            entry.gone = false;
+            entry.ws = ws;
+            ws.matchId = room.matchId;
+            ws.matchUid = entry.uid;
+            ws.matchSpawnIndex = entry.spawnIndex;
+            if (!room.players.includes(ws)) room.players.push(ws);
+            armGraceTimer(room);
+            console.log(`[REJOIN] ${uid} back in ${room.matchId} (${room.game.kind})`);
+            if (room.game.kind === "zombie") broadcastZombieState(room, true);
+            else broadcastMummyState(room, true);
             break;
         }
 
