@@ -1,11 +1,38 @@
-const express = require('express');
-const http = require('http');
-const { WebSocketServer, WebSocket } = require('ws');
-const cors = require('cors');
+// One malformed packet or a momentary network fault must not take the whole
+// service down: every player on this box loses their match when it does, and a
+// crash loop is what gets the deployment marked failed. Installed before the
+// requires below so even a load-time failure is reported instead of exiting 1.
+process.on('uncaughtException', (err) => {
+    console.error('[PROCESS] uncaught exception:', err);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('[PROCESS] unhandled rejection:', reason);
+});
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+// On Render an exit-1 with no visible reason is almost always a missing
+// dependency, which happens when the service's Root Directory is not the folder
+// that holds package.json, so `npm install` installed nothing. Say so plainly.
+function load(name) {
+    try {
+        return require(name);
+    } catch (err) {
+        console.error(
+            `[BOOT] Cannot load "${name}": ${err.message}\n` +
+            `[BOOT] Fix on Render -> Settings:\n` +
+            `[BOOT]   Root Directory = the folder that contains package.json\n` +
+            `[BOOT]   Build Command  = npm install\n` +
+            `[BOOT]   Start Command  = node server.js\n` +
+            `[BOOT]   Node Version   = 18 or newer`
+        );
+        process.exitCode = 1;
+        throw err;
+    }
+}
+
+const http = require('http');
+const wsLib = load('ws');
+const WebSocketServer = wsLib.WebSocketServer || wsLib.Server;
+const WebSocket = wsLib.WebSocket;
 
 const PORT = process.env.PORT || 3000;
 
@@ -14,20 +41,56 @@ const PORT = process.env.PORT || 3000;
 // ==========================================
 const oauthTokens = new Map(); // state -> { access_token, refresh_token, expires_at, user }
 
+// ---- the handful of things express was doing ----
+// Written against node's own http so the only package this service needs to boot
+// is ws. Every response stays permissive exactly as cors() left it, and a body is
+// capped because a POST to this port can come from anywhere.
+const MAX_BODY_BYTES = 64 * 1024;
+
+function respond(res, status, type, body) {
+    res.writeHead(status, {
+        'Content-Type': type,
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+    });
+    res.end(body);
+}
+
+function respondJson(res, status, obj) {
+    respond(res, status, 'application/json; charset=utf-8', JSON.stringify(obj));
+}
+
+function readBody(req, res, done) {
+    let raw = '';
+    let failed = false;
+    req.on('data', (chunk) => {
+        if (failed) return;
+        raw += chunk;
+        if (raw.length > MAX_BODY_BYTES) {
+            failed = true;
+            respondJson(res, 413, { error: "Body too large" });
+            req.destroy();
+        }
+    });
+    req.on('end', () => { if (!failed) done(raw); });
+    req.on('error', () => {});
+}
+
 // Health check endpoint
-app.get('/', (req, res) => {
-    res.json({
+function handleHealth(req, res) {
+    respondJson(res, 200, {
         status: "online",
         service: "Flame Strike Game Server",
         timestamp: new Date().toISOString()
     });
-});
+}
 
 // OAuth Callback from Supabase / Google
 // Supabase OAuth redirects with hash fragment (#access_token=...&refresh_token=...&state=...)
 // This page reads the hash and submits it back to the server
-app.get('/auth/callback', (req, res) => {
-    res.send(`
+function handleCallback(req, res) {
+    respond(res, 200, 'text/html; charset=utf-8', `
 <!DOCTYPE html>
 <html>
 <head>
@@ -76,49 +139,53 @@ app.get('/auth/callback', (req, res) => {
 </body>
 </html>
     `);
-});
+}
 
 // Internal endpoint to store extracted token
-app.post('/auth/save-token', (req, res) => {
-    const { state, access_token, refresh_token } = req.body;
-    console.log('[AUTH] Save-token called. State:', state, 'Token present:', !!access_token);
-    
-    if (access_token) {
-        const finalState = state || 'global_fallback';
-        oauthTokens.set(finalState, {
-            access_token,
-            refresh_token,
-            created_at: Date.now()
-        });
-        // Also store under global_fallback for Zero-State bridge
-        oauthTokens.set('global_fallback', {
-            access_token,
-            refresh_token,
-            created_at: Date.now()
-        });
-        // Auto cleanup after 5 minutes
-        setTimeout(() => {
-            oauthTokens.delete(finalState);
-            oauthTokens.delete('global_fallback');
-        }, 5 * 60 * 1000);
-        console.log('[AUTH] Token saved successfully for state:', finalState);
-        return res.json({ success: true });
-    }
-    res.status(400).json({ error: "Missing token" });
-});
+function handleSaveToken(req, res) {
+    readBody(req, res, (raw) => {
+        let body = {};
+        try { body = JSON.parse(raw || '{}'); } catch (err) { body = {}; }
+        const { state, access_token, refresh_token } = body;
+        console.log('[AUTH] Save-token called. State:', state, 'Token present:', !!access_token);
+
+        if (access_token) {
+            const finalState = state || 'global_fallback';
+            oauthTokens.set(finalState, {
+                access_token,
+                refresh_token,
+                created_at: Date.now()
+            });
+            // Also store under global_fallback for Zero-State bridge
+            oauthTokens.set('global_fallback', {
+                access_token,
+                refresh_token,
+                created_at: Date.now()
+            });
+            // Auto cleanup after 5 minutes
+            setTimeout(() => {
+                oauthTokens.delete(finalState);
+                oauthTokens.delete('global_fallback');
+            }, 5 * 60 * 1000);
+            console.log('[AUTH] Token saved successfully for state:', finalState);
+            respondJson(res, 200, { success: true });
+            return;
+        }
+        respondJson(res, 400, { error: "Missing token" });
+    });
+}
 
 // Godot polls this endpoint during login
-app.get('/auth/poll', (req, res) => {
-    const state = req.query.state;
+function handlePoll(req, res, state) {
     if (!state) {
-        return res.status(400).json({ error: "Missing state query param" });
+        return respondJson(res, 400, { error: "Missing state query param" });
     }
 
     // Try exact state match first
     if (oauthTokens.has(state)) {
         const tokenData = oauthTokens.get(state);
         oauthTokens.delete(state); // One-time use
-        return res.json({
+        return respondJson(res, 200, {
             access_token: tokenData.access_token,
             refresh_token: tokenData.refresh_token,
             pending: false
@@ -129,20 +196,38 @@ app.get('/auth/poll', (req, res) => {
     if (oauthTokens.has('global_fallback')) {
         const tokenData = oauthTokens.get('global_fallback');
         oauthTokens.delete('global_fallback'); // One-time use
-        return res.json({
+        return respondJson(res, 200, {
             access_token: tokenData.access_token,
             refresh_token: tokenData.refresh_token,
             pending: false
         });
     }
 
-    res.json({ pending: true });
-});
+    respondJson(res, 200, { pending: true });
+}
+
+// Everything that is not a websocket upgrade lands here: the four routes above,
+// and a plain 404 for the rest.
+function routeHttp(req, res) {
+    const path = String(req.url || '').split('?')[0];
+    if (req.method === 'OPTIONS') {
+        respond(res, 204, 'text/plain; charset=utf-8', '');
+        return;
+    }
+    if (req.method === 'GET' && path === '/') { handleHealth(req, res); return; }
+    if (req.method === 'GET' && path === '/auth/callback') { handleCallback(req, res); return; }
+    if (req.method === 'POST' && path === '/auth/save-token') { handleSaveToken(req, res); return; }
+    if (req.method === 'GET' && path === '/auth/poll') {
+        handlePoll(req, res, new URL(req.url, 'http://localhost').searchParams.get('state'));
+        return;
+    }
+    respondJson(res, 404, { error: "Not found" });
+}
 
 // ==========================================
 // 2. WEBSOCKET REAL-TIME MATCHMAKING
 // ==========================================
-const server = http.createServer(app);
+const server = http.createServer(routeHttp);
 const wss = new WebSocketServer({ server });
 
 // Mode queues: array of { ws, uid, team_size, character_id, username, player_uid }
@@ -399,14 +484,57 @@ function removeFromAllQueues(ws) {
 // ==========================================
 // 0. CROSS-SERVER: HUB AND RELAY
 // ==========================================
-// One deployment is the hub (Asia 1, no HUB_URL) and owns every team, queue and
-// room. The other seven run with HUB_URL set and forward every player packet to
-// the hub, so a player on Europe meets a player on Oceania exactly like two
-// players on the same server. On the hub a relayed player is a plain object
-// that mimics a socket (send/readyState), which is why the whole game engine
-// below works on both without knowing which one it holds.
-const HUB_URL = process.env.HUB_URL || "";
+// One deployment is the hub (Asia 1) and owns every team, queue and room. The
+// other seven forward every player packet to it, so a player on Europe meets a
+// player on Oceania exactly like two players on the same server. On the hub a
+// relayed player is a plain object that mimics a socket (send/readyState), which
+// is why the whole game engine below works on both without knowing which one it
+// holds.
+// The fleet runs this one file with no per-service configuration: each
+// deployment reads its own RENDER_EXTERNAL_URL, and the service whose address is
+// HUB_HOST becomes the hub while every other one links itself to it. An explicit
+// HUB_URL still wins, which is how the local test harness runs eight processes
+// on one machine.
+const HUB_HOST = String(process.env.HUB_HOST || "dark-ward-sever.onrender.com").trim().toLowerCase();
 const HUB_RECONNECT_MS = 3000;
+
+function hostOf(url) {
+    return String(url || "").trim().toLowerCase()
+        .replace(/^wss?:\/\//, "").replace(/^https?:\/\//, "")
+        .split("/")[0].split("@").pop();
+}
+
+// A scheme the ws client can dial, or "" - never a throw, because a typo in one
+// dashboard field was enough to crash-loop a deployment out of existence.
+function asWsUrl(url) {
+    const raw = String(url || "").trim();
+    if (raw === "") return "";
+    if (/^(wss|ws):\/\//i.test(raw)) return raw;
+    if (/^https?:\/\//i.test(raw)) return raw.replace(/^http/i, "ws");
+    return "";
+}
+
+const selfHost = hostOf(process.env.RENDER_EXTERNAL_URL || process.env.SERVICE_URL || "");
+const autoHubUrl = (selfHost !== "" && selfHost !== HUB_HOST) ? "wss://" + HUB_HOST : "";
+
+let HUB_URL = autoHubUrl;
+if (process.env.HUB_URL !== undefined) {
+    const clean = asWsUrl(process.env.HUB_URL);
+    if (clean === "" && String(process.env.HUB_URL).trim() !== "") {
+        // A typo in the dashboard must not split the fleet: fall back to what this
+        // service's own address says its role is instead of quietly going private.
+        console.warn(`[CONFIG] HUB_URL="${process.env.HUB_URL}" is not a ws(s):// address. ` +
+            (autoHubUrl === "" ? "Running as the hub." : `Relaying to ${autoHubUrl} instead.`));
+    } else {
+        HUB_URL = clean;
+    }
+}
+// The hub pointing at itself is a loop, not a link: a relayed packet would leave
+// this process and come straight back to it.
+if (HUB_URL !== "" && hostOf(HUB_URL) === selfHost) HUB_URL = "";
+
+const REGION_ID = String(process.env.REGION_ID || selfHost ||
+    ("region_" + PORT + "_" + Math.random().toString(36).slice(2, 8)));
 
 // ---- relay mode (this process forwards its players to the hub) ----
 const connsById = new Map(); // connId -> local player socket
@@ -415,14 +543,20 @@ let hubWs = null;
 let hubTimer = null;
 
 function connectToHub() {
+    if (HUB_URL === "") return;
     if (hubWs && (hubWs.readyState === WebSocket.OPEN || hubWs.readyState === WebSocket.CONNECTING)) return;
-    hubWs = new WebSocket(HUB_URL);
+    try {
+        hubWs = new WebSocket(HUB_URL);
+    } catch (err) {
+        console.error('[RELAY] cannot dial hub URL:', err.message);
+        hubWs = null;
+        clearTimeout(hubTimer);
+        hubTimer = setTimeout(connectToHub, HUB_RECONNECT_MS);
+        return;
+    }
     hubWs.on('open', () => {
-        console.log(`[RELAY] linked to hub ${HUB_URL}`);
-        hubWs.send(JSON.stringify({
-            type: "hub_register",
-            region_id: process.env.REGION_ID || ("region_" + PORT + "_" + Math.random().toString(36).slice(2, 8))
-        }));
+        console.log(`[RELAY] linked to hub ${HUB_URL} as ${REGION_ID}`);
+        hubWs.send(JSON.stringify({ type: "hub_register", region_id: REGION_ID }));
         // Players who joined while the link was down are announced again.
         for (const ws of wss.clients) {
             if (!ws.isRegion && ws.connId) {
@@ -441,10 +575,31 @@ function connectToHub() {
     hubWs.on('close', () => {
         console.log('[RELAY] hub link dropped, retrying...');
         hubWs = null;
+        wakeHub();
         clearTimeout(hubTimer);
         hubTimer = setTimeout(connectToHub, HUB_RECONNECT_MS);
     });
     hubWs.on('error', () => {});
+}
+
+// The hub is the one service every region depends on, and a free instance sleeps
+// when nobody is knocking. A relay's own socket attempt does not wake it, so this
+// plain HTTP GET to its health root does - at most once a minute.
+let lastWakeAt = 0;
+
+function wakeHub() {
+    if (HUB_URL === "") return;
+    const now = Date.now();
+    if (now - lastWakeAt < 60000) return;
+    lastWakeAt = now;
+    try {
+        const host = hostOf(HUB_URL);
+        const req = http.get({ host: host, path: "/", timeout: 5000 }, (res) => res.resume());
+        req.on('error', () => {});
+        req.on('timeout', () => req.destroy());
+    } catch (err) {
+        console.error('[RELAY] hub wake-up failed:', err.message);
+    }
 }
 
 function relayToHub(ws, data) {
@@ -2631,8 +2786,18 @@ server.listen(PORT, () => {
     console.log(`===========================================`);
     console.log(`Flame Strike Server listening on port ${PORT}`);
     console.log(`WebSocket: ws://localhost:${PORT}`);
+    console.log(`Role: ${HUB_URL === "" ? "HUB (owns every queue, team and room)" : "RELAY -> " + HUB_URL}`);
+    console.log(`Region id: ${REGION_ID}`);
     console.log(`===========================================`);
     if (HUB_URL !== "") {
+        wakeHub();
         connectToHub();
+    }
+});
+
+server.on('error', (err) => {
+    console.error(`[BOOT] cannot listen on port ${PORT}: ${err.message}`);
+    if (err.code === 'EADDRINUSE') {
+        console.error('[BOOT] another process already owns this port.');
     }
 });
