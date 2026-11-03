@@ -396,82 +396,245 @@ function removeFromAllQueues(ws) {
     }
 }
 
+// ==========================================
+// 0. CROSS-SERVER: HUB AND RELAY
+// ==========================================
+// One deployment is the hub (Asia 1, no HUB_URL) and owns every team, queue and
+// room. The other seven run with HUB_URL set and forward every player packet to
+// the hub, so a player on Europe meets a player on Oceania exactly like two
+// players on the same server. On the hub a relayed player is a plain object
+// that mimics a socket (send/readyState), which is why the whole game engine
+// below works on both without knowing which one it holds.
+const HUB_URL = process.env.HUB_URL || "";
+const HUB_RECONNECT_MS = 3000;
+
+// ---- relay mode (this process forwards its players to the hub) ----
+const connsById = new Map(); // connId -> local player socket
+let relayConnCounter = 0;
+let hubWs = null;
+let hubTimer = null;
+
+function connectToHub() {
+    if (hubWs && (hubWs.readyState === WebSocket.OPEN || hubWs.readyState === WebSocket.CONNECTING)) return;
+    hubWs = new WebSocket(HUB_URL);
+    hubWs.on('open', () => {
+        console.log(`[RELAY] linked to hub ${HUB_URL}`);
+        hubWs.send(JSON.stringify({
+            type: "hub_register",
+            region_id: process.env.REGION_ID || ("region_" + PORT + "_" + Math.random().toString(36).slice(2, 8))
+        }));
+        // Players who joined while the link was down are announced again.
+        for (const ws of wss.clients) {
+            if (!ws.isRegion && ws.connId) {
+                hubWs.send(JSON.stringify({ type: "relay_open", conn: ws.connId }));
+            }
+        }
+    });
+    hubWs.on('message', (message) => {
+        let data;
+        try { data = JSON.parse(message.toString()); } catch (e) { return; }
+        if (data.type === "hub_to") {
+            const target = connsById.get(String(data.conn));
+            if (target && target.readyState === WebSocket.OPEN) target.send(String(data.data));
+        }
+    });
+    hubWs.on('close', () => {
+        console.log('[RELAY] hub link dropped, retrying...');
+        hubWs = null;
+        clearTimeout(hubTimer);
+        hubTimer = setTimeout(connectToHub, HUB_RECONNECT_MS);
+    });
+    hubWs.on('error', () => {});
+}
+
+function relayToHub(ws, data) {
+    if (!hubWs || hubWs.readyState !== WebSocket.OPEN) return;
+    hubWs.send(JSON.stringify({ type: "relay_msg", conn: ws.connId, data: data }));
+}
+
+// ---- hub mode (this process owns the game and hears every region) ----
+const regionLinks = new Map(); // regionId -> { ws, peers: Map(connId -> peer) }
+let regionCounter = 0;
+
+function makePeer(regionId, connId) {
+    const link = regionLinks.get(regionId);
+    const peer = {
+        __peer: true,
+        regionId: regionId,
+        connId: connId,
+        readyState: 1, // WebSocket.OPEN
+        isAlive: true,
+        send: (text) => {
+            const l = regionLinks.get(regionId);
+            if (l && l.ws.readyState === WebSocket.OPEN) {
+                l.ws.send(JSON.stringify({ type: "hub_to", conn: connId, data: text }));
+            }
+        }
+    };
+    if (link) {
+        if (link.peers.has(connId)) return link.peers.get(connId);
+        link.peers.set(connId, peer);
+    }
+    return peer;
+}
+
+function registerRegion(ws, data) {
+    const regionId = String(data.region_id || ("region_" + (++regionCounter)));
+    ws.isRegion = true;
+    ws.regionId = regionId;
+    if (regionLinks.has(regionId)) {
+        // The same id linking twice means the old socket is a zombie of a
+        // half-dropped link: retire it so its close handler frees nothing twice.
+        try { regionLinks.get(regionId).ws.close(); } catch (e) {}
+    }
+    regionLinks.set(regionId, { ws: ws, peers: new Map() });
+    console.log(`[HUB] region ${regionId} linked`);
+}
+
+function handleRegionControl(ws, data) {
+    const link = regionLinks.get(ws.regionId);
+    if (!link) return;
+    if (data.type === "relay_open") {
+        makePeer(ws.regionId, String(data.conn));
+        console.log(`[HUB] player ${data.conn} opened on ${ws.regionId}`);
+    } else if (data.type === "relay_msg") {
+        const peer = link.peers.get(String(data.conn));
+        if (!peer) return;
+        try {
+            handleClientMessage(peer, data.data);
+        } catch (err) {
+            console.error('[HUB] relayed message error:', err);
+        }
+    } else if (data.type === "relay_close") {
+        const peer = link.peers.get(String(data.conn));
+        if (peer) {
+            link.peers.delete(String(data.conn));
+            dropPeer(peer);
+        }
+    }
+}
+
+function dropRegionLink(ws) {
+    const link = regionLinks.get(ws.regionId);
+    if (!link) return;
+    regionLinks.delete(ws.regionId);
+    for (const peer of link.peers.values()) dropPeer(peer);
+    console.log(`[HUB] region ${ws.regionId} dropped (${link.peers.size} players released)`);
+}
+
 wss.on('connection', (ws) => {
-    console.log('[WS] New player connected');
+    console.log('[WS] New connection');
     ws.isAlive = true;
+    ws.isRegion = false;
+    ws.regionId = "";
+    if (HUB_URL !== "") {
+        ws.connId = "c" + (++relayConnCounter);
+        connsById.set(ws.connId, ws);
+    }
+    let firstMsg = true;
 
     ws.on('pong', () => {
         ws.isAlive = true;
     });
 
     ws.on('message', (message) => {
+        let data;
         try {
-            const data = JSON.parse(message.toString());
-            handleClientMessage(ws, data);
+            data = JSON.parse(message.toString());
         } catch (err) {
             console.error('[WS ERROR] Failed to parse message:', err);
+            return;
         }
+        // A relay's first frame is its handshake; anything else is a player.
+        if (firstMsg) {
+            firstMsg = false;
+            if (HUB_URL === "" && data.type === "hub_register") {
+                registerRegion(ws, data);
+                return;
+            }
+        }
+        if (ws.isRegion) { handleRegionControl(ws, data); return; }
+        if (HUB_URL !== "") { relayToHub(ws, data); return; }
+        handleClientMessage(ws, data);
     });
 
     ws.on('close', () => {
-        console.log('[WS] Player disconnected');
-        if (ws.playerUid && clientsByUid.get(ws.playerUid) === ws) {
-            clientsByUid.delete(ws.playerUid);
-        }
-        removeFromAllQueues(ws);
-        leaveTeam(ws);
-        // Everyone still waiting sees their pool shrink instead of counting a
-        // closed socket toward the required body count.
-        broadcastAllPools();
-
-        if (ws.matchId && matches.has(ws.matchId)) {
-            const room = matches.get(ws.matchId);
-            const gone = room.entries.find(e => e.ws === ws);
-
-            if (room.game && room.game.phase !== "finished") {
-                // Loaded arenas are the only way a match starts, so a player who
-                // drops out beforehand releases the rest instead of freezing them.
-                if (room.game.phase === "waiting") {
-                    cancelMummyWaiting(room);
-                    return;
-                }
-                // Walking out of a live match is a forfeit, whatever the round was
-                // doing: the side still in the arena takes the match outright, so
-                // nobody is left fighting a ghost until the clock runs out. But a
-                // dropped phone is not necessarily a walk-out - mobile nets flap -
-                // so the entry stays seated, marked gone, for RECONNECT_GRACE_MS.
-                // The room forfeits only if the player never comes back.
-                if (gone) {
-                    gone.gone = true;
-                    room.players = room.players.filter(other => other !== ws);
-                    const txt = JSON.stringify({
-                        type: "player_disconnected",
-                        player_uid: gone.uid,
-                        spawn_index: gone.spawnIndex
-                    });
-                    for (const otherWs of room.players) {
-                        if (otherWs.readyState === WebSocket.OPEN) otherWs.send(txt);
-                    }
-                    armGraceTimer(room);
-                    return;
-                }
+        if (ws.isRegion) { dropRegionLink(ws); return; }
+        if (HUB_URL !== "") {
+            connsById.delete(ws.connId);
+            if (hubWs && hubWs.readyState === WebSocket.OPEN) {
+                hubWs.send(JSON.stringify({ type: "relay_close", conn: ws.connId }));
             }
-
-            room.players = room.players.filter(other => other !== ws);
-            room.entries = room.entries.filter(e => e.ws !== ws);
-            const txt = JSON.stringify({
-                type: "player_disconnected",
-                player_uid: gone ? gone.uid : "",
-                spawn_index: gone ? gone.spawnIndex : -1
-            });
-            for (const otherWs of room.players) {
-                if (otherWs.readyState === WebSocket.OPEN) otherWs.send(txt);
-            }
-            // A shared room only closes once nobody is left in it.
-            if (room.players.length === 0) matches.delete(ws.matchId);
+            return;
         }
+        dropPeer(ws);
     });
+
+    if (HUB_URL !== "" && hubWs && hubWs.readyState === WebSocket.OPEN) {
+        hubWs.send(JSON.stringify({ type: "relay_open", conn: ws.connId }));
+    }
 });
+
+// A player left, on a real socket or through a dropped region link: every
+// queue, team and room this body was part of hears about it exactly once.
+function dropPeer(ws) {
+    console.log('[WS] Player disconnected');
+    if (ws.playerUid && clientsByUid.get(ws.playerUid) === ws) {
+        clientsByUid.delete(ws.playerUid);
+    }
+    removeFromAllQueues(ws);
+    leaveTeam(ws);
+    // Everyone still waiting sees their pool shrink instead of counting a
+    // closed socket toward the required body count.
+    broadcastAllPools();
+
+    if (ws.matchId && matches.has(ws.matchId)) {
+        const room = matches.get(ws.matchId);
+        const gone = room.entries.find(e => e.ws === ws);
+
+        if (room.game && room.game.phase !== "finished") {
+            // Loaded arenas are the only way a match starts, so a player who
+            // drops out beforehand releases the rest instead of freezing them.
+            if (room.game.phase === "waiting") {
+                cancelMummyWaiting(room);
+                return;
+            }
+            // Walking out of a live match is a forfeit, whatever the round was
+            // doing: the side still in the arena takes the match outright, so
+            // nobody is left fighting a ghost until the clock runs out. But a
+            // dropped phone is not necessarily a walk-out - mobile nets flap -
+            // so the entry stays seated, marked gone, for RECONNECT_GRACE_MS.
+            // The room forfeits only if the player never comes back.
+            if (gone) {
+                gone.gone = true;
+                room.players = room.players.filter(other => other !== ws);
+                const txt = JSON.stringify({
+                    type: "player_disconnected",
+                    player_uid: gone.uid,
+                    spawn_index: gone.spawnIndex
+                });
+                for (const otherWs of room.players) {
+                    if (otherWs.readyState === WebSocket.OPEN) otherWs.send(txt);
+                }
+                armGraceTimer(room);
+                return;
+            }
+        }
+
+        room.players = room.players.filter(other => other !== ws);
+        room.entries = room.entries.filter(e => e.ws !== ws);
+        const txt = JSON.stringify({
+            type: "player_disconnected",
+            player_uid: gone ? gone.uid : "",
+            spawn_index: gone ? gone.spawnIndex : -1
+        });
+        for (const otherWs of room.players) {
+            if (otherWs.readyState === WebSocket.OPEN) otherWs.send(txt);
+        }
+        // A shared room only closes once nobody is left in it.
+        if (room.players.length === 0) matches.delete(ws.matchId);
+    }
+}
 
 function makeRoom(mode, sides) {
     // One shared room for the whole opposing set: 1v1 = 2 players, 2v2 = 4,
@@ -2469,4 +2632,7 @@ server.listen(PORT, () => {
     console.log(`Flame Strike Server listening on port ${PORT}`);
     console.log(`WebSocket: ws://localhost:${PORT}`);
     console.log(`===========================================`);
+    if (HUB_URL !== "") {
+        connectToHub();
+    }
 });
