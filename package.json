@@ -7,8 +7,6 @@
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "ws": "^8.17.0",
-    "cors": "^2.8.5"
+    "ws": "8.22.0"
   }
 }
