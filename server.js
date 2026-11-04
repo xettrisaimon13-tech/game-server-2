@@ -309,6 +309,230 @@ function memberInfo(m) {
     };
 }
 
+// ---- Bot helpers ----
+function isBotPeer(ws) {
+    return !!ws && ws.__bot === true;
+}
+
+function randomChoice(arr) {
+    return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function makeBotPeer() {
+    const id = "bot_" + (botCounter++);
+    const peer = {
+        __bot: true,
+        readyState: 1,
+        isAlive: true,
+        playerUid: id,
+        botId: id,
+        matchId: null,
+        matchUid: id,
+        matchSpawnIndex: -1,
+        teamId: null,
+        send: () => {},
+        close: () => {}
+    };
+    return peer;
+}
+
+function makeBotIdentity() {
+    return {
+        playerUid: "",
+        username: "",
+        characterId: 1,
+        bundleId: -1
+    };
+}
+
+function setBotIdentity(peer) {
+    peer.playerUid = peer.botId;
+    peer.botName = randomChoice(BOT_NAMES) + " " + peer.botId.split("_")[1];
+    peer.botCharacterId = randomChoice(BOT_CHARACTERS);
+    peer.botBundleId = randomChoice(BOT_BUNDLES);
+}
+
+function makeBotQueueEntry(mode, slot) {
+    const peer = makeBotPeer();
+    setBotIdentity(peer);
+    return {
+        ws: peer,
+        mode: mode,
+        slot: slot,
+        teamSize: 1,
+        characterId: peer.botCharacterId,
+        bundleId: peer.botBundleId,
+        username: peer.botName,
+        playerUid: peer.botId,
+        queuedAt: Date.now()
+    };
+}
+
+function makeBotTeamGroup(mode, slot) {
+    const members = [];
+    for (let i = 0; i < slot; i++) {
+        members.push(makeBotQueueEntry(mode, slot));
+    }
+    return {
+        teamId: "bot_team_" + (botCounter++),
+        mode: mode,
+        slot: slot,
+        teamSize: slot,
+        isBot: true,
+        queuedAt: Date.now(),
+        members: members
+    };
+}
+
+function botFillDelay() {
+    const base = BOT_FILL_MS;
+    // Tests pin the delay to a very small number; keep them deterministic.
+    if (base <= 1000) return base;
+    return base + Math.floor(Math.random() * BOT_FILL_JITTER_MS);
+}
+
+function spawnPointFor(mode, index) {
+    if (mode === ZOMBIE_MODE) return ZOMBIE_SPAWN_POINTS[index] || { x: 0, y: 1, z: 0 };
+    return MUMMY_SPAWN_POINTS[index] || { x: 0, y: 6.55, z: 0 };
+}
+
+function initBotEntry(room, entry) {
+    if (!isBotPeer(entry.ws)) return;
+    entry.uid = entry.ws.botId;
+    entry.username = entry.ws.botName;
+    entry.characterId = entry.ws.botCharacterId;
+    entry.bundleId = entry.ws.botBundleId;
+    entry.pos = Object.assign({}, spawnPointFor(room.mode, entry.spawnIndex));
+    entry.bot = {
+        nextAttackAt: 0,
+        nextMoveAt: 0,
+        // Two bodies built on identical constants move in lockstep and read as
+        // machines, so each one gets its own pace and a heading that drifts.
+        // These are the only extra numbers the AI carries.
+        speedMul: 0.86 + Math.random() * 0.26,
+        wobble: (Math.random() - 0.5) * 0.4
+    };
+}
+
+function resetBotPositions(room) {
+    for (const e of room.entries) {
+        if (!isBotPeer(e.ws)) continue;
+        e.pos = Object.assign({}, spawnPointFor(room.mode, e.spawnIndex));
+        if (e.bot) e.bot.nextAttackAt = 0;
+    }
+}
+
+function removeBotsFromQueue(mode, slot) {
+    let removed = 0;
+    queues[mode] = queues[mode].filter(e => {
+        if (e.slot === slot && isBotPeer(e.ws)) { removed++; return false; }
+        return true;
+    });
+    teamQueues[mode] = teamQueues[mode].filter(g => {
+        if (g.slot === slot && g.isBot) { removed += g.members.length; return false; }
+        return true;
+    });
+    return removed;
+}
+
+// A bot is only ever borrowed to finish a match a real player is waiting for.
+// Once that player cancels or drops, the seat they were filling is not owed to
+// anybody, so the bots go back in the box instead of pairing into a match
+// nobody is watching.
+function evictOrphanBots() {
+    for (const mode of [MUMMY_MODE, ZOMBIE_MODE]) {
+        for (const slot of TEAM_SLOTS) {
+            const realWaiting = queues[mode].some(e => e.slot === slot && !isBotPeer(e.ws) && queueEntryUsable(e, mode, slot));
+            const realTeam = teamQueues[mode].some(g => g.slot === slot && !g.isBot && g.members.every(m => queueEntryUsable(m, mode, slot)));
+            if (!realWaiting && !realTeam) {
+                if (removeBotsFromQueue(mode, slot) > 0) {
+                    console.log(`[BOT] Cleared bots left waiting alone in ${mode} slot ${slot}`);
+                }
+            }
+        }
+    }
+}
+
+function countRealQueueEntries(mode, slot) {
+    return queues[mode].filter(e => e.slot === slot && !isBotPeer(e.ws) && queueEntryUsable(e, mode, slot)).length;
+}
+
+function countRealTeamGroups(mode, slot) {
+    return teamQueues[mode].filter(g => g.slot === slot && !g.isBot && g.members.every(m => queueEntryUsable(m, mode, slot))).length;
+}
+
+function oldestRealQueueTime(mode, slot) {
+    let oldest = 0;
+    for (const e of queues[mode]) {
+        if (e.slot === slot && !isBotPeer(e.ws) && queueEntryUsable(e, mode, slot)) {
+            if (oldest === 0 || e.queuedAt < oldest) oldest = e.queuedAt;
+        }
+    }
+    return oldest;
+}
+
+function oldestRealTeamTime(mode, slot) {
+    let oldest = 0;
+    for (const g of teamQueues[mode]) {
+        if (g.slot === slot && !g.isBot && g.members.every(m => queueEntryUsable(m, mode, slot))) {
+            if (oldest === 0 || g.queuedAt < oldest) oldest = g.queuedAt;
+        }
+    }
+    return oldest;
+}
+
+function fillBotsIfNeeded() {
+    const now = Date.now();
+    evictOrphanBots();
+    for (const mode of [MUMMY_MODE, ZOMBIE_MODE]) {
+        for (const slot of TEAM_SLOTS) {
+            const need = slot * 2;
+
+            // Solo queue: evict bots if real players are now enough.
+            if (countRealQueueEntries(mode, slot) >= need) {
+                if (removeBotsFromQueue(mode, slot) > 0) {
+                    console.log(`[BOT] Evicted bots from ${mode} slot ${slot}: real players filled up`);
+                }
+                continue;
+            }
+
+            const realCount = countRealQueueEntries(mode, slot);
+            const waiting = queues[mode].filter(e => e.slot === slot && queueEntryUsable(e, mode, slot));
+            if (realCount === 0 || waiting.length >= need) continue;
+
+            const oldest = oldestRealQueueTime(mode, slot);
+            if (oldest === 0 || now - oldest < botFillDelay()) continue;
+
+            const missing = need - realCount;
+            for (let i = 0; i < missing; i++) {
+                queues[mode].push(makeBotQueueEntry(mode, slot));
+            }
+            console.log(`[BOT] Added ${missing} bots to ${mode} slot ${slot}`);
+            processSoloQueue(mode);
+        }
+
+        // Zombie and party-sized mummy modes also use the team queue.
+        for (const slot of TEAM_SLOTS) {
+            const realGroups = countRealTeamGroups(mode, slot);
+            if (realGroups >= 2) {
+                if (removeBotsFromQueue(mode, slot) > 0) {
+                    console.log(`[BOT] Evicted bot team from ${mode} slot ${slot}: real teams filled up`);
+                }
+                continue;
+            }
+            const waitingGroups = teamQueues[mode].filter(g => g.slot === slot && g.members.every(m => queueEntryUsable(m, mode, slot)));
+            if (realGroups === 0 || waitingGroups.length >= 2) continue;
+
+            const oldest = oldestRealTeamTime(mode, slot);
+            if (oldest === 0 || Date.now() - oldest < botFillDelay()) continue;
+
+            teamQueues[mode].push(makeBotTeamGroup(mode, slot));
+            console.log(`[BOT] Added bot team to ${mode} slot ${slot}`);
+            processTeamQueue(mode);
+        }
+    }
+}
+
 // Clients attach their identity (UID, name, equipped character) to every team
 // message, so a player who equips or buys a character while already in a party —
 // or while queued — is carried with their new model instead of the one they
@@ -733,6 +957,10 @@ wss.on('connection', (ws) => {
 // A player left, on a real socket or through a dropped region link: every
 // queue, team and room this body was part of hears about it exactly once.
 function dropPeer(ws) {
+    // A bot is a server-side body: it has no socket to close, so a disconnect
+    // path must never run its queue/team cleanup and free a seat out of a live
+    // room.
+    if (isBotPeer(ws)) return;
     console.log('[WS] Player disconnected');
     if (ws.playerUid && clientsByUid.get(ws.playerUid) === ws) {
         clientsByUid.delete(ws.playerUid);
@@ -844,13 +1072,21 @@ function makeRoom(mode, sides) {
     });
 
     const room = {
-        players: entries.map(e => e.ws),
+        players: entries.filter(e => !isBotPeer(e.ws)).map(e => e.ws),
         mode: mode,
         matchId: matchId,
         entries: entries
     };
+    for (const e of entries) {
+        if (isBotPeer(e.ws)) {
+            initBotEntry(room, e);
+            e.ws.matchId = matchId;
+            e.ws.matchUid = e.uid;
+            e.ws.matchSpawnIndex = e.spawnIndex;
+        }
+    }
     matches.set(matchId, room);
-    console.log(`[MATCH FOUND] ${entries.length} players in ${matchId} for ${mode} (${sides.map(s => s.teamId || 'solo').join(' vs ')})`);
+    console.log(`[MATCH FOUND] ${entries.length} bodies in ${matchId} for ${mode} (${sides.map(s => s.teamId || 'solo').join(' vs ')})`);
 
     for (const self of entries) {
         const enemy = entries.find(e => e.side !== self.side) || null;
@@ -927,6 +1163,7 @@ function queueTeam(mode, team, slot) {
         mode: mode,
         slot: slot,
         teamSize: slot,
+        queuedAt: Date.now(),
         members: team.members.map(m => ({
             ws: m.ws,
             mode: mode,
@@ -1061,6 +1298,49 @@ const ZOMBIE_BREAK_MS = (parseInt(process.env.ZOMBIE_BREAK_SECONDS, 10) || 5) * 
 const ZOMBIE_ATTACK_RANGE = parseFloat(process.env.ZOMBIE_ATTACK_RANGE) || 2.6;
 const ZOMBIE_TEAM_NAMES = ["TEAM TIGER", "TEAM LION"];
 
+// ---- AI Bot players ----
+// Bots fill a queue only after real players have been waiting long enough and
+// only enough of them to complete the match. They are server-side peers: they
+// have a socket-like object (readyState, send, matchId, playerUid) so the room
+// engine treats them exactly like a remote player, but their movement and
+// attacks are driven by the tick below instead of a network frame.
+const BOT_NAMES = ["Shadow", "Viper", "Raven", "Ghost", "Frost", "Blaze"];
+const BOT_CHARACTERS = [1, 2, 3];
+const BOT_BUNDLES = [1, 2];
+const BOT_FILL_MS = parseInt(process.env.BOT_FILL_MS, 10) || 40000;   // the wait starts here
+const BOT_FILL_JITTER_MS = parseInt(process.env.BOT_FILL_JITTER_MS, 10) || 20000; // ...and lands inside 40-60s
+const BOT_TICK_MS = parseInt(process.env.BOT_TICK_MS, 10) || 100;
+const BOT_MOVE_BROADCAST_MS = parseInt(process.env.BOT_MOVE_BROADCAST_MS, 10) || 100;
+const BOT_ATTACK_COOLDOWN_MS = parseInt(process.env.BOT_ATTACK_COOLDOWN_MS, 10) || 900;
+const BOT_WALK_SPEED = parseFloat(process.env.BOT_WALK_SPEED) || 5.0;
+const BOT_RUN_SPEED = parseFloat(process.env.BOT_RUN_SPEED) || 7.0;
+const BOT_TURN_SPEED = parseFloat(process.env.BOT_TURN_SPEED) || 6.0; // radians/sec
+const BOT_ATTACK_RANGE = parseFloat(process.env.BOT_ATTACK_RANGE) || 2.2;
+const BOT_FLEE_START = parseFloat(process.env.BOT_FLEE_START) || 6.0;
+const BOT_CAUTION_RANGE = parseFloat(process.env.BOT_CAUTION_RANGE) || 12.0;
+const BOT_ARENA_RADIUS_MUMMY = parseFloat(process.env.BOT_ARENA_RADIUS_MUMMY) || 12.0;
+const BOT_ARENA_RADIUS_ZOMBIE = parseFloat(process.env.BOT_ARENA_RADIUS_ZOMBIE) || 11.0;
+let botCounter = 1;
+
+// Spawn seats measured from the authored arena scenes, so bots start exactly
+// where the client places a body with the same spawn_index.
+const MUMMY_SPAWN_POINTS = [
+    { x: -10.000, y: 6.55, z: 0.000 },
+    { x: 9.239, y: 6.55, z: -3.827 },
+    { x: -9.239, y: 6.55, z: -3.827 },
+    { x: 7.071, y: 6.55, z: -7.071 },
+    { x: -7.071, y: 6.55, z: -7.071 },
+    { x: 3.827, y: 6.55, z: -9.239 },
+    { x: -3.827, y: 6.55, z: -9.239 },
+    { x: 0.000, y: 6.55, z: -10.000 }
+];
+const ZOMBIE_RING_RADIUS = 11.0;
+const ZOMBIE_SPAWN_POINTS = [];
+for (let i = 0; i < 8; i++) {
+    const a = (i * 45) * Math.PI / 180;
+    ZOMBIE_SPAWN_POINTS.push({ x: Math.cos(a) * ZOMBIE_RING_RADIUS, y: 1.0, z: Math.sin(a) * ZOMBIE_RING_RADIUS });
+}
+
 // ---- Human side ability: Holographic Clones ----
 // Which character owns which ability is decided here, not in the client's CATALOG,
 // so a tampered message cannot hand a player an ability they never equipped. Keep
@@ -1121,6 +1401,18 @@ function mummyIdOf(entry) {
     return entry.uid !== "" ? String(entry.uid) : `slot_${entry.spawnIndex}`;
 }
 
+// The arena only starts once every seat reports the scene loaded. A bot has no
+// scene to load - it is born inside the room - so it counts as ready the moment
+// the room exists, otherwise the real players would wait on a seat that can
+// never answer.
+function markBotsReady(room) {
+    const g = room.game;
+    if (!g || !g.ready) return;
+    for (const e of room.entries) {
+        if (isBotPeer(e.ws)) g.ready.add(mummyIdOf(e));
+    }
+}
+
 function initMummyMatch(room) {
     const sideSize = room.entries.filter(e => e.side === 0).length;
     room.game = {
@@ -1146,6 +1438,7 @@ function initMummyMatch(room) {
     };
     resetMummyCombat(room);
     resetMummyAbilities(room);
+    markBotsReady(room);
     broadcastMummyState(room, true);
 }
 
@@ -1774,6 +2067,10 @@ function beginMummyRound(room, roundNumber) {
         g.roles[mummyIdOf(e)] = e.side === g.hunterSide ? "mummy" : "human";
     }
 
+    // Bots start every round back on their spawn seat, so a round break cannot
+    // leave them standing where the last round ended.
+    resetBotPositions(room);
+
     console.log(`[MUMMY] ${room.mode} round ${roundNumber}: ${Object.entries(g.roles).map(([id, r]) => `${id}=${r}`).join(" ")}`);
     broadcastMummyState(room, true);
 }
@@ -1943,6 +2240,7 @@ function initZombieMatch(room) {
         winnerSide: -1,
         endsAt: 0
     };
+    markBotsReady(room);
     broadcastZombieState(room, true);
 }
 
@@ -1966,6 +2264,7 @@ function beginZombieRound(room, roundNumber) {
         g.roles[mummyIdOf(first)] = "zombie";
         g.infected[mummyIdOf(first)] = true;
     }
+    resetBotPositions(room);
     console.log(`[ZOMBIE] ${room.matchId} round ${roundNumber}: ` +
         Object.entries(g.roles).map(([id, r]) => `${id}=${r}`).join(" "));
     broadcastZombieState(room, true);
@@ -2105,6 +2404,367 @@ function tickZombieMatches() {
         }
         if (g.phase !== "finished") broadcastZombieState(room, false);
     }
+}
+
+// ==========================================
+// 2.5 BOT AI
+// ==========================================
+// One 10 Hz pass over every live room. Each bot body runs a tiny state machine
+// (hunt, flee, or hold ground) and steps itself with the same metres-per-second
+// the arena uses, so the positions the room relays are continuous rather than
+// teleporting. Everything is plain arithmetic on the server's own tables - no
+// pathfinding grid, no per-frame allocation beyond a couple of scalars.
+function botYawTowards(fromPos, toPos) {
+    return Math.atan2(toPos.x - fromPos.x, toPos.z - fromPos.z);
+}
+
+function botAngleDelta(a, b) {
+    let d = b - a;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return d;
+}
+
+// A body that only ever travels at exactly one speed along exactly one line is
+// the walk that gives a bot away. Both costs are a multiply and an add.
+function botPace(b, speed) {
+    return speed * b.speedMul;
+}
+
+function botDrift(b, yaw) {
+    b.wobble += (Math.random() - 0.5) * 0.12;
+    if (b.wobble > 0.3) b.wobble = 0.3;
+    else if (b.wobble < -0.3) b.wobble = -0.3;
+    return yaw + b.wobble;
+}
+
+function botBodyAlive(room, id) {
+    const g = room.game;
+    if (!g) return false;
+    if (g.kind === "zombie") return true;
+    const c = g.combat[id];
+    return !!c && !c.downed && !c.eliminated;
+}
+
+// A body the phone has never reported a position for still occupies its spawn
+// seat, so it is seeded here rather than skipped: a mummy bot that could not see
+// a motionless human would stand next to them forever.
+function botNearest(room, entry, predicate) {
+    let best = null;
+    let bestDistance = Infinity;
+    for (const other of room.entries) {
+        if (other === entry || !predicate(other)) continue;
+        const target = botPositionOf(room, other);
+        if (!target) continue;
+        const d = flatDistance(entry.pos, target);
+        if (d < bestDistance) {
+            bestDistance = d;
+            best = other;
+        }
+    }
+    return best ? { entry: best, distance: bestDistance } : null;
+}
+
+// A real player who has never sent a movement frame has no server-side position
+// yet, so a bot aiming at them uses their spawn seat rather than the origin.
+function botPositionOf(room, entry) {
+    if (entry.pos) return entry.pos;
+    if (!isBotPeer(entry.ws)) {
+        entry.pos = Object.assign({}, spawnPointFor(room.mode, entry.spawnIndex));
+    }
+    return entry.pos;
+}
+
+function botSteer(room, entry, desiredYaw, speed, dt) {
+    const pos = entry.pos;
+    const delta = botAngleDelta(pos.yaw || 0, desiredYaw);
+    const maxTurn = BOT_TURN_SPEED * dt;
+    const turn = Math.abs(delta) < maxTurn ? delta : Math.sign(delta) * maxTurn;
+    const yaw = (pos.yaw || 0) + turn;
+    const radius = room.mode === ZOMBIE_MODE ? BOT_ARENA_RADIUS_ZOMBIE : BOT_ARENA_RADIUS_MUMMY;
+
+    let step = speed * dt;
+    let nx = pos.x + Math.sin(yaw) * step;
+    let nz = pos.z + Math.cos(yaw) * step;
+
+    // Keep the body inside the fighting ring: past the rim the steering flips to
+    // the centre instead of letting the bot walk off the world.
+    if (Math.sqrt(nx * nx + nz * nz) > radius) {
+        const inward = Math.atan2(-pos.x, -pos.z);
+        nx = pos.x + Math.sin(inward) * step;
+        nz = pos.z + Math.cos(inward) * step;
+    }
+
+    const separated = separateFromRoom(room, entry, nx, nz);
+    pos.x = separated.x;
+    pos.z = separated.z;
+    pos.yaw = yaw;
+    // A speed of 0 means "face them, do not step": the client picks its
+    // locomotion clip off this flag, so a swinging bot must not look like it
+    // is sprinting on the spot.
+    pos.moving = step > 0.0001;
+}
+
+function botBroadcastMove(room, entry, now) {
+    const b = entry.bot;
+    if (now < (b.nextMoveAt || 0)) return;
+    b.nextMoveAt = now + BOT_MOVE_BROADCAST_MS;
+    const pos = entry.pos;
+    const txt = JSON.stringify({
+        type: "player_move",
+        player_uid: entry.ws.matchUid || entry.uid,
+        spawn_index: entry.spawnIndex,
+        x: Math.round(pos.x * 1000) / 1000,
+        y: pos.y,
+        z: Math.round(pos.z * 1000) / 1000,
+        yaw: Math.round((pos.yaw || 0) * 1000) / 1000,
+        moving: !!pos.moving,
+        grounded: true
+    });
+    pos.moving = false;
+    for (const otherWs of room.players) {
+        if (otherWs !== entry.ws && otherWs.readyState === WebSocket.OPEN) otherWs.send(txt);
+    }
+}
+
+function botHuntTargetId(room, entry, role) {
+    const g = room.game;
+    // A hunter only ever goes for the enemy team: the mummy and zombie rules both
+    // refuse a hit on an ally, and chasing one would make a bot look stupid.
+    return botNearest(room, entry, (other) => {
+        if (other.side === entry.side) return false;
+        const id = mummyIdOf(other);
+        return g.roles[id] !== role && botBodyAlive(room, id) && !!botPositionOf(room, other);
+    });
+}
+
+function botFleeSource(room, entry) {
+    const g = room.game;
+    return botNearest(room, entry, (other) => {
+        if (other.side === entry.side) return false;
+        const id = mummyIdOf(other);
+        const role = g.roles[id];
+        return (role === "mummy" || role === "zombie") && botBodyAlive(room, id) && !!botPositionOf(room, other);
+    });
+}
+
+function botThink(room, entry, now, dt) {
+    const g = room.game;
+    const role = g.roles[mummyIdOf(entry)];
+    const b = entry.bot;
+
+    botPositionOf(room, entry);
+    if (!botBodyAlive(room, mummyIdOf(entry))) {
+        // Downed or eliminated: stand still so the state the client draws matches
+        // the seat the body was left at.
+        entry.pos.moving = false;
+        botBroadcastMove(room, entry, now);
+        return;
+    }
+
+    if (role === "mummy" || role === "zombie") {
+        const prey = botHuntTargetId(room, entry, role);
+        if (prey) {
+            const preyId = mummyIdOf(prey.entry);
+            if (prey.distance <= BOT_ATTACK_RANGE) {
+                // Face them and swing on the server's cooldown; a hit only lands
+                // once the reach re-check inside the authority passes.
+                botSteer(room, entry, botYawTowards(entry.pos, prey.entry.pos), 0, dt);
+                if (now >= b.nextAttackAt) {
+                    b.nextAttackAt = now + BOT_ATTACK_COOLDOWN_MS;
+                    if (g.kind === "zombie") {
+                        performZombieSwing(room, entry);
+                        performZombieAttack(room, entry, preyId);
+                    } else {
+                        performMummySwing(room, entry);
+                        performMummyAttack(room, entry, preyId);
+                    }
+                }
+            } else {
+                botSteer(room, entry, botDrift(b, botYawTowards(entry.pos, prey.entry.pos)), botPace(b, BOT_RUN_SPEED), dt);
+            }
+        } else {
+            entry.pos.moving = false;
+        }
+        botBroadcastMove(room, entry, now);
+        return;
+    }
+
+    // Human bot: keep away from the hunter, break line of sight by hugging the
+    // rim, and never walk into a second body.
+    const threat = botFleeSource(room, entry);
+    if (threat) {
+        const away = botYawTowards(threat.entry.pos, entry.pos);
+        if (threat.distance <= BOT_FLEE_START) {
+            botSteer(room, entry, botDrift(b, blendAwayFromCrowd(room, entry, away)), botPace(b, BOT_RUN_SPEED), dt);
+        } else if (threat.distance <= BOT_CAUTION_RANGE) {
+            // Not close enough to sprint, but do not stand facing them either:
+            // sidestep, which is what a player does while watching a mummy.
+            botSteer(room, entry, botDrift(b, blendAwayFromCrowd(room, entry, away + Math.PI / 2.4)), botPace(b, BOT_WALK_SPEED), dt);
+        } else {
+            // Safe: drift away from everybody and settle, which reads as camping.
+            const crowd = botNearest(room, entry, (other) => other.side === entry.side && botBodyAlive(room, mummyIdOf(other)));
+            const heading = crowd ? botYawTowards(crowd.entry.pos, entry.pos) : away;
+            botSteer(room, entry, botDrift(b, heading), botPace(b, BOT_WALK_SPEED) * 0.6, dt);
+        }
+    } else {
+        entry.pos.moving = false;
+    }
+    botBroadcastMove(room, entry, now);
+}
+
+// Two bots fleeing the same mummy would otherwise stack on one line; pushing
+// away from the nearest body of their own team splits them like real players
+// running to different cover.
+function blendAwayFromCrowd(room, entry, yaw) {
+    const crowd = botNearest(room, entry, (other) => other.side === entry.side
+        && botBodyAlive(room, mummyIdOf(other))
+        && flatDistance(entry.pos, botPositionOf(room, other)) < 2.2);
+    if (!crowd) return yaw;
+    const push = botYawTowards(crowd.entry.pos, entry.pos);
+    const delta = botAngleDelta(yaw, push);
+    return yaw + delta * 0.5;
+}
+
+function tickBots() {
+    const now = Date.now();
+    const dt = BOT_TICK_MS / 1000;
+    for (const room of matches.values()) {
+        const g = room.game;
+        if (!g || g.phase !== "playing" || g.settled) continue;
+        for (const entry of room.entries) {
+            if (!isBotPeer(entry.ws) || !entry.bot) continue;
+            try {
+                botThink(room, entry, now, dt);
+            } catch (err) {
+                console.error('[BOT] think failed:', err);
+            }
+        }
+    }
+}
+
+// ---- shared swing / hit authority ----
+// A real phone's `swing_start` and a bot's decision call exactly these four
+// functions, so one set of rules - role, alive check, shield, clone, range,
+// damage - decides every hit in the game no matter who proposed it.
+function performMummySwing(room, attacker) {
+    const g = room.game;
+    if (g.phase !== "playing" || g.settled) return false;
+    const attackerId = mummyIdOf(attacker);
+    if (g.roles[attackerId] !== "mummy") return false;
+    if (!mummyAlive(room, attackerId)) return false;
+
+    const swing = (g.swingSeq[attackerId] = (g.swingSeq[attackerId] || 0) + 1);
+    const clip = swing % 2 === 1 ? "Sword_Attack" : "Fighting_Left_Jab";
+    for (const e of room.entries) {
+        sendJson(e.ws, {
+            type: "attack_anim",
+            match_id: room.matchId,
+            player_id: attackerId,
+            clip: clip
+        });
+    }
+    return true;
+}
+
+function performMummyAttack(room, attacker, targetId) {
+    const g = room.game;
+    if (g.phase !== "playing" || g.settled) return false;
+
+    const attackerId = mummyIdOf(attacker);
+    if (g.roles[attackerId] !== "mummy") return false;
+    if (!mummyAlive(room, attackerId)) return false;
+
+    if (!room.entries.some(e => mummyIdOf(e) === targetId)) return false;
+    if (targetId === attackerId || g.roles[targetId] !== "human") return false;
+
+    const target = g.combat[targetId];
+    if (!target || target.downed || target.eliminated) return false;
+
+    // A dome standing over the body takes the swing first. However many
+    // teammates are inside it, one press is one hit on the shell.
+    const guardId = shieldCovering(room, targetId);
+    if (guardId !== "") {
+        landShieldHit(room, guardId, Date.now());
+        console.log(`[MUMMY] ${attackerId} hit ${guardId}'s shield instead of ${targetId} in ${room.matchId}`);
+        return true;
+    }
+
+    // A hologram standing between the catcher and the body it swung at
+    // takes the blow. Deciding it here rather than on the catcher's phone
+    // is what makes all eight screens agree on who was actually hit.
+    const targetEntry = room.entries.find(e => mummyIdOf(e) === targetId);
+    const baitId = cloneAbsorbing(room, attacker.pos, targetEntry ? targetEntry.pos : null);
+    if (baitId !== "") {
+        landCloneHit(room, baitId, Date.now());
+        console.log(`[MUMMY] ${attackerId} hit clone ${baitId} instead of ${targetId} in ${room.matchId}`);
+        return true;
+    }
+
+    // Apply damage
+    target.hp = Math.max(0, target.hp - MUMMY_DAMAGE_PER_HIT);
+    console.log(`[MUMMY] ${attackerId} hit ${targetId} for ${MUMMY_DAMAGE_PER_HIT} damage, HP now ${target.hp}`);
+
+    // Check if HP reached zero
+    if (target.hp <= 0) {
+        if (g.sideSize <= 1) {
+            // 1v1: HP=0 ends the round immediately
+            if (!eliminateMummyPlayer(room, targetId)) return true;
+            console.log(`[MUMMY] ${attackerId} caught ${targetId} out in ${room.matchId}`);
+            if (g.phase !== "finished") settleMummyRound(room, "mummy");
+        } else {
+            // 2v2+: HP=0 knocks down instead of eliminating
+            if (!downMummyPlayer(room, targetId)) return true;
+            console.log(`[MUMMY] ${attackerId} knocked ${targetId} down in ${room.matchId}`);
+            broadcastMummyState(room, true);
+        }
+    } else {
+        // Just damage, HP still > 0
+        broadcastMummyState(room, true);
+    }
+    return true;
+}
+
+function performZombieSwing(room, attacker) {
+    const g = room.game;
+    if (g.kind !== "zombie" || g.phase !== "playing" || g.settled) return false;
+    const attackerId = mummyIdOf(attacker);
+    if (g.roles[attackerId] !== "zombie") return false;
+
+    const swing = (g.swingSeq[attackerId] = (g.swingSeq[attackerId] || 0) + 1);
+    const clip = swing % 2 === 1 ? "Sword_Attack" : "Fighting_Left_Jab";
+    for (const e of room.entries) {
+        sendJson(e.ws, {
+            type: "attack_anim",
+            match_id: room.matchId,
+            player_id: attackerId,
+            clip: clip
+        });
+    }
+    return true;
+}
+
+function performZombieAttack(room, attacker, targetId) {
+    const g = room.game;
+    if (g.kind !== "zombie" || g.phase !== "playing" || g.settled) return false;
+
+    const attackerId = mummyIdOf(attacker);
+    if (g.roles[attackerId] !== "zombie") return false;
+
+    const target = room.entries.find(e => mummyIdOf(e) === targetId);
+    if (!target || targetId === attackerId || g.roles[targetId] !== "human") return false;
+
+    // The server owns the metre-stick as well as the infection: a swing at
+    // a body beyond arm plus a step of lag simply misses, on every screen.
+    if (flatDistance(attacker.pos, target.pos) > ZOMBIE_ATTACK_RANGE + 0.5) {
+        console.log(`[ZOMBIE] ${attackerId} swung at ${targetId} out of range in ${room.matchId}`);
+        return true;
+    }
+
+    if (infectZombie(room, attackerId, targetId)) {
+        broadcastZombieState(room, true);
+    }
+    return true;
 }
 
 function handleClientMessage(ws, data) {
@@ -2350,7 +3010,8 @@ function handleClientMessage(ws, data) {
                 characterId,
                 bundleId,
                 username,
-                playerUid
+                playerUid,
+                queuedAt: Date.now()
             });
             console.log(`[QUEUE] ${playerUid || "solo"} joined ${mode} slot ${slot}. Waiting: ${queues[mode].filter(e => e.slot === slot).length}/${slot * 2}`);
             processSoloQueue(mode);
@@ -2487,26 +3148,9 @@ function handleClientMessage(ws, data) {
         case 'swing_start': {
             const room = ws.matchId && matches.get(ws.matchId);
             if (!room || !room.game) break;
-
-            const g = room.game;
-            if (g.phase !== "playing" || g.settled) break;
-
             const attacker = room.entries.find(e => e.ws === ws);
             if (!attacker) break;
-            const attackerId = mummyIdOf(attacker);
-            if (g.roles[attackerId] !== "mummy") break;
-            if (!mummyAlive(room, attackerId)) break;
-
-            const swing = (g.swingSeq[attackerId] = (g.swingSeq[attackerId] || 0) + 1);
-            const clip = swing % 2 === 1 ? "Sword_Attack" : "Fighting_Left_Jab";
-            for (const e of room.entries) {
-                sendJson(e.ws, {
-                    type: "attack_anim",
-                    match_id: room.matchId,
-                    player_id: attackerId,
-                    clip: clip
-                });
-            }
+            performMummySwing(room, attacker);
             break;
         }
 
@@ -2516,64 +3160,9 @@ function handleClientMessage(ws, data) {
         case 'mummy_attack': {
             const room = ws.matchId && matches.get(ws.matchId);
             if (!room || !room.game) break;
-
-            const g = room.game;
-            if (g.phase !== "playing" || g.settled) break;
-
             const attacker = room.entries.find(e => e.ws === ws);
             if (!attacker) break;
-            const attackerId = mummyIdOf(attacker);
-            if (g.roles[attackerId] !== "mummy") break;
-            if (!mummyAlive(room, attackerId)) break;
-
-            const targetId = String(data.target_id || "");
-            if (!room.entries.some(e => mummyIdOf(e) === targetId)) break;
-            if (targetId === attackerId || g.roles[targetId] !== "human") break;
-
-            const target = g.combat[targetId];
-            if (!target || target.downed || target.eliminated) break;
-
-            // A dome standing over the body takes the swing first. However many
-            // teammates are inside it, one press is one hit on the shell.
-            const guardId = shieldCovering(room, targetId);
-            if (guardId !== "") {
-                landShieldHit(room, guardId, Date.now());
-                console.log(`[MUMMY] ${attackerId} hit ${guardId}'s shield instead of ${targetId} in ${room.matchId}`);
-                break;
-            }
-
-            // A hologram standing between the catcher and the body it swung at
-            // takes the blow. Deciding it here rather than on the catcher's phone
-            // is what makes all eight screens agree on who was actually hit.
-            const targetEntry = room.entries.find(e => mummyIdOf(e) === targetId);
-            const baitId = cloneAbsorbing(room, attacker.pos, targetEntry ? targetEntry.pos : null);
-            if (baitId !== "") {
-                landCloneHit(room, baitId, Date.now());
-                console.log(`[MUMMY] ${attackerId} hit clone ${baitId} instead of ${targetId} in ${room.matchId}`);
-                break;
-            }
-
-            // Apply damage
-            target.hp = Math.max(0, target.hp - MUMMY_DAMAGE_PER_HIT);
-            console.log(`[MUMMY] ${attackerId} hit ${targetId} for ${MUMMY_DAMAGE_PER_HIT} damage, HP now ${target.hp}`);
-
-            // Check if HP reached zero
-            if (target.hp <= 0) {
-                if (g.sideSize <= 1) {
-                    // 1v1: HP=0 ends the round immediately
-                    if (!eliminateMummyPlayer(room, targetId)) break;
-                    console.log(`[MUMMY] ${attackerId} caught ${targetId} out in ${room.matchId}`);
-                    if (g.phase !== "finished") settleMummyRound(room, "mummy");
-                } else {
-                    // 2v2+: HP=0 knocks down instead of eliminating
-                    if (!downMummyPlayer(room, targetId)) break;
-                    console.log(`[MUMMY] ${attackerId} knocked ${targetId} down in ${room.matchId}`);
-                    broadcastMummyState(room, true);
-                }
-            } else {
-                // Just damage, HP still > 0
-                broadcastMummyState(room, true);
-            }
+            performMummyAttack(room, attacker, String(data.target_id || ""));
             break;
         }
 
@@ -2583,54 +3172,18 @@ function handleClientMessage(ws, data) {
         case 'zombie_swing': {
             const room = ws.matchId && matches.get(ws.matchId);
             if (!room || !room.game || room.game.kind !== "zombie") break;
-
-            const g = room.game;
-            if (g.phase !== "playing" || g.settled) break;
-
             const attacker = room.entries.find(e => e.ws === ws);
             if (!attacker) break;
-            const attackerId = mummyIdOf(attacker);
-            if (g.roles[attackerId] !== "zombie") break;
-
-            const swing = (g.swingSeq[attackerId] = (g.swingSeq[attackerId] || 0) + 1);
-            const clip = swing % 2 === 1 ? "Sword_Attack" : "Fighting_Left_Jab";
-            for (const e of room.entries) {
-                sendJson(e.ws, {
-                    type: "attack_anim",
-                    match_id: room.matchId,
-                    player_id: attackerId,
-                    clip: clip
-                });
-            }
+            performZombieSwing(room, attacker);
             break;
         }
 
         case 'zombie_attack': {
             const room = ws.matchId && matches.get(ws.matchId);
             if (!room || !room.game || room.game.kind !== "zombie") break;
-
-            const g = room.game;
-            if (g.phase !== "playing" || g.settled) break;
-
             const attacker = room.entries.find(e => e.ws === ws);
             if (!attacker) break;
-            const attackerId = mummyIdOf(attacker);
-            if (g.roles[attackerId] !== "zombie") break;
-
-            const targetId = String(data.target_id || "");
-            const target = room.entries.find(e => mummyIdOf(e) === targetId);
-            if (!target || targetId === attackerId || g.roles[targetId] !== "human") break;
-
-            // The server owns the metre-stick as well as the infection: a swing at
-            // a body beyond arm plus a step of lag simply misses, on every screen.
-            if (flatDistance(attacker.pos, target.pos) > ZOMBIE_ATTACK_RANGE + 0.5) {
-                console.log(`[ZOMBIE] ${attackerId} swung at ${targetId} out of range in ${room.matchId}`);
-                break;
-            }
-
-            if (infectZombie(room, attackerId, targetId)) {
-                broadcastZombieState(room, true);
-            }
+            performZombieAttack(room, attacker, String(data.target_id || ""));
             break;
         }
 
@@ -2765,6 +3318,14 @@ function handleClientMessage(ws, data) {
 
 const mummyTick = setInterval(tickMummyMatches, 250);
 const zombieTick = setInterval(tickZombieMatches, 250);
+// Bot movement runs one step behind the rules tick, so a bot's position changes
+// are decided by the same tables that decide a hit, but sent at the 10 Hz the
+// arena interpolates at.
+const botTick = setInterval(tickBots, BOT_TICK_MS);
+// Waiting queues are re-checked twice a second; nothing else decides when a bot
+// may step in, so a queue with a real player arriving one second later keeps
+// their own match.
+const botFillTick = setInterval(fillBotsIfNeeded, 2000);
 
 const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
