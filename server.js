@@ -2948,6 +2948,101 @@ function botNearestStandableCell(arena, x, z) {
     return -1;
 }
 
+// The figure people actually want when they ask how much of the map a bot uses is
+// metres, not cells - and a cell count flatters it, because 331 m² spread over a
+// 25 m square means the longest route a bot can take is what matters. So the
+// shipped table is measured at boot: two sweeps of the same step rules
+// botPathCells uses give the corner-to-corner walk, one sweep per spawn seat gives
+// the farthest body a bot has to reach from where it starts, and the speeds at the
+// top of this file turn that into seconds. Printed instead of estimated, so the
+// number cannot drift away from the bytes that shipped.
+function arenaNavRange(arena, seats, label) {
+    const n = arena.n;
+    const sweep = (seed) => {
+        const d = new Int32Array(n * n).fill(-1);
+        const q = [seed];
+        let head = 0;
+        let far = seed;
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let minZ = Infinity;
+        let maxZ = -Infinity;
+        let maxR = 0;
+        d[seed] = 0;
+        while (head < q.length) {
+            const cur = q[head++];
+            const p = botCellCentre(arena, cur);
+            if (p.x < minX) minX = p.x;
+            if (p.x > maxX) maxX = p.x;
+            if (p.z < minZ) minZ = p.z;
+            if (p.z > maxZ) maxZ = p.z;
+            maxR = Math.max(maxR, Math.hypot(p.x, p.z));
+            const cf = botCellFeet(arena, cur);
+            const r = (cur / n) | 0;
+            const c = cur % n;
+            const around = [r > 0 ? cur - n : -1, r < n - 1 ? cur + n : -1,
+                c > 0 ? cur - 1 : -1, c < n - 1 ? cur + 1 : -1];
+            for (const nb of around) {
+                if (nb < 0 || d[nb] !== -1) continue;
+                const nf = botCellFeet(arena, nb);
+                if (nf === null || nf - cf > BOT_STEP_UP_M || cf - nf > BOT_STEP_DOWN_M) continue;
+                d[nb] = d[cur] + 1;
+                if (d[nb] > d[far]) far = nb;
+                q.push(nb);
+            }
+        }
+        return { far: far, count: q.length, maxCells: d[far], box: [minX, maxX, minZ, maxZ], maxR: maxR };
+    };
+    let start = -1;
+    let bestD = Infinity;
+    for (let r = 0; r < n; r++) {
+        for (let c = 0; c < n; c++) {
+            const x = -arena.half + c * arena.cell + arena.cell / 2;
+            const z = -arena.half + r * arena.cell + arena.cell / 2;
+            const d = x * x + z * z;
+            if (d >= bestD) continue;
+            const idx = r * n + c;
+            if (botCellFeet(arena, idx) === null) continue;
+            bestD = d;
+            start = idx;
+        }
+    }
+    if (start < 0) {
+        console.log(`[BOTNAV] ${label} range: no standable cell on the table at all`);
+        return null;
+    }
+    const a = sweep(start);
+    const b = sweep(a.far);
+    const diameter = b.maxCells * arena.cell;
+    const seatsOut = [];
+    if (seats && seats.length) {
+        let worst = 0;
+        let best = Infinity;
+        let reachedAll = true;
+        for (const s of seats) {
+            const idx = botNearestStandableCell(arena, s.x, s.z);
+            if (idx < 0) {
+                reachedAll = false;
+                continue;
+            }
+            const run = sweep(idx);
+            if (run.count < b.count) reachedAll = false;
+            const metres = run.maxCells * arena.cell;
+            best = Math.min(best, metres);
+            worst = Math.max(worst, metres);
+        }
+        seatsOut.push(`${best.toFixed(1)}-${worst.toFixed(1)} m from a spawn seat` +
+            `${reachedAll ? ", every seat reaching the whole floor" : " (a seat sees less than the middle does)"}`);
+    }
+    console.log(`[BOTNAV] ${label} range: ${b.count} walkable cells = ` +
+        `${(b.count * arena.cell * arena.cell).toFixed(1)} m² of floor, ` +
+        `x ${b.box[0].toFixed(2)}..${b.box[1].toFixed(2)} z ${b.box[2].toFixed(2)}..${b.box[3].toFixed(2)} ` +
+        `out to r ${b.maxR.toFixed(1)} m, ${diameter.toFixed(1)} m corner to corner on foot` +
+        ` = ${(diameter / BOT_RUN_SPEED).toFixed(1)} s at ${BOT_RUN_SPEED} m/s` +
+        `${seatsOut.length ? ", " + seatsOut.join(", ") : ""}`);
+    return { cells: b.count, square: b.count * arena.cell * arena.cell, diameter: diameter };
+}
+
 // One set of search buffers per arena, made at boot. The AI is single-threaded,
 // so two searches can never overlap, and `seen` carries a generation stamp
 // instead of being cleared - a repath touches the cells it walks, not 10,000.
@@ -4239,7 +4334,9 @@ function handleClientMessage(ws, data) {
 const mummyTick = setInterval(tickMummyMatches, 250);
 const zombieTick = setInterval(tickZombieMatches, 250);
 checkArena(BOT_ARENA_MUMMY, "mummy");
+arenaNavRange(BOT_ARENA_MUMMY, MUMMY_SPAWN_POINTS, "mummy");
 checkArena(BOT_ARENA_ZOMBIE, "zombie");
+arenaNavRange(BOT_ARENA_ZOMBIE, ZOMBIE_SPAWN_POINTS, "zombie");
 // Bot movement runs one step behind the rules tick, so a bot's position changes
 // are decided by the same tables that decide a hit, but sent at the 10 Hz the
 // arena interpolates at.
