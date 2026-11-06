@@ -309,288 +309,6 @@ function memberInfo(m) {
     };
 }
 
-// ---- Bot helpers ----
-function isBotPeer(ws) {
-    return !!ws && ws.__bot === true;
-}
-
-function randomChoice(arr) {
-    return arr[Math.floor(Math.random() * arr.length)];
-}
-
-function makeBotPeer() {
-    const id = "bot_" + (botCounter++);
-    const peer = {
-        __bot: true,
-        readyState: 1,
-        isAlive: true,
-        playerUid: id,
-        botId: id,
-        matchId: null,
-        matchUid: id,
-        matchSpawnIndex: -1,
-        teamId: null,
-        send: () => {},
-        close: () => {}
-    };
-    return peer;
-}
-
-function makeBotIdentity() {
-    return {
-        playerUid: "",
-        username: "",
-        characterId: 1,
-        bundleId: -1
-    };
-}
-
-function setBotIdentity(peer) {
-    peer.playerUid = peer.botId;
-    peer.botName = randomChoice(BOT_NAMES) + " " + peer.botId.split("_")[1];
-    peer.botCharacterId = randomChoice(BOT_CHARACTERS);
-    peer.botBundleId = randomChoice(BOT_BUNDLES);
-}
-
-function makeBotQueueEntry(mode, slot) {
-    const peer = makeBotPeer();
-    setBotIdentity(peer);
-    return {
-        ws: peer,
-        mode: mode,
-        slot: slot,
-        teamSize: 1,
-        characterId: peer.botCharacterId,
-        bundleId: peer.botBundleId,
-        username: peer.botName,
-        playerUid: peer.botId,
-        queuedAt: Date.now()
-    };
-}
-
-function makeBotTeamGroup(mode, slot) {
-    const members = [];
-    for (let i = 0; i < slot; i++) {
-        members.push(makeBotQueueEntry(mode, slot));
-    }
-    return {
-        teamId: "bot_team_" + (botCounter++),
-        mode: mode,
-        slot: slot,
-        teamSize: slot,
-        isBot: true,
-        queuedAt: Date.now(),
-        members: members
-    };
-}
-
-function botFillDelay() {
-    const base = BOT_FILL_MS;
-    // Tests pin the delay to a very small number; keep them deterministic.
-    if (base <= 1000) return base;
-    return base + Math.floor(Math.random() * BOT_FILL_JITTER_MS);
-}
-
-function spawnPointFor(mode, index) {
-    if (mode === ZOMBIE_MODE) return ZOMBIE_SPAWN_POINTS[index] || { x: 0, y: 1, z: 0 };
-    return MUMMY_SPAWN_POINTS[index] || { x: 0, y: 6.55, z: 0 };
-}
-
-// A bot starts on the floor the arena was measured with, not the spawn marker's
-// height: that marker is where the client drops a body before gravity takes it,
-// and the wire carries feet. Facing the middle of the ring is what a player does
-// between rounds.
-function botPlaceAtSpawn(room, entry) {
-    const seat = spawnPointFor(room.mode, entry.spawnIndex);
-    const arena = arenaFor(room.mode);
-    let x = seat.x;
-    let z = seat.z;
-    let feet = botFeetAt(arena, x, z);
-    if (feet === null) {
-        const cell = botNearestStandableCell(arena, x, z);
-        if (cell >= 0) {
-            const at = botCellCentre(arena, cell);
-            x = at.x;
-            z = at.z;
-            feet = botCellFeet(arena, cell);
-        }
-    }
-    entry.pos = { x: x, y: feet === null ? seat.y : feet, z: z, yaw: Math.atan2(-x, -z), moving: false };
-}
-
-function initBotEntry(room, entry) {
-    if (!isBotPeer(entry.ws)) return;
-    entry.uid = entry.ws.botId;
-    entry.username = entry.ws.botName;
-    entry.characterId = entry.ws.botCharacterId;
-    entry.bundleId = entry.ws.botBundleId;
-    botPlaceAtSpawn(room, entry);
-    entry.bot = {
-        nextAttackAt: 0,
-        nextMoveAt: 0,
-        // Two bodies built on identical constants move in lockstep and read as
-        // machines, so each one gets its own pace and a heading that drifts.
-        speedMul: 0.86 + Math.random() * 0.26,
-        wobble: (Math.random() - 0.5) * 0.4,
-        // Navigation state: the path being walked, when it was last rebuilt and
-        // the mark the stuck check measures from. Nothing else reads these.
-        path: null,
-        pathIndex: 0,
-        pathGoal: -1,
-        pathPartial: false,
-        partialEnd: null,
-        nextPathAt: 0,
-        unstickUntil: 0,
-        unstickSide: 0,
-        blockedTicks: 0,
-        // Progress-toward-aim stuck detection: the point the nav is heading for,
-        // when it was set, and how far the body was from it last window.
-        aim: null,
-        aimAt: 0,
-        progressAt: 0,
-        progressDist: -1,
-        noProgress: 0,
-        reachedPartial: false,
-        // Patrol state: the leg being walked and when to give up on it.
-        roam: null,
-        roamUntil: 0
-    };
-}
-
-function resetBotPositions(room) {
-    for (const e of room.entries) {
-        if (!isBotPeer(e.ws)) continue;
-        botPlaceAtSpawn(room, e);
-        if (e.bot) {
-            e.bot.nextAttackAt = 0;
-            e.bot.path = null;
-            e.bot.pathGoal = -1;
-            e.bot.pathPartial = false;
-            e.bot.partialEnd = null;
-            e.bot.unstickUntil = 0;
-            e.bot.blockedTicks = 0;
-            e.bot.aim = null;
-            e.bot.aimAt = 0;
-            e.bot.progressDist = -1;
-            e.bot.noProgress = 0;
-            e.bot.reachedPartial = false;
-            e.bot.roam = null;
-            e.bot.roamUntil = 0;
-        }
-    }
-}
-
-function removeBotsFromQueue(mode, slot) {
-    let removed = 0;
-    queues[mode] = queues[mode].filter(e => {
-        if (e.slot === slot && isBotPeer(e.ws)) { removed++; return false; }
-        return true;
-    });
-    teamQueues[mode] = teamQueues[mode].filter(g => {
-        if (g.slot === slot && g.isBot) { removed += g.members.length; return false; }
-        return true;
-    });
-    return removed;
-}
-
-// A bot is only ever borrowed to finish a match a real player is waiting for.
-// Once that player cancels or drops, the seat they were filling is not owed to
-// anybody, so the bots go back in the box instead of pairing into a match
-// nobody is watching.
-function evictOrphanBots() {
-    for (const mode of [MUMMY_MODE, ZOMBIE_MODE]) {
-        for (const slot of TEAM_SLOTS) {
-            const realWaiting = queues[mode].some(e => e.slot === slot && !isBotPeer(e.ws) && queueEntryUsable(e, mode, slot));
-            const realTeam = teamQueues[mode].some(g => g.slot === slot && !g.isBot && g.members.every(m => queueEntryUsable(m, mode, slot)));
-            if (!realWaiting && !realTeam) {
-                if (removeBotsFromQueue(mode, slot) > 0) {
-                    console.log(`[BOT] Cleared bots left waiting alone in ${mode} slot ${slot}`);
-                }
-            }
-        }
-    }
-}
-
-function countRealQueueEntries(mode, slot) {
-    return queues[mode].filter(e => e.slot === slot && !isBotPeer(e.ws) && queueEntryUsable(e, mode, slot)).length;
-}
-
-function countRealTeamGroups(mode, slot) {
-    return teamQueues[mode].filter(g => g.slot === slot && !g.isBot && g.members.every(m => queueEntryUsable(m, mode, slot))).length;
-}
-
-function oldestRealQueueTime(mode, slot) {
-    let oldest = 0;
-    for (const e of queues[mode]) {
-        if (e.slot === slot && !isBotPeer(e.ws) && queueEntryUsable(e, mode, slot)) {
-            if (oldest === 0 || e.queuedAt < oldest) oldest = e.queuedAt;
-        }
-    }
-    return oldest;
-}
-
-function oldestRealTeamTime(mode, slot) {
-    let oldest = 0;
-    for (const g of teamQueues[mode]) {
-        if (g.slot === slot && !g.isBot && g.members.every(m => queueEntryUsable(m, mode, slot))) {
-            if (oldest === 0 || g.queuedAt < oldest) oldest = g.queuedAt;
-        }
-    }
-    return oldest;
-}
-
-function fillBotsIfNeeded() {
-    const now = Date.now();
-    evictOrphanBots();
-    for (const mode of [MUMMY_MODE, ZOMBIE_MODE]) {
-        for (const slot of TEAM_SLOTS) {
-            const need = slot * 2;
-
-            // Solo queue: evict bots if real players are now enough.
-            if (countRealQueueEntries(mode, slot) >= need) {
-                if (removeBotsFromQueue(mode, slot) > 0) {
-                    console.log(`[BOT] Evicted bots from ${mode} slot ${slot}: real players filled up`);
-                }
-                continue;
-            }
-
-            const realCount = countRealQueueEntries(mode, slot);
-            const waiting = queues[mode].filter(e => e.slot === slot && queueEntryUsable(e, mode, slot));
-            if (realCount === 0 || waiting.length >= need) continue;
-
-            const oldest = oldestRealQueueTime(mode, slot);
-            if (oldest === 0 || now - oldest < botFillDelay()) continue;
-
-            const missing = need - realCount;
-            for (let i = 0; i < missing; i++) {
-                queues[mode].push(makeBotQueueEntry(mode, slot));
-            }
-            console.log(`[BOT] Added ${missing} bots to ${mode} slot ${slot}`);
-            processSoloQueue(mode);
-        }
-
-        // Zombie and party-sized mummy modes also use the team queue.
-        for (const slot of TEAM_SLOTS) {
-            const realGroups = countRealTeamGroups(mode, slot);
-            if (realGroups >= 2) {
-                if (removeBotsFromQueue(mode, slot) > 0) {
-                    console.log(`[BOT] Evicted bot team from ${mode} slot ${slot}: real teams filled up`);
-                }
-                continue;
-            }
-            const waitingGroups = teamQueues[mode].filter(g => g.slot === slot && g.members.every(m => queueEntryUsable(m, mode, slot)));
-            if (realGroups === 0 || waitingGroups.length >= 2) continue;
-
-            const oldest = oldestRealTeamTime(mode, slot);
-            if (oldest === 0 || Date.now() - oldest < botFillDelay()) continue;
-
-            teamQueues[mode].push(makeBotTeamGroup(mode, slot));
-            console.log(`[BOT] Added bot team to ${mode} slot ${slot}`);
-            processTeamQueue(mode);
-        }
-    }
-}
-
 // Clients attach their identity (UID, name, equipped character) to every team
 // message, so a player who equips or buys a character while already in a party —
 // or while queued — is carried with their new model instead of the one they
@@ -1015,10 +733,6 @@ wss.on('connection', (ws) => {
 // A player left, on a real socket or through a dropped region link: every
 // queue, team and room this body was part of hears about it exactly once.
 function dropPeer(ws) {
-    // A bot is a server-side body: it has no socket to close, so a disconnect
-    // path must never run its queue/team cleanup and free a seat out of a live
-    // room.
-    if (isBotPeer(ws)) return;
     console.log('[WS] Player disconnected');
     if (ws.playerUid && clientsByUid.get(ws.playerUid) === ws) {
         clientsByUid.delete(ws.playerUid);
@@ -1130,19 +844,11 @@ function makeRoom(mode, sides) {
     });
 
     const room = {
-        players: entries.filter(e => !isBotPeer(e.ws)).map(e => e.ws),
+        players: entries.map(e => e.ws),
         mode: mode,
         matchId: matchId,
         entries: entries
     };
-    for (const e of entries) {
-        if (isBotPeer(e.ws)) {
-            initBotEntry(room, e);
-            e.ws.matchId = matchId;
-            e.ws.matchUid = e.uid;
-            e.ws.matchSpawnIndex = e.spawnIndex;
-        }
-    }
     matches.set(matchId, room);
     console.log(`[MATCH FOUND] ${entries.length} bodies in ${matchId} for ${mode} (${sides.map(s => s.teamId || 'solo').join(' vs ')})`);
 
@@ -1184,34 +890,103 @@ function makeRoom(mode, sides) {
     return true;
 }
 
-// Teams queue as whole groups and only ever meet a group that asked for the
-// same mode and the same slot. Sizes are never mixed: a duo can only meet
-// another duo, a squad only a squad.
-function processTeamQueue(mode) {
-    if (!teamQueues[mode]) return;
-    let paired = true;
-    while (paired) {
-        paired = false;
-        const q = teamQueues[mode];
-        for (let i = 0; i < q.length && !paired; i++) {
-            for (let j = i + 1; j < q.length; j++) {
-                const a = q[i];
-                const b = q[j];
-                // Same queue key, same selected slot, and both parties are
-                // exactly as large as the slot they asked for. Anything else
-                // is a mismatch and must keep waiting.
-                if (a.slot !== b.slot) continue;
-                if (a.members.length !== a.slot || b.members.length !== b.slot) continue;
-                if (!a.members.every(m => queueEntryUsable(m, mode, a.slot))) continue;
-                if (!b.members.every(m => queueEntryUsable(m, mode, b.slot))) continue;
-                if (!makeRoom(mode, [a, b])) continue;
-                q.splice(j, 1);
-                q.splice(i, 1);
-                paired = true;
-                break;
+// ---- One queue, both pools ----
+// A search is keyed on (mode, slot) and nothing else: a party keeps its own
+// roster and seats a whole side, and the seats it left open are filled by the
+// players who searched that exact slot alone. Nothing is invented and nothing
+// is resized - a room opens only when every side is exactly the slot the players
+// themselves picked, so a pool that cannot reach slot * 2 real bodies just keeps
+// waiting. Fewest strangers first, so two parties that are already full meet
+// each other before a single one of their seats is handed to someone off the
+// street.
+function processMatchQueue(mode) {
+    if (!queues[mode] || !teamQueues[mode]) return;
+    for (const slot of TEAM_SLOTS) {
+        dropRepeatSoloEntries(mode, slot);
+        for (let guard = 0; guard < 16; guard++) {
+            const plan = planRoom(mode, slot);
+            if (!plan) break;
+            // makeRoom re-checks every socket, seat and side size one last time;
+            // a refusal leaves the whole pool exactly as it was.
+            if (!makeRoom(mode, plan.sides)) break;
+            for (const g of plan.groups) {
+                const idx = teamQueues[mode].indexOf(g);
+                if (idx !== -1) teamQueues[mode].splice(idx, 1);
+            }
+            for (const e of plan.solos) {
+                const idx = queues[mode].indexOf(e);
+                if (idx !== -1) queues[mode].splice(idx, 1);
             }
         }
     }
+    broadcastAllPools();
+}
+
+// The same body must never hold two seats in one pool: the newest search wins.
+function dropRepeatSoloEntries(mode, slot) {
+    const seen = new Set();
+    queues[mode] = queues[mode].filter(e => {
+        if (e.slot !== slot) return true;
+        if (seen.has(e.ws)) return false;
+        seen.add(e.ws);
+        return true;
+    });
+}
+
+function usableGroups(mode, slot) {
+    return teamQueues[mode].filter(g => g.slot === slot
+        && g.members.length <= slot
+        && g.members.every(m => queueEntryUsable(m, mode, slot)));
+}
+
+// Every way of filling one side out of whole parties, with the lone seats each
+// leaves. A slot is at most 4, so enumerating the subsets costs nothing and it
+// is the only honest way to find that a 3-party plus one searcher is a team.
+function sidePacks(groups, slot) {
+    const packs = [{ groups: [], openSeats: slot }];
+    for (const g of groups) {
+        const added = [];
+        for (const p of packs) {
+            const open = p.openSeats - g.members.length;
+            if (open < 0) continue;
+            added.push({ groups: p.groups.concat([g]), openSeats: open });
+        }
+        packs.push(...added);
+    }
+    packs.sort((a, b) => a.openSeats - b.openSeats || b.groups.length - a.groups.length);
+    return packs;
+}
+
+function planRoom(mode, slot) {
+    const groups = usableGroups(mode, slot);
+    const solos = queues[mode].filter(e => e.slot === slot && queueEntryUsable(e, mode, slot));
+    const packs = sidePacks(groups, slot);
+    for (const a of packs) {
+        for (const b of packs) {
+            if (a.groups.some(g => b.groups.includes(g))) continue;
+            if (a.openSeats + b.openSeats > solos.length) continue;
+            const mine = solos.slice(0, a.openSeats);
+            const theirs = solos.slice(a.openSeats, a.openSeats + b.openSeats);
+            return {
+                sides: [mixSide(a, mine), mixSide(b, theirs)],
+                groups: a.groups.concat(b.groups),
+                solos: mine.concat(theirs)
+            };
+        }
+    }
+    return null;
+}
+
+function mixSide(pack, soloSlice) {
+    const members = [];
+    for (const g of pack.groups) {
+        for (const m of g.members) members.push(m);
+    }
+    return {
+        // A side made of more than one source belongs to nobody's party.
+        teamId: pack.groups.length === 1 && soloSlice.length === 0 ? pack.groups[0].teamId : "",
+        members: members.concat(soloSlice)
+    };
 }
 
 function queueTeam(mode, team, slot) {
@@ -1245,8 +1020,9 @@ function queueTeam(mode, team, slot) {
             required_players: slot * 2
         });
     }
-    // Every mode meets a party of the same size: duo v duo, trio v trio, squad v squad.
-    processTeamQueue(mode);
+    // A party that is short of its own slot is not a special case: the same pass
+    // that pairs two full parties looks for the lone bodies that fill the gap.
+    processMatchQueue(mode);
 }
 
 // A queued body is only usable while its socket is open, it is still asking for
@@ -1259,16 +1035,21 @@ function queueEntryUsable(entry, mode, slot) {
         && !(entry.ws.matchId && matches.has(entry.ws.matchId));
 }
 
+// Everyone searching one (mode, slot) is competing for the same seats, so the
+// number a waiting phone is shown counts every body already sitting in that
+// pool: the lone searchers plus the members of any party short of the slot.
 function broadcastPoolStatus(mode, slot) {
     if (!queues[mode]) return;
     const pool = queues[mode].filter(e => e.slot === slot);
     const required = slot * 2;
+    let bodies = pool.filter(e => queueEntryUsable(e, mode, slot)).length;
+    for (const g of usableGroups(mode, slot)) bodies += g.members.length;
     for (const e of pool) {
         sendJson(e.ws, {
             type: "player_joined",
             mode: mode,
             team_size: slot,
-            player_count: pool.length,
+            player_count: Math.min(bodies, required),
             required_players: required
         });
     }
@@ -1280,44 +1061,6 @@ function broadcastAllPools() {
     }
 }
 
-// Solo searches pool per (mode, slot) and only a full pool of slot * 2 bodies
-// starts a room: 1v1 for Solo, 2v2 for Duo, 3v3 for Trio, 4v4 for Squad.
-// Everything is re-checked here, immediately before the room is built, so a
-// cancel, a disconnect or a mode/slot switch can never leak into a match.
-function processSoloQueue(mode) {
-    if (!queues[mode]) return;
-    for (const slot of TEAM_SLOTS) {
-        const need = slot * 2;
-        for (let guard = 0; guard < 16; guard++) {
-            const ready = queues[mode].filter(e => queueEntryUsable(e, mode, slot));
-            if (ready.length < need) break;
-            const sockets = new Set(ready.map(e => e.ws));
-            if (sockets.size !== ready.length) {
-                // The same player queued twice: keep the newest entry only.
-                const seen = new Set();
-                queues[mode] = queues[mode].filter(e => {
-                    if (e.slot !== slot) return true;
-                    if (seen.has(e.ws)) return false;
-                    seen.add(e.ws);
-                    return true;
-                });
-                continue;
-            }
-            const group = ready.slice(0, need);
-            if (!group.every(e => queueEntryUsable(e, mode, slot))) break;
-            const started = makeRoom(mode, [
-                { teamId: "", members: group.slice(0, slot) },
-                { teamId: "", members: group.slice(slot) }
-            ]);
-            if (!started) break;
-            for (const e of group) {
-                const idx = queues[mode].indexOf(e);
-                if (idx !== -1) queues[mode].splice(idx, 1);
-            }
-        }
-    }
-    broadcastAllPools();
-}
 
 // ---- Mummy vs Human: server-authoritative 1v1 / 2v2 / 3v3 / 4v4 match ----
 // The clients only report proximity; every role, timer tick, knockdown, revive,
@@ -1356,215 +1099,6 @@ const ZOMBIE_BREAK_MS = (parseInt(process.env.ZOMBIE_BREAK_SECONDS, 10) || 5) * 
 const ZOMBIE_ATTACK_RANGE = parseFloat(process.env.ZOMBIE_ATTACK_RANGE) || 2.6;
 const ZOMBIE_TEAM_NAMES = ["TEAM TIGER", "TEAM LION"];
 
-// ---- AI Bot players ----
-// Bots fill a queue only after real players have been waiting long enough and
-// only enough of them to complete the match. They are server-side peers: they
-// have a socket-like object (readyState, send, matchId, playerUid) so the room
-// engine treats them exactly like a remote player, but their movement and
-// attacks are driven by the tick below instead of a network frame.
-const BOT_NAMES = ["Shadow", "Viper", "Raven", "Ghost", "Frost", "Blaze"];
-const BOT_CHARACTERS = [1, 2, 3];
-const BOT_BUNDLES = [1, 2];
-const BOT_FILL_MS = parseInt(process.env.BOT_FILL_MS, 10) || 20000;   // the wait starts here
-const BOT_FILL_JITTER_MS = parseInt(process.env.BOT_FILL_JITTER_MS, 10) || 30000; // ...and lands inside 20-50s
-const BOT_TICK_MS = parseInt(process.env.BOT_TICK_MS, 10) || 100;
-const BOT_MOVE_BROADCAST_MS = parseInt(process.env.BOT_MOVE_BROADCAST_MS, 10) || 100;
-const BOT_ATTACK_COOLDOWN_MS = parseInt(process.env.BOT_ATTACK_COOLDOWN_MS, 10) || 900;
-const BOT_WALK_SPEED = parseFloat(process.env.BOT_WALK_SPEED) || 5.0;
-const BOT_RUN_SPEED = parseFloat(process.env.BOT_RUN_SPEED) || 7.0;
-const BOT_TURN_SPEED = parseFloat(process.env.BOT_TURN_SPEED) || 6.0; // radians/sec
-const BOT_ATTACK_RANGE = parseFloat(process.env.BOT_ATTACK_RANGE) || 2.2;
-const BOT_FLEE_START = parseFloat(process.env.BOT_FLEE_START) || 6.0;
-const BOT_CAUTION_RANGE = parseFloat(process.env.BOT_CAUTION_RANGE) || 12.0;
-// The mummy arena needs no radius: its baked table is the boundary, and the
-// cells a body can stand in run all the way into the corners (measured out to
-// r = 17.2 m), so a radius here could only fence the bot out of ground a real
-// player walks. The zombie ring is generated as a disc, so its radius is part
-// of the table itself.
-const BOT_ARENA_RADIUS_ZOMBIE = parseFloat(process.env.BOT_ARENA_RADIUS_ZOMBIE) || 11.0;
-// How much of a height change a body is willing to take as a step. The arena's
-// stairs were authored at 0.45 m risers, so 0.5 m up clears them and 0.7 m down
-// still refuses the long drop off a deck - which is what keeps a bot from
-// "walking off" a floor the server would otherwise have to let it fall through.
-const BOT_STEP_UP_M = parseFloat(process.env.BOT_STEP_UP_M) || 0.5;
-const BOT_STEP_DOWN_M = parseFloat(process.env.BOT_STEP_DOWN_M) || 0.7;
-const BOT_REPATH_MS = parseInt(process.env.BOT_REPATH_MS, 10) || 500;
-// A body that commands a step and does not take it should react on the next tick,
-// not a second later. The old behaviour - hold the heading until the slow stuck
-// check fires, then turn a random way - is what read as "moves but keeps getting
-// stuck" on the deployed build, because the coin flip can point at the next wall.
-const BOT_BLOCKED_TICKS = parseInt(process.env.BOT_BLOCKED_TICKS, 10) || 2;
-const BOT_SIDESTEP_MS = parseInt(process.env.BOT_SIDESTEP_MS, 10) || 700;
-// Goal-progress stuck detection: a body sliding along a wall moves in metres
-// but not toward what it is aiming at, so displacement alone reads it as
-// healthy forever. Every BOT_PROGRESS_MS the distance to the aim point is
-// compared with the previous window; two windows without closing it by at
-// least BOT_PROGRESS_SLACK_M means the route is not being made and the bot
-// repaths from where it stands instead of holding the line against a wall.
-const BOT_PROGRESS_MS = parseInt(process.env.BOT_PROGRESS_MS, 10) || 900;
-const BOT_PROGRESS_SLACK_M = parseFloat(process.env.BOT_PROGRESS_SLACK_M) || 0.3;
-const BOT_FLEE_REACH_M = parseFloat(process.env.BOT_FLEE_REACH_M) || 9.0;
-// A bot with nobody to chase and nobody to run from used to stop dead where the
-// last body fell: a statue in one corner while the rest of the arena went unused.
-// A free bot now walks a patrol leg - a standable cell this far away, reached with
-// the same navigator a chase uses - so the whole floor gets used the way a player
-// rotating between fights uses it.
-const BOT_ROAM_MIN_M = parseFloat(process.env.BOT_ROAM_MIN_M) || 5.0;
-const BOT_ROAM_MAX_M = parseFloat(process.env.BOT_ROAM_MAX_M) || 15.0;
-const BOT_ROAM_TRIES = parseInt(process.env.BOT_ROAM_TRIES, 10) || 24;
-const BOT_ROAM_MS = parseInt(process.env.BOT_ROAM_MS, 10) || 6000;
-// One sweep of the largest table, so a route the map does have is never given up
-// on. Measured on the mummy arena, a full sweep costs about half a millisecond and
-// a bot only ever pays it when its goal changes cell, at most BOT_REPATH_MS apart.
-const BOT_PATH_BUDGET = parseInt(process.env.BOT_PATH_BUDGET, 10) || 20000;
-// How far a bot's centre keeps from anything the table calls blocked. The bake only
-// promised that a 0.60 m body fits at a cell's CENTRE, and a bot's centre can be up
-// to half a cell diagonal (0.18 m at this pitch) away from it, so a ring of cells
-// has to be clear before a cell is used at all.
-// 0.75 m was that ring until it was measured: it fenced the bots out of 1,182 of the
-// 6,081 lower-floor cells, left 5 cells of the stair band instead of 37, and the run
-// reads as bodies shuffling in the middle of the arena while the rim goes unused. At
-// 0.5 m (two rings) the floor keeps 5,291 cells, the stair band keeps 16, and a 0.42 m
-// body anywhere in a kept cell is still clear of every obstacle the bake found two
-// cells away. It is tunable: BOT_BODY_CLEARANCE_M=0.25 gives back the whole rim.
-const BOT_BODY_CLEARANCE_M = parseFloat(process.env.BOT_BODY_CLEARANCE_M) || 0.5;
-
-// ---- Baked arena walkability ----
-// mumuy_vs_human.tscn is fifteen trimesh colliders over three floor heights, and
-// the Node process has no physics and no copy of that map. So the arena was
-// measured with the real colliders - headless, by _arena_bake.gd - and is carried
-// here as a table. One character per 0.25 m cell, row 0 at z = -half:
-//   ' '  nothing to stand on (the ray found no floor, or the ring's outside)
-//   '#'  a body would overlap a wall, a prop or a low ceiling
-//   any other printable char  a cell a body can stand in, feet at (code - 48) / 5
-// The bake used a body fatter than any player (0.60 m radius against the widest
-// body's 0.42 m) so that a bot placed anywhere inside a standable cell - not just
-// at its centre - is provably clear of the map.
-const BOT_MUMMY_ARENA_ROWS = [
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "######PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "#########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "##########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "#########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "#########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "#########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "#######PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "#######PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "jii####PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "jjiii#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "jiii##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "jiii##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "jiii#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "iii##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "iii##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "iii#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "ii##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "ii##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "ii#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "i##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "i##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "i##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPQQQ",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPQQQQQQQQ",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPQQQQQQQQQRRR",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPQQQQQQQQQRRRRRRR",
-    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPQQQQQQQQRRRRRRRRRSSS",
-    "PPPPPPPPPPPPPPPPPPPPPPPPP############################################################################",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#                             ###############################################",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#                             ###############################################",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#                             #######t#############################t#########",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#                             #tttttttttttttttttttttttttttttttttttttttttttttt",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#                             #tttttttttttttttttttttttttttttttttttttttttttttt",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#                             ##ttttttttttttttttttttttttttttttttttttttttttttt",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              ##############################################################",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPP##############              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP#                            ##############################################################",
-    "PPPPPPPPPP#                                                                                          ",
-    "PPPPPPPPPP#                                                                                          ",
-
-];
-let botCounter = 1;
-
-// Spawn seats measured from the authored arena scenes, so bots start exactly
-// where the client places a body with the same spawn_index.
-const MUMMY_SPAWN_POINTS = [
-    { x: -10.000, y: 6.55, z: 0.000 },
-    { x: 9.239, y: 6.55, z: -3.827 },
-    { x: -9.239, y: 6.55, z: -3.827 },
-    { x: 7.071, y: 6.55, z: -7.071 },
-    { x: -7.071, y: 6.55, z: -7.071 },
-    { x: 3.827, y: 6.55, z: -9.239 },
-    { x: -3.827, y: 6.55, z: -9.239 },
-    { x: 0.000, y: 6.55, z: -10.000 }
-];
-const ZOMBIE_RING_RADIUS = 11.0;
-const ZOMBIE_SPAWN_POINTS = [];
-for (let i = 0; i < 8; i++) {
-    const a = (i * 45) * Math.PI / 180;
-    ZOMBIE_SPAWN_POINTS.push({ x: Math.cos(a) * ZOMBIE_RING_RADIUS, y: 1.0, z: Math.sin(a) * ZOMBIE_RING_RADIUS });
-}
-
 // ---- Human side ability: Holographic Clones ----
 // Which character owns which ability is decided here, not in the client's CATALOG,
 // so a tampered message cannot hand a player an ability they never equipped. Keep
@@ -1578,7 +1112,7 @@ const ABILITY_COOLDOWN_MS = 70000;
 const MUMMY_ATTACK_RANGE = parseFloat(process.env.MUMMY_ATTACK_RANGE) || 2.6;
 // How far either side of the Human's facing a clone stands.
 const CLONE_FLANK_METRES = 1.6;
-// Clones then walk straight ahead like bots, so they pull the Mummy's swing.
+// Clones then walk straight ahead from the flank they appeared at.
 // Both ends use these two numbers: the phone draws the body on this line, and
 // the server moves its own copy down the same line, so a swing at what a player
 // sees is a swing on the body the server is counting.
@@ -1625,18 +1159,6 @@ function mummyIdOf(entry) {
     return entry.uid !== "" ? String(entry.uid) : `slot_${entry.spawnIndex}`;
 }
 
-// The arena only starts once every seat reports the scene loaded. A bot has no
-// scene to load - it is born inside the room - so it counts as ready the moment
-// the room exists, otherwise the real players would wait on a seat that can
-// never answer.
-function markBotsReady(room) {
-    const g = room.game;
-    if (!g || !g.ready) return;
-    for (const e of room.entries) {
-        if (isBotPeer(e.ws)) g.ready.add(mummyIdOf(e));
-    }
-}
-
 function initMummyMatch(room) {
     const sideSize = room.entries.filter(e => e.side === 0).length;
     room.game = {
@@ -1662,7 +1184,6 @@ function initMummyMatch(room) {
     };
     resetMummyCombat(room);
     resetMummyAbilities(room);
-    markBotsReady(room);
     broadcastMummyState(room, true);
 }
 
@@ -2291,10 +1812,6 @@ function beginMummyRound(room, roundNumber) {
         g.roles[mummyIdOf(e)] = e.side === g.hunterSide ? "mummy" : "human";
     }
 
-    // Bots start every round back on their spawn seat, so a round break cannot
-    // leave them standing where the last round ended.
-    resetBotPositions(room);
-
     console.log(`[MUMMY] ${room.mode} round ${roundNumber}: ${Object.entries(g.roles).map(([id, r]) => `${id}=${r}`).join(" ")}`);
     broadcastMummyState(room, true);
 }
@@ -2464,7 +1981,6 @@ function initZombieMatch(room) {
         winnerSide: -1,
         endsAt: 0
     };
-    markBotsReady(room);
     broadcastZombieState(room, true);
 }
 
@@ -2488,7 +2004,6 @@ function beginZombieRound(room, roundNumber) {
         g.roles[mummyIdOf(first)] = "zombie";
         g.infected[mummyIdOf(first)] = true;
     }
-    resetBotPositions(room);
     console.log(`[ZOMBIE] ${room.matchId} round ${roundNumber}: ` +
         Object.entries(g.roles).map(([id, r]) => `${id}=${r}`).join(" "));
     broadcastZombieState(room, true);
@@ -2630,1036 +2145,8 @@ function tickZombieMatches() {
     }
 }
 
-// ==========================================
-// 2.5 BOT AI
-// ==========================================
-// One 10 Hz pass over every live room. Each bot body runs a tiny state machine
-// (hunt, flee, or hold ground) and steps itself with the same metres-per-second
-// the arena uses, so the positions the room relays are continuous rather than
-// teleporting. Movement is resolved against the baked arena table above - the
-// same walls, props and floor heights the phones' physics engines are standing
-// in - so a bot cannot cross a wall, climb a sheer step or sink through a deck,
-// and every screen agrees on where it went.
-function buildArena(rows, cell, half) {
-    return { cell: cell, half: half, n: rows.length, rows: rows, scratch: null };
-}
-
-// The night-city arena is one flat floor with every map body taken out of the
-// space on purpose, exactly as zombie_match.gd does to the props on every phone.
-// Measured the same way as the mummy arena (a body-sized probe at a 2 m pitch out
-// to 60 m): nothing solid, feet at y = 0, so its table is generated rather than
-// pasted. The ring's outside is void, which is what bounds the mode.
-function buildFlatArena(cell, half, feetY, radius) {
-    const n = Math.round((half * 2) / cell) + 1;
-    const code = String.fromCharCode(48 + Math.round(feetY * 5));
-    const rows = [];
-    for (let r = 0; r < n; r++) {
-        const z = -half + r * cell;
-        let row = "";
-        for (let c = 0; c < n; c++) {
-            const x = -half + c * cell;
-            row += x * x + z * z <= radius * radius ? code : " ";
-        }
-        rows.push(row);
-    }
-    return buildArena(rows, cell, half);
-}
-
-// The baked table guarantees a body fits at a cell's centre, but a bot's centre can
-// be anywhere in that cell, and on a wall's edge that is not the clearance the
-// phone's model needs. This shaves the rim: a cell stays only while the ground
-// around it is unbroken for the full clearance. Only cells are removed, never
-// invented, so the baked rows stay the measured truth and everything that is left
-// is floor the arena really has, with room around it to stand on.
-function standableCell(arena, r, c) {
-    if (r < 0 || c < 0 || r >= arena.n || c >= arena.n) return false;
-    return arena.rows[r].charCodeAt(c) >= 48;
-}
-
-function erodeArena(arena, metres) {
-    const rings = Math.max(0, Math.round(metres / arena.cell));
-    if (!rings) return arena;
-    let baked = 0;
-    for (let r = 0; r < arena.n; r++) {
-        for (let c = 0; c < arena.n; c++) {
-            if (standableCell(arena, r, c)) baked++;
-        }
-    }
-    const rows = [];
-    for (let r = 0; r < arena.n; r++) {
-        let row = "";
-        for (let c = 0; c < arena.n; c++) {
-            let keep = standableCell(arena, r, c);
-            for (let dr = -rings; dr <= rings && keep; dr++) {
-                for (let dc = -rings; dc <= rings && keep; dc++) {
-                    keep = standableCell(arena, r + dr, c + dc);
-                }
-            }
-            row += keep ? arena.rows[r][c] : " ";
-        }
-        rows.push(row);
-    }
-    const eroded = buildArena(rows, arena.cell, arena.half);
-    eroded.baked = { standable: baked };
-    eroded.clearance = metres;
-    return eroded;
-}
-
-const BOT_ARENA_MUMMY = erodeArena(buildArena(BOT_MUMMY_ARENA_ROWS, 0.25, 12.5), BOT_BODY_CLEARANCE_M);
-const BOT_ARENA_ZOMBIE = erodeArena(buildFlatArena(0.5, 13.0, 0.0, BOT_ARENA_RADIUS_ZOMBIE), BOT_BODY_CLEARANCE_M);
-
-// A pasted table that does not cover the extent it claims would silently turn the
-// arena into a wall, so the shape is checked at boot and said out loud.
-function checkArena(arena, name) {
-    const span = (arena.n - 1) * arena.cell;
-    let standable = 0;
-    for (let r = 0; r < arena.n; r++) {
-        for (let c = 0; c < arena.n; c++) {
-            if (arena.rows[r].charCodeAt(c) >= 48) standable++;
-        }
-    }
-    const ok = Math.abs(span - arena.half * 2) < 0.001 && arena.rows.every(row => row.length === arena.n) && standable > 0;
-    // Standable is not the same as reachable. A clearance ring that is too wide, or
-    // a table that lost a stairway, both leave cells a body can never walk to, and
-    // that is exactly the "bots only use the middle of the map" report - so the boot
-    // line says how much of the floor the piece its centre stands on actually covers.
-    const n = arena.n;
-    const pieces = arenaPieces(arena);
-    let middle = -1;
-    let bestD = Infinity;
-    for (let i = 0; i < n * n; i++) {
-        const feet = botCellFeet(arena, i);
-        if (feet === null) continue;
-        const r = (i / n) | 0;
-        const c = i % n;
-        const x = -arena.half + c * arena.cell;
-        const z = -arena.half + r * arena.cell;
-        const d = x * x + z * z;
-        if (d < bestD) { bestD = d; middle = i; }
-    }
-    const home = middle < 0 ? -1 : pieces.ids[middle];
-    let reachable = 0;
-    for (let i = 0; i < pieces.ids.length; i++) {
-        if (pieces.ids[i] === home) reachable++;
-    }
-    const cut = arena.baked ? ` (the baked table had ${arena.baked.standable})` : "";
-    console.log(`[ARENA] ${name} walkability: ${arena.n}x${arena.n} cells at ${arena.cell} m, ` +
-        `${standable} standable keeping ${arena.clearance || 0} m clear of the map${cut}` +
-        `, ${reachable} of them on the piece of ground its middle stands on, in ${pieces.count} piece${pieces.count === 1 ? "" : "s"}` +
-        `${reachable < standable ? ` (${standable - reachable} sit behind ground no body can cross - the upper deck is one of them)` : ""}` +
-        `${ok ? "" : " - TABLE MISMATCH"}`);
-    if (!ok) console.error(`[ARENA] ${name} walkability table is not usable: span ${span} vs ${arena.half * 2}`);
-    return ok;
-}
-
-function arenaFor(mode) {
-    return mode === ZOMBIE_MODE ? BOT_ARENA_ZOMBIE : BOT_ARENA_MUMMY;
-}
-
-// -1 when the point is off the table entirely.
-function botCellAt(arena, x, z) {
-    const c = Math.floor((x + arena.half) / arena.cell);
-    const r = Math.floor((z + arena.half) / arena.cell);
-    if (c < 0 || r < 0 || c >= arena.n || r >= arena.n) return -1;
-    return r * arena.n + c;
-}
-
-// Feet height of a standable cell, or null for a wall, a prop or thin air.
-function botCellFeet(arena, idx) {
-    if (idx < 0) return null;
-    const code = arena.rows[(idx / arena.n) | 0].charCodeAt(idx % arena.n);
-    return code >= 48 ? (code - 48) / 5 : null;
-}
-
-function botCellCentre(arena, idx) {
-    const r = (idx / arena.n) | 0;
-    const c = idx % arena.n;
-    return { x: -arena.half + c * arena.cell + arena.cell / 2, z: -arena.half + r * arena.cell + arena.cell / 2 };
-}
-
-function botFeetAt(arena, x, z) {
-    return botCellFeet(arena, botCellAt(arena, x, z));
-}
-
-// The floor is not one piece. The upper deck of the measured arena is standable
-// ground that no stair reaches, and a strip of the rim cut by the clearance ring
-// can be another, so a search across the whole table fails for a body standing
-// anywhere else. Labelling the pieces once - with the same step rules a walk uses
-// - lets a patrol pick a leg it can actually get to instead of setting off for an
-// island, reaching the edge of its own ground, and standing there while the match
-// plays out behind it.
-function arenaPieces(arena) {
-    if (arena.pieces) return arena.pieces;
-    const n = arena.n;
-    const ids = new Int32Array(n * n).fill(-1);
-    const stack = [];
-    let piece = 0;
-    for (let start = 0; start < ids.length; start++) {
-        if (ids[start] !== -1 || botCellFeet(arena, start) === null) continue;
-        ids[start] = piece;
-        stack.push(start);
-        while (stack.length) {
-            const cur = stack.pop();
-            const cf = botCellFeet(arena, cur);
-            const r = (cur / n) | 0;
-            const c = cur % n;
-            const around = [r > 0 ? cur - n : -1, r < n - 1 ? cur + n : -1,
-                c > 0 ? cur - 1 : -1, c < n - 1 ? cur + 1 : -1];
-            for (const nb of around) {
-                if (nb < 0 || ids[nb] !== -1) continue;
-                const nf = botCellFeet(arena, nb);
-                if (nf === null || nf - cf > BOT_STEP_UP_M || cf - nf > BOT_STEP_DOWN_M) continue;
-                ids[nb] = piece;
-                stack.push(nb);
-            }
-        }
-        piece++;
-    }
-    arena.pieces = { ids: ids, count: piece };
-    return arena.pieces;
-}
-
-function arenaPieceAt(arena, idx) {
-    if (idx < 0) return -1;
-    return arenaPieces(arena).ids[idx];
-}
-
-// Enterable means the cell stands a body up at all AND the change of floor from
-// where the body is now is a step, not a climb or a drop. The second half is what
-// keeps a bot on its own level of the arena instead of walking off a deck.
-function botCellEnterable(arena, fromY, idx) {
-    const feet = botCellFeet(arena, idx);
-    if (feet === null) return false;
-    if (fromY === null || fromY === undefined) return true;
-    return feet - fromY <= BOT_STEP_UP_M && fromY - feet <= BOT_STEP_DOWN_M;
-}
-
-function botPointEnterable(arena, fromY, x, z) {
-    return botCellEnterable(arena, fromY, botCellAt(arena, x, z));
-}
-
-function botSegmentClear(arena, ax, az, ay, bx, bz) {
-    const dx = bx - ax;
-    const dz = bz - az;
-    const steps = Math.ceil(Math.sqrt(dx * dx + dz * dz) / (arena.cell * 0.5));
-    if (steps <= 0) return true;
-    const sx = dx / steps;
-    const sz = dz / steps;
-    let x = ax;
-    let z = az;
-    let start = botCellAt(arena, x, z);
-    let prevR = start < 0 ? -1 : (start / arena.n) | 0;
-    let prevC = start < 0 ? -1 : start % arena.n;
-    for (let i = 1; i <= steps; i++) {
-        x += sx;
-        z += sz;
-        const idx = botCellAt(arena, x, z);
-        if (!botCellEnterable(arena, ay, idx)) return false;
-        const r = (idx / arena.n) | 0;
-        const c = idx % arena.n;
-        // Crossing into a new row and a new column at once means the line went
-        // through the corner between four cells; the two that share an edge with
-        // it have to be clear too, or a body clips the point of a wall.
-        if (r !== prevR && c !== prevC) {
-            if (!botCellEnterable(arena, ay, prevR * arena.n + c)) return false;
-            if (!botCellEnterable(arena, ay, r * arena.n + prevC)) return false;
-        }
-        prevR = r;
-        prevC = c;
-    }
-    return true;
-}
-
-function botLineClear(arena, from, to) {
-    return botSegmentClear(arena, from.x, from.z, from.y, to.x, to.z);
-}
-
-// The raycast of the grid world: a commanded step is walked half a cell at a
-// time and ends at the last point the table says a body fits - the spot in
-// front of a wall, never a point past it. A destination-only check can stride
-// over a thin wall at run speed (7 m/s covers 0.7 m, almost three cells, in one
-// tick); walking the line cannot, at any speed. The table itself was measured
-// with capsule probes against the arena's real physics colliders, so this walk
-// is the runtime half of that collision detection.
-function botStepTo(arena, fromY, fromX, fromZ, toX, toZ) {
-    const dx = toX - fromX;
-    const dz = toZ - fromZ;
-    const steps = Math.max(1, Math.ceil(Math.sqrt(dx * dx + dz * dz) / (arena.cell * 0.5)));
-    const sx = dx / steps;
-    const sz = dz / steps;
-    let x = fromX;
-    let z = fromZ;
-    let prev = { x: fromX, z: fromZ };
-    let start = botCellAt(arena, fromX, fromZ);
-    let prevR = start < 0 ? -1 : (start / arena.n) | 0;
-    let prevC = start < 0 ? -1 : start % arena.n;
-    for (let i = 1; i <= steps; i++) {
-        x += sx;
-        z += sz;
-        const idx = botCellAt(arena, x, z);
-        if (!botCellEnterable(arena, fromY, idx)) return prev;
-        const r = (idx / arena.n) | 0;
-        const c = idx % arena.n;
-        // Crossing a row and a column at once means the line went through the
-        // corner between four cells; the two sharing an edge with it have to be
-        // clear too, or a body clips the point of a wall.
-        if (r !== prevR && c !== prevC) {
-            if (!botCellEnterable(arena, fromY, prevR * arena.n + c)) return prev;
-            if (!botCellEnterable(arena, fromY, r * arena.n + prevC)) return prev;
-        }
-        prevR = r;
-        prevC = c;
-        prev = { x: x, z: z };
-    }
-    return { x: toX, z: toZ };
-}
-
-// A goal along a heading that a body can actually stand on: start at the far end
-// and come back, because the open ground is usually in front of the body rather
-// than two metres short of it.
-function botStandableAhead(arena, pos, yaw, reach) {
-    for (let d = reach; d >= 1.0; d -= arena.cell * 2) {
-        const x = pos.x + Math.sin(yaw) * d;
-        const z = pos.z + Math.cos(yaw) * d;
-        if (botPointEnterable(arena, pos.y, x, z)) return { x: x, z: z };
-    }
-    return { x: pos.x + Math.sin(yaw), z: pos.z + Math.cos(yaw) };
-}
-
-// A goal that is not standable - a player who has climbed a crate - is answered
-// with the closest cell that is, so the body next to them is reachable.
-function botNearestStandableCell(arena, x, z) {
-    const idx = botCellAt(arena, x, z);
-    if (botCellFeet(arena, idx) !== null) return idx;
-    const c0 = idx < 0 ? Math.round((x + arena.half) / arena.cell) : idx % arena.n;
-    const r0 = idx < 0 ? Math.round((z + arena.half) / arena.cell) : (idx / arena.n) | 0;
-    for (let ring = 1; ring <= 6; ring++) {
-        for (let dr = -ring; dr <= ring; dr++) {
-            for (let dc = -ring; dc <= ring; dc++) {
-                if (Math.max(Math.abs(dr), Math.abs(dc)) !== ring) continue;
-                const r = r0 + dr;
-                const c = c0 + dc;
-                if (r < 0 || c < 0 || r >= arena.n || c >= arena.n) continue;
-                const nb = r * arena.n + c;
-                if (botCellFeet(arena, nb) !== null) return nb;
-            }
-        }
-    }
-    return -1;
-}
-
-// The figure people actually want when they ask how much of the map a bot uses is
-// metres, not cells - and a cell count flatters it, because 331 m² spread over a
-// 25 m square means the longest route a bot can take is what matters. So the
-// shipped table is measured at boot: two sweeps of the same step rules
-// botPathCells uses give the corner-to-corner walk, one sweep per spawn seat gives
-// the farthest body a bot has to reach from where it starts, and the speeds at the
-// top of this file turn that into seconds. Printed instead of estimated, so the
-// number cannot drift away from the bytes that shipped.
-function arenaNavRange(arena, seats, label) {
-    const n = arena.n;
-    const sweep = (seed) => {
-        const d = new Int32Array(n * n).fill(-1);
-        const q = [seed];
-        let head = 0;
-        let far = seed;
-        let minX = Infinity;
-        let maxX = -Infinity;
-        let minZ = Infinity;
-        let maxZ = -Infinity;
-        let maxR = 0;
-        d[seed] = 0;
-        while (head < q.length) {
-            const cur = q[head++];
-            const p = botCellCentre(arena, cur);
-            if (p.x < minX) minX = p.x;
-            if (p.x > maxX) maxX = p.x;
-            if (p.z < minZ) minZ = p.z;
-            if (p.z > maxZ) maxZ = p.z;
-            maxR = Math.max(maxR, Math.hypot(p.x, p.z));
-            const cf = botCellFeet(arena, cur);
-            const r = (cur / n) | 0;
-            const c = cur % n;
-            const around = [r > 0 ? cur - n : -1, r < n - 1 ? cur + n : -1,
-                c > 0 ? cur - 1 : -1, c < n - 1 ? cur + 1 : -1];
-            for (const nb of around) {
-                if (nb < 0 || d[nb] !== -1) continue;
-                const nf = botCellFeet(arena, nb);
-                if (nf === null || nf - cf > BOT_STEP_UP_M || cf - nf > BOT_STEP_DOWN_M) continue;
-                d[nb] = d[cur] + 1;
-                if (d[nb] > d[far]) far = nb;
-                q.push(nb);
-            }
-        }
-        return { far: far, count: q.length, maxCells: d[far], box: [minX, maxX, minZ, maxZ], maxR: maxR };
-    };
-    let start = -1;
-    let bestD = Infinity;
-    for (let r = 0; r < n; r++) {
-        for (let c = 0; c < n; c++) {
-            const x = -arena.half + c * arena.cell + arena.cell / 2;
-            const z = -arena.half + r * arena.cell + arena.cell / 2;
-            const d = x * x + z * z;
-            if (d >= bestD) continue;
-            const idx = r * n + c;
-            if (botCellFeet(arena, idx) === null) continue;
-            bestD = d;
-            start = idx;
-        }
-    }
-    if (start < 0) {
-        console.log(`[BOTNAV] ${label} range: no standable cell on the table at all`);
-        return null;
-    }
-    const a = sweep(start);
-    const b = sweep(a.far);
-    const diameter = b.maxCells * arena.cell;
-    const seatsOut = [];
-    if (seats && seats.length) {
-        let worst = 0;
-        let best = Infinity;
-        let reachedAll = true;
-        for (const s of seats) {
-            const idx = botNearestStandableCell(arena, s.x, s.z);
-            if (idx < 0) {
-                reachedAll = false;
-                continue;
-            }
-            const run = sweep(idx);
-            if (run.count < b.count) reachedAll = false;
-            const metres = run.maxCells * arena.cell;
-            best = Math.min(best, metres);
-            worst = Math.max(worst, metres);
-        }
-        seatsOut.push(`${best.toFixed(1)}-${worst.toFixed(1)} m from a spawn seat` +
-            `${reachedAll ? ", every seat reaching the whole floor" : " (a seat sees less than the middle does)"}`);
-    }
-    console.log(`[BOTNAV] ${label} range: ${b.count} walkable cells = ` +
-        `${(b.count * arena.cell * arena.cell).toFixed(1)} m² of floor, ` +
-        `x ${b.box[0].toFixed(2)}..${b.box[1].toFixed(2)} z ${b.box[2].toFixed(2)}..${b.box[3].toFixed(2)} ` +
-        `out to r ${b.maxR.toFixed(1)} m, ${diameter.toFixed(1)} m corner to corner on foot` +
-        ` = ${(diameter / BOT_RUN_SPEED).toFixed(1)} s at ${BOT_RUN_SPEED} m/s` +
-        `${seatsOut.length ? ", " + seatsOut.join(", ") : ""}`);
-    return { cells: b.count, square: b.count * arena.cell * arena.cell, diameter: diameter };
-}
-
-// One set of search buffers per arena, made at boot. The AI is single-threaded,
-// so two searches can never overlap, and `seen` carries a generation stamp
-// instead of being cleared - a repath touches the cells it walks, not 10,000.
-function arenaScratch(arena) {
-    if (!arena.scratch) {
-        const cells = arena.n * arena.n;
-        arena.scratch = {
-            prev: new Int32Array(cells),
-            seen: new Int32Array(cells),
-            queue: new Int32Array(cells),
-            gen: 0
-        };
-    }
-    return arena.scratch;
-}
-
-function botReadPath(arena, s, goalIdx) {
-    const cells = [];
-    let idx = goalIdx;
-    while (idx >= 0) {
-        cells.push(idx);
-        idx = s.prev[idx];
-    }
-    cells.reverse();
-    const pts = [];
-    // The first cell is where the body already stands, so it is not a waypoint.
-    for (let i = 1; i < cells.length; i++) pts.push(botCellCentre(arena, cells[i]));
-    if (!pts.length) return pts;
-    // A stairway of cell centres walks like a robot. Each kept point is thrown
-    // away when the body can see past it to the next, which turns a staircase of
-    // waypoints into the two or three corners a player would actually turn.
-    const out = [pts[0]];
-    let i = 0;
-    while (i < pts.length - 1) {
-        const top = Math.min(pts.length - 1, i + 10);
-        let j = top;
-        while (j > i + 1 && !botSegmentClear(arena, pts[i].x, pts[i].z,
-            botCellFeet(arena, botCellAt(arena, pts[i].x, pts[i].z)), pts[j].x, pts[j].z)) j--;
-        out.push(pts[j]);
-        i = j;
-    }
-    return out;
-}
-
-// Returns the smoothed waypoint list to the goal, or - when no walkable route
-// to it exists, the arena's levels being what they are - the waypoint list to
-// the explored cell nearest the goal, flagged partial. Walking to the edge of
-// the reachable world and stopping beats the old answer (null, then a straight
-// walk into the wall in front of the goal forever).
-function botPathCells(arena, startIdx, goalIdx) {
-    if (startIdx < 0 || goalIdx < 0 || startIdx === goalIdx) return null;
-    const s = arenaScratch(arena);
-    const n = arena.n;
-    s.gen++;
-    const gen = s.gen;
-    s.seen[startIdx] = gen;
-    s.prev[startIdx] = -1;
-    let head = 0;
-    let tail = 0;
-    let expanded = 0;
-    const goalC = botCellCentre(arena, goalIdx);
-    let bestIdx = startIdx;
-    let bestD = Infinity;
-    s.queue[tail++] = startIdx;
-    while (head < tail && expanded < BOT_PATH_BUDGET) {
-        const cur = s.queue[head++];
-        if (cur === goalIdx) return { pts: botReadPath(arena, s, cur), partial: false };
-        expanded++;
-        const curC = botCellCentre(arena, cur);
-        const d = (curC.x - goalC.x) * (curC.x - goalC.x) + (curC.z - goalC.z) * (curC.z - goalC.z);
-        if (d < bestD) {
-            bestD = d;
-            bestIdx = cur;
-        }
-        const cf = botCellFeet(arena, cur);
-        const r = (cur / n) | 0;
-        const c = cur % n;
-        for (let k = 0; k < 4; k++) {
-            const nr = r + (k === 0 ? -1 : k === 1 ? 1 : 0);
-            const nc = c + (k === 2 ? -1 : k === 3 ? 1 : 0);
-            if (nr < 0 || nc < 0 || nr >= n || nc >= n) continue;
-            const nb = nr * n + nc;
-            if (s.seen[nb] === gen) continue;
-            const nf = botCellFeet(arena, nb);
-            if (nf === null) continue;
-            if (nf - cf > BOT_STEP_UP_M || cf - nf > BOT_STEP_DOWN_M) continue;
-            s.seen[nb] = gen;
-            s.prev[nb] = cur;
-            s.queue[tail++] = nb;
-        }
-    }
-    if (bestIdx !== startIdx) return { pts: botReadPath(arena, s, bestIdx), partial: true };
-    return null;
-}
-
-// The heading for this tick on the way to `goal`: straight at it when the baked
-// arena says the line is clear, otherwise along the shortest walkable way around
-// what is standing in it. A path is rebuilt when the goal moves to another cell
-// or the cached one ages out, so a chase normally costs one line test per tick.
-// A waypoint the body cannot walk - it was pushed off the smoothed line by
-// another body, or the leg crosses a corner the step-walk refuses - is skipped
-// for the next one instead of being rammed, and a goal with no route at all
-// (the arena's deck is a separate level) is answered by walking to the nearest
-// cell the search proved reachable and stopping there, facing the goal.
-function botNavigatedYaw(room, entry, goal, now) {
-    const arena = arenaFor(room.mode);
-    const pos = entry.pos;
-    const b = entry.bot;
-    b.reachedPartial = false;
-    if (botLineClear(arena, pos, goal)) {
-        b.path = null;
-        b.pathGoal = -1;
-        b.pathPartial = false;
-        botAimAt(b, { x: goal.x, z: goal.z }, pos, now);
-        return botYawTowards(pos, goal);
-    }
-    const goalIdx = botNearestStandableCell(arena, goal.x, goal.z);
-    if (goalIdx >= 0 && (goalIdx !== b.pathGoal || !b.path || now >= b.nextPathAt)) {
-        const res = botPathCells(arena, botCellAt(arena, pos.x, pos.z), goalIdx);
-        b.path = res ? res.pts : null;
-        b.pathPartial = !!(res && res.partial);
-        b.partialEnd = res && res.partial && res.pts.length ? res.pts[res.pts.length - 1] : null;
-        b.pathIndex = 0;
-        b.pathGoal = goalIdx;
-        b.nextPathAt = now + BOT_REPATH_MS;
-    }
-    if (b.path && b.path.length) {
-        while (b.pathIndex < b.path.length - 1 && flatDistance(pos, b.path[b.pathIndex]) < 0.45) {
-            b.pathIndex++;
-        }
-        while (b.pathIndex < b.path.length - 1 && !botSegmentClear(arena, pos.x, pos.z, pos.y,
-            b.path[b.pathIndex].x, b.path[b.pathIndex].z)) {
-            b.pathIndex++;
-        }
-        if (b.pathIndex < b.path.length) {
-            const wp = b.path[b.pathIndex];
-            if (b.pathPartial && b.pathIndex === b.path.length - 1 && flatDistance(pos, wp) < 0.9) {
-                // Standing at the edge of the reachable world: hold this spot and
-                // face the goal rather than grinding into the wall before it.
-                b.path = null;
-                b.reachedPartial = true;
-                botAimAt(b, { x: goal.x, z: goal.z }, pos, now);
-                return botYawTowards(pos, goal);
-            }
-            botAimAt(b, { x: wp.x, z: wp.z }, pos, now);
-            return botYawTowards(pos, wp);
-        }
-        b.path = null;
-    }
-    // No route at all right now. The last search's edge point, if there was
-    // one, is the best walkable answer; only a goal with no standable cell at
-    // all falls back to the raw heading.
-    if (b.partialEnd && flatDistance(pos, b.partialEnd) > 0.9) {
-        botAimAt(b, { x: b.partialEnd.x, z: b.partialEnd.z }, pos, now);
-        return botYawTowards(pos, b.partialEnd);
-    }
-    b.reachedPartial = true;
-    botAimAt(b, { x: goal.x, z: goal.z }, pos, now);
-    return botYawTowards(pos, goal);
-}
-
-// The point progress-stuck detection measures against, updated whenever the
-// nav hands out a new aim: the baseline distance restarts so a turn to a new
-// waypoint cannot read as "no progress" against the previous one.
-function botAimAt(b, point, pos, now) {
-    if (!b.aim || Math.abs(b.aim.x - point.x) + Math.abs(b.aim.z - point.z) > 0.01) {
-        b.aim = point;
-        b.aimAt = now;
-        b.progressDist = -1;
-        b.noProgress = 0;
-    } else {
-        b.aimAt = now;
-    }
-}
-
-function botYawTowards(fromPos, toPos) {
-    return Math.atan2(toPos.x - fromPos.x, toPos.z - fromPos.z);
-}
-
-function botAngleDelta(a, b) {
-    let d = b - a;
-    while (d > Math.PI) d -= Math.PI * 2;
-    while (d < -Math.PI) d += Math.PI * 2;
-    return d;
-}
-
-// A body that only ever travels at exactly one speed along exactly one line is
-// the walk that gives a bot away. Both costs are a multiply and an add.
-function botPace(b, speed) {
-    return speed * b.speedMul;
-}
-
-function botDrift(b, yaw) {
-    b.wobble += (Math.random() - 0.5) * 0.12;
-    if (b.wobble > 0.3) b.wobble = 0.3;
-    else if (b.wobble < -0.3) b.wobble = -0.3;
-    return yaw + b.wobble;
-}
-
-function botBodyAlive(room, id) {
-    const g = room.game;
-    if (!g) return false;
-    if (g.kind === "zombie") return true;
-    const c = g.combat[id];
-    return !!c && !c.downed && !c.eliminated;
-}
-
-// A body the phone has never reported a position for still occupies its spawn
-// seat, so it is seeded here rather than skipped: a mummy bot that could not see
-// a motionless human would stand next to them forever.
-function botNearest(room, entry, predicate) {
-    let best = null;
-    let bestDistance = Infinity;
-    for (const other of room.entries) {
-        if (other === entry || !predicate(other)) continue;
-        const target = botPositionOf(room, other);
-        if (!target) continue;
-        const d = flatDistance(entry.pos, target);
-        if (d < bestDistance) {
-            bestDistance = d;
-            best = other;
-        }
-    }
-    return best ? { entry: best, distance: bestDistance } : null;
-}
-
-// A real player who has never sent a movement frame has no server-side position
-// yet, so a bot aiming at them uses their spawn seat rather than the origin.
-function botPositionOf(room, entry) {
-    if (entry.pos) return entry.pos;
-    if (!isBotPeer(entry.ws)) {
-        entry.pos = Object.assign({}, spawnPointFor(room.mode, entry.spawnIndex));
-    }
-    return entry.pos;
-}
-
-// How far a heading has ground under it, in metres, sampled on the table and
-// capped at a body's turn: the bot does not need to see the whole arena, only
-// which of its two shoulders is not a wall.
-function botGroundAhead(arena, pos, yaw) {
-    const probe = arena.cell * 2;
-    let clear = 0;
-    for (let d = probe; d <= 3.0; d += probe) {
-        if (!botPointEnterable(arena, pos.y, pos.x + Math.sin(yaw) * d, pos.z + Math.cos(yaw) * d)) break;
-        clear = d;
-    }
-    return clear;
-}
-
-// Which way to turn when the body stops going: the shoulder with more clear ground,
-// so it goes round the obstacle instead of guessing at the next wall. Both shut is a
-// pocket, and out of a pocket the only way is back the way it came.
-function botOpenSide(arena, pos, yaw, b) {
-    const left = botGroundAhead(arena, pos, yaw - Math.PI / 2);
-    const right = botGroundAhead(arena, pos, yaw + Math.PI / 2);
-    if (!left && !right) return Math.PI;
-    if (left !== right) return right > left ? Math.PI / 2 : -Math.PI / 2;
-    return (b.unstickSide >= 0 ? -1 : 1) * Math.PI / 2;
-}
-
-function botSteer(room, entry, desiredYaw, speed, dt, now) {
-    const pos = entry.pos;
-    const b = entry.bot;
-    const arena = arenaFor(room.mode);
-    // The mummy arena's boundary is its baked table (the step-walk refuses
-    // every cell past it), so only the generated zombie disc needs a radius.
-    const radius = room.mode === ZOMBIE_MODE ? BOT_ARENA_RADIUS_ZOMBIE : Infinity;
-    const inside = (x, z) => x * x + z * z <= radius * radius;
-
-    // The floor the body is really standing on, straight off the table. Every
-    // height test below compares a candidate against this rather than against a
-    // y that may have been set by a push or by a spawn marker.
-    const home = botFeetAt(arena, pos.x, pos.z);
-    const wasX = pos.x;
-    const wasZ = pos.z;
-    let stalled = false;
-
-    let want = desiredYaw;
-    // A body whose detour window is still open walks the beside-line it chose when
-    // the map stopped it, the wall-turn a player makes without thinking about it.
-    if (speed > 0 && now < b.unstickUntil) want += b.unstickSide;
-
-    const delta = botAngleDelta(pos.yaw || 0, want);
-    // A body on an open detour turns at twice the running rate. The ease is what a
-    // straight line needs; against a wall it is the difference between a slide and
-    // half a second of feet that go nowhere, which is the pause a phone reads as
-    // the bot giving up on the chase.
-    const maxTurn = BOT_TURN_SPEED * dt * (now < b.unstickUntil ? 2 : 1);
-    const turn = Math.abs(delta) < maxTurn ? delta : Math.sign(delta) * maxTurn;
-    const yaw = (pos.yaw || 0) + turn;
-
-    const step = speed * dt;
-    let nx = pos.x;
-    let nz = pos.z;
-
-    // The commanded step is walked half a cell at a time and ends at the last
-    // point the table says a body fits: the spot in front of a wall, never a point
-    // past it. Refusing the whole step instead - which is what a destination-only
-    // check does - is the freeze a phone sees on a body pressed along a wall face:
-    // it loses that tick's metres outright, loses the next two as well, and then
-    // the stuck handling throws the route away and turns around. Walking the line
-    // keeps the slide a player gets for free and cannot earn a pass through the
-    // wall, because it is the same half-cell sample the nav searches by.
-    //
-    // A body with no floor under it is the one case that gets no say at all. The
-    // tick that picks it up and sets it down on measured ground runs before this
-    // one, so getting here means something put it there; letting it steer without
-    // the table's answer is how a body ends up walking through a wall, and it has
-    // no height to compare a step against either.
-    if (home !== null) {
-        const walked = botStepTo(arena, home, pos.x, pos.z,
-            pos.x + Math.sin(yaw) * step, pos.z + Math.cos(yaw) * step);
-        // The mummy arena ends at its baked table; the generated disc is a radius,
-        // so it needs saying once here rather than trusting the walk.
-        if (inside(walked.x, walked.z)) {
-            nx = walked.x;
-            nz = walked.z;
-            // Bodies are solid too: the same pass a real phone's report goes
-            // through, so a bot and a player cannot occupy one spot on a screen.
-            // A push the table refuses is a push through a wall, so it is dropped
-            // rather than taken back out of the room's geometry.
-            const separated = separateFromRoom(room, entry, nx, nz);
-            if (inside(separated.x, separated.z) && botPointEnterable(arena, home, separated.x, separated.z)) {
-                nx = separated.x;
-                nz = separated.z;
-            }
-        }
-    }
-
-    pos.x = nx;
-    pos.z = nz;
-    pos.yaw = yaw;
-    // Displacement is the evidence, not the map's answer: a step the table refuses
-    // and a step a body pushes straight back look identical on a phone - the walk
-    // clip running under a body that is going nowhere. Two of those and the body
-    // takes the open shoulder instead of holding the line for a second until the
-    // slower distance check below notices.
-    if (speed > 0) {
-        const gainX = pos.x - wasX;
-        const gainZ = pos.z - wasZ;
-        const least = step * 0.25;
-        stalled = gainX * gainX + gainZ * gainZ < least * least;
-        if (stalled) b.blockedTicks++;
-        else b.blockedTicks = 0;
-    } else {
-        b.blockedTicks = 0;
-    }
-    // A side-step that keeps being refused is the shoulder that points into the
-    // wall, and holding it for the rest of its window is the freeze a phone sees:
-    // a body in the walk clip that goes nowhere. So the reaction fires again inside
-    // an open window, and the second answer is to reverse and walk back out.
-    if (b.blockedTicks >= BOT_BLOCKED_TICKS) {
-        const insideDetour = now < b.unstickUntil;
-        b.blockedTicks = 0;
-        b.unstickSide = insideDetour ? Math.PI : botOpenSide(arena, pos, yaw, b);
-        b.unstickUntil = now + (insideDetour ? BOT_SIDESTEP_MS / 2 : BOT_SIDESTEP_MS);
-        b.path = null;
-        b.pathGoal = -1;
-        b.noProgress = 0;
-    }
-    // The wire carries feet, so the body is put down on the floor the arena was
-    // measured with rather than left floating at its spawn marker.
-    const feet = botFeetAt(arena, nx, nz);
-    if (feet !== null) pos.y = feet;
-    // A speed of 0 means "face them, do not step": the client picks its
-    // locomotion clip off this flag, so a swinging bot must not look like it
-    // is sprinting on the spot. A body the map refused has to say the same thing -
-    // a commanded step it never took is reported as standing still, which is both
-    // what the phone draws and what the stuck checks above are already doing.
-    pos.moving = step > 0.0001 && !stalled;
-
-    // Progress stuck detection: a body can slide along a wall for minutes and
-    // move in metres without ever closing on the point the nav gave it - the
-    // displacement check above reads that as healthy. So every window the
-    // distance to the aim is compared against the previous one; two windows
-    // without real approach mean the route is not being made, and the bot
-    // takes the open shoulder and rebuilds its path from where it stands.
-    if (speed > 0) {
-        if (b.aimAt > 0 && now - b.aimAt <= BOT_PROGRESS_MS * 3 && now >= b.progressAt) {
-            const dNow = flatDistance(pos, b.aim);
-            if (b.progressDist >= 0) {
-                if (b.progressDist - dNow < BOT_PROGRESS_SLACK_M && dNow > 0.8) b.noProgress++;
-                else b.noProgress = 0;
-            }
-            b.progressDist = dNow;
-            b.progressAt = now + BOT_PROGRESS_MS;
-            if (b.noProgress >= 2) {
-                b.noProgress = 0;
-                b.unstickUntil = now + BOT_SIDESTEP_MS;
-                b.unstickSide = botOpenSide(arena, pos, pos.yaw || 0, b);
-                b.path = null;
-                b.pathGoal = -1;
-            }
-        }
-    } else {
-        b.progressDist = -1;
-        b.noProgress = 0;
-    }
-}
-
-function botBroadcastMove(room, entry, now) {
-    const b = entry.bot;
-    if (now < (b.nextMoveAt || 0)) return;
-    b.nextMoveAt = now + BOT_MOVE_BROADCAST_MS;
-    const pos = entry.pos;
-    const txt = JSON.stringify({
-        type: "player_move",
-        player_uid: entry.ws.matchUid || entry.uid,
-        spawn_index: entry.spawnIndex,
-        x: Math.round(pos.x * 1000) / 1000,
-        y: pos.y,
-        z: Math.round(pos.z * 1000) / 1000,
-        yaw: Math.round((pos.yaw || 0) * 1000) / 1000,
-        moving: !!pos.moving,
-        grounded: true
-    });
-    pos.moving = false;
-    for (const otherWs of room.players) {
-        if (otherWs !== entry.ws && otherWs.readyState === WebSocket.OPEN) otherWs.send(txt);
-    }
-}
-
-function botHuntTargetId(room, entry, role) {
-    const g = room.game;
-    // A hunter only ever goes for the enemy team: the mummy and zombie rules both
-    // refuse a hit on an ally, and chasing one would make a bot look stupid.
-    return botNearest(room, entry, (other) => {
-        if (other.side === entry.side) return false;
-        const id = mummyIdOf(other);
-        return g.roles[id] !== role && botBodyAlive(room, id) && !!botPositionOf(room, other);
-    });
-}
-
-function botFleeSource(room, entry) {
-    const g = room.game;
-    return botNearest(room, entry, (other) => {
-        if (other.side === entry.side) return false;
-        const id = mummyIdOf(other);
-        const role = g.roles[id];
-        return (role === "mummy" || role === "zombie") && botBodyAlive(room, id) && !!botPositionOf(room, other);
-    });
-}
-
-function botThink(room, entry, now, dt) {
-    const g = room.game;
-    const role = g.roles[mummyIdOf(entry)];
-    const b = entry.bot;
-
-    botPositionOf(room, entry);
-    // Feet first, before anything is aimed: the body is put on the floor the arena
-    // was measured with, so a chase, a line of sight and the wire all agree on
-    // the height the client is about to draw.
-    // Every guard below reads the floor under the body, so a body with no floor
-    // under it - one a push or a seat change left past the table's rim - steers
-    // with nothing to refuse it. This is the one place that picks the body back up
-    // and sets it down on measured ground, and it runs for a downed body too, so
-    // the client never draws someone standing on nothing.
-    const arena = arenaFor(room.mode);
-    let standY = botFeetAt(arena, entry.pos.x, entry.pos.z);
-    if (standY === null) {
-        const seat = botNearestStandableCell(arena, entry.pos.x, entry.pos.z);
-        const centre = botCellCentre(arena, seat);
-        standY = botCellFeet(arena, seat);
-        if (standY !== null) {
-            entry.pos.x = centre.x;
-            entry.pos.z = centre.z;
-            if (entry.bot) {
-                entry.bot.path = null;
-                entry.bot.pathGoal = -1;
-                entry.bot.progressDist = -1;
-            }
-        }
-    }
-    if (standY !== null) entry.pos.y = standY;
-    if (!botBodyAlive(room, mummyIdOf(entry))) {
-        // Downed or eliminated: stand still so the state the client draws matches
-        // the seat the body was left at.
-        entry.pos.moving = false;
-        botBroadcastMove(room, entry, now);
-        return;
-    }
-
-    if (role === "mummy" || role === "zombie") {
-        const prey = botHuntTargetId(room, entry, role);
-        if (prey) {
-            const preyId = mummyIdOf(prey.entry);
-            if (prey.distance <= BOT_ATTACK_RANGE) {
-                // Face them and swing on the server's cooldown; a hit only lands
-                // once the reach re-check inside the authority passes.
-                botSteer(room, entry, botYawTowards(entry.pos, prey.entry.pos), 0, dt, now);
-                if (now >= b.nextAttackAt) {
-                    b.nextAttackAt = now + BOT_ATTACK_COOLDOWN_MS;
-                    if (g.kind === "zombie") {
-                        performZombieSwing(room, entry);
-                        performZombieAttack(room, entry, preyId);
-                    } else {
-                        performMummySwing(room, entry);
-                        performMummyAttack(room, entry, preyId);
-                    }
-                }
-            } else {
-                botSteer(room, entry, botDrift(b, botNavigatedYaw(room, entry, prey.entry.pos, now)),
-                    b.reachedPartial ? 0 : botPace(b, BOT_RUN_SPEED), dt, now);
-            }
-        } else {
-            // Every enemy is down or out of the world: keep hunting nothing by
-            // walking the arena instead of freezing on the last kill spot.
-            botRoamStep(room, entry, now, dt);
-        }
-        botBroadcastMove(room, entry, now);
-        return;
-    }
-
-    // Human bot: keep away from the hunter, break line of sight by hugging the
-    // rim, and never walk into a second body.
-    const threat = botFleeSource(room, entry);
-    if (threat) {
-        const away = botYawTowards(threat.entry.pos, entry.pos);
-        if (threat.distance <= BOT_FLEE_START) {
-            // Running away is the one thing worth pathing for: a body that only
-            // knows "opposite the mummy" backs itself into a corner and dies.
-            const escape = botStandableAhead(arena, entry.pos,
-                blendAwayFromCrowd(room, entry, away), BOT_FLEE_REACH_M);
-            // and it keeps running when the search cannot find a route to the
-            // point it picked: a body with a hunter at 5 m that stands still
-            // because its escape lay across unreachable ground is a body that
-            // died deciding. The step-walk stops it at the wall face, so pushing
-            // along one is both safe and what a cornered player does.
-            botSteer(room, entry, botDrift(b, botNavigatedYaw(room, entry, escape, now)),
-                botPace(b, BOT_RUN_SPEED), dt, now);
-        } else if (threat.distance <= BOT_CAUTION_RANGE) {
-            // Not close enough to sprint, but do not stand facing them either:
-            // sidestep, which is what a player does while watching a mummy.
-            botSteer(room, entry, botDrift(b, blendAwayFromCrowd(room, entry, away + Math.PI / 2.4)), botPace(b, BOT_WALK_SPEED), dt, now);
-        } else {
-            // Far enough away to be safe: patrol the arena instead of camping, so
-            // the whole floor gets walked between fights.
-            botRoamStep(room, entry, now, dt);
-        }
-    } else {
-        // Nothing is chasing this bot at all: same patrol, because a bot that
-        // stands still in an empty arena is the fastest tell there is.
-        botRoamStep(room, entry, now, dt);
-    }
-    botBroadcastMove(room, entry, now);
-}
-
-// Two bots fleeing the same mummy would otherwise stack on one line; pushing
-// away from the nearest body of their own team splits them like real players
-// running to different cover.
-function blendAwayFromCrowd(room, entry, yaw) {
-    const crowd = botNearest(room, entry, (other) => other.side === entry.side
-        && botBodyAlive(room, mummyIdOf(other))
-        && flatDistance(entry.pos, botPositionOf(room, other)) < 2.2);
-    if (!crowd) return yaw;
-    const push = botYawTowards(crowd.entry.pos, entry.pos);
-    const delta = botAngleDelta(yaw, push);
-    return yaw + delta * 0.5;
-}
-
-// The next place a free bot walks to. Kept until it is reached or ages out, so a
-// bot commits to a leg instead of jittering on the spot; if the table offers
-// nothing at patrol distance, the leg it already had is the best answer.
-function botRoamGoal(room, entry, now) {
-    const arena = arenaFor(room.mode);
-    const b = entry.bot;
-    if (b.roam && now < b.roamUntil && flatDistance(entry.pos, b.roam) > 1.0) return b.roam;
-    const homePiece = arenaPieceAt(arena, botCellAt(arena, entry.pos.x, entry.pos.z));
-    for (let i = 0; i < BOT_ROAM_TRIES; i++) {
-        const idx = (Math.random() * arena.n * arena.n) | 0;
-        const feet = botCellFeet(arena, idx);
-        if (feet === null) continue;
-        // A leg across a piece of ground no stair reaches is a walk that ends in
-        // the middle of the arena with nothing left to do.
-        if (arenaPieceAt(arena, idx) !== homePiece) continue;
-        const c = botCellCentre(arena, idx);
-        const d = flatDistance(entry.pos, c);
-        if (d < BOT_ROAM_MIN_M || d > BOT_ROAM_MAX_M) continue;
-        b.roam = { x: c.x, y: feet, z: c.z };
-        b.roamUntil = now + BOT_ROAM_MS;
-        return b.roam;
-    }
-    return b.roam || null;
-}
-
-// Walking that leg: the same navigator and the same stuck handling a chase gets,
-// at walking pace, so patrolling never earns a bot a new way to clip a wall.
-function botRoamStep(room, entry, now, dt) {
-    const b = entry.bot;
-    const goal = botRoamGoal(room, entry, now);
-    if (!goal) {
-        entry.pos.moving = false;
-        return;
-    }
-    const yaw = blendAwayFromCrowd(room, entry, botNavigatedYaw(room, entry, goal, now));
-    botSteer(room, entry, botDrift(b, yaw), b.reachedPartial ? 0 : botPace(b, BOT_WALK_SPEED), dt, now);
-}
-
-function tickBots() {
-    const now = Date.now();
-    const dt = BOT_TICK_MS / 1000;
-    for (const room of matches.values()) {
-        const g = room.game;
-        if (!g || g.phase !== "playing" || g.settled) continue;
-        for (const entry of room.entries) {
-            if (!isBotPeer(entry.ws) || !entry.bot) continue;
-            try {
-                botThink(room, entry, now, dt);
-            } catch (err) {
-                console.error('[BOT] think failed:', err);
-            }
-        }
-    }
-}
-
 // ---- shared swing / hit authority ----
-// A real phone's `swing_start` and a bot's decision call exactly these four
+// Every `swing_start` a phone sends calls exactly these four
 // functions, so one set of rules - role, alive check, shield, clone, range,
 // damage - decides every hit in the game no matter who proposed it.
 function performMummySwing(room, attacker) {
@@ -3977,8 +2464,9 @@ function handleClientMessage(ws, data) {
                 sendJson(ws, { type: "team_size_mismatch", team_size: data.team_size });
                 break;
             }
-            // A zombie queue has one shape: a full Squad on each side. Any other
-            // request would wait forever on the 4v4 room gate, so it is refused here.
+            // A zombie room is Squad-sized on both sides and nothing else, so any
+            // other slot is refused here rather than left to wait on a gate it can
+            // never satisfy. Who is inside those four seats is the queue's business.
             if (mode === ZOMBIE_MODE && slot !== ZOMBIE_TEAM_SIZE) {
                 sendJson(ws, { type: "team_size_mismatch", team_size: slot, expected: ZOMBIE_TEAM_SIZE });
                 break;
@@ -3988,14 +2476,14 @@ function handleClientMessage(ws, data) {
             const username = data.username || "Player";
             const playerUid = uid || "";
 
-            // The queue size is the server's roster, never the number the client
-            // claims — so a party can only ever meet a party of the same size.
+            // The party's roster is the server's, never the number the client
+            // claims: a group may search a slot as big as it likes - the seats it
+            // does not fill go to players who searched that same slot alone - but
+            // it can never shrink itself to dodge a body it already has.
             const team = teamOf(ws);
             if (team && team.members.length > 1) {
                 if (team.leaderUid !== playerUid) { teamError(ws, "Only the team leader can start matchmaking"); break; }
-                // The slot must be the party's real size. A party cannot search
-                // for a bigger or smaller lobby than the one it already has.
-                if (team.members.length !== slot) {
+                if (team.members.length > slot) {
                     sendJson(ws, {
                         type: "team_size_mismatch",
                         team_size: slot,
@@ -4012,11 +2500,6 @@ function handleClientMessage(ws, data) {
             // Re-queueing is an update, not a second seat: the old entry (and any
             // old slot/mode) is dropped before the new one is added.
             removeFromAllQueues(ws);
-            // One body can never be a 4v4 side: the infection mode is party-only.
-            if (mode === ZOMBIE_MODE) {
-                sendJson(ws, { type: "team_size_mismatch", team_size: slot, expected: ZOMBIE_TEAM_SIZE });
-                break;
-            }
             queues[mode].push({
                 ws,
                 mode,
@@ -4029,7 +2512,7 @@ function handleClientMessage(ws, data) {
                 queuedAt: Date.now()
             });
             console.log(`[QUEUE] ${playerUid || "solo"} joined ${mode} slot ${slot}. Waiting: ${queues[mode].filter(e => e.slot === slot).length}/${slot * 2}`);
-            processSoloQueue(mode);
+            processMatchQueue(mode);
             break;
         }
 
@@ -4333,18 +2816,6 @@ function handleClientMessage(ws, data) {
 
 const mummyTick = setInterval(tickMummyMatches, 250);
 const zombieTick = setInterval(tickZombieMatches, 250);
-checkArena(BOT_ARENA_MUMMY, "mummy");
-arenaNavRange(BOT_ARENA_MUMMY, MUMMY_SPAWN_POINTS, "mummy");
-checkArena(BOT_ARENA_ZOMBIE, "zombie");
-arenaNavRange(BOT_ARENA_ZOMBIE, ZOMBIE_SPAWN_POINTS, "zombie");
-// Bot movement runs one step behind the rules tick, so a bot's position changes
-// are decided by the same tables that decide a hit, but sent at the 10 Hz the
-// arena interpolates at.
-const botTick = setInterval(tickBots, BOT_TICK_MS);
-// Waiting queues are re-checked twice a second; nothing else decides when a bot
-// may step in, so a queue with a real player arriving one second later keeps
-// their own match.
-const botFillTick = setInterval(fillBotsIfNeeded, 2000);
 
 const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
