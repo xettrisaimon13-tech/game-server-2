@@ -450,7 +450,10 @@ function initBotEntry(room, entry) {
         progressAt: 0,
         progressDist: -1,
         noProgress: 0,
-        reachedPartial: false
+        reachedPartial: false,
+        // Patrol state: the leg being walked and when to give up on it.
+        roam: null,
+        roamUntil: 0
     };
 }
 
@@ -471,6 +474,8 @@ function resetBotPositions(room) {
             e.bot.progressDist = -1;
             e.bot.noProgress = 0;
             e.bot.reachedPartial = false;
+            e.bot.roam = null;
+            e.bot.roamUntil = 0;
         }
     }
 }
@@ -1399,16 +1404,30 @@ const BOT_SIDESTEP_MS = parseInt(process.env.BOT_SIDESTEP_MS, 10) || 700;
 const BOT_PROGRESS_MS = parseInt(process.env.BOT_PROGRESS_MS, 10) || 900;
 const BOT_PROGRESS_SLACK_M = parseFloat(process.env.BOT_PROGRESS_SLACK_M) || 0.3;
 const BOT_FLEE_REACH_M = parseFloat(process.env.BOT_FLEE_REACH_M) || 9.0;
+// A bot with nobody to chase and nobody to run from used to stop dead where the
+// last body fell: a statue in one corner while the rest of the arena went unused.
+// A free bot now walks a patrol leg - a standable cell this far away, reached with
+// the same navigator a chase uses - so the whole floor gets used the way a player
+// rotating between fights uses it.
+const BOT_ROAM_MIN_M = parseFloat(process.env.BOT_ROAM_MIN_M) || 5.0;
+const BOT_ROAM_MAX_M = parseFloat(process.env.BOT_ROAM_MAX_M) || 15.0;
+const BOT_ROAM_TRIES = parseInt(process.env.BOT_ROAM_TRIES, 10) || 24;
+const BOT_ROAM_MS = parseInt(process.env.BOT_ROAM_MS, 10) || 6000;
 // One sweep of the largest table, so a route the map does have is never given up
 // on. Measured on the mummy arena, a full sweep costs about half a millisecond and
 // a bot only ever pays it when its goal changes cell, at most BOT_REPATH_MS apart.
 const BOT_PATH_BUDGET = parseInt(process.env.BOT_PATH_BUDGET, 10) || 20000;
 // How far a bot's centre keeps from anything the table calls blocked. The bake only
-// promised that a 0.60 m body fits at a cell's centre, and the drawn mummy is 2.71 m
-// across: on the deployed build a bot measured 0.25 m from the mask, which every
-// phone renders as the body standing inside the wall. At this clearance no frame of
-// a sixty second four-bot run came within 0.30 m of ground the map refuses.
-const BOT_BODY_CLEARANCE_M = parseFloat(process.env.BOT_BODY_CLEARANCE_M) || 0.75;
+// promised that a 0.60 m body fits at a cell's CENTRE, and a bot's centre can be up
+// to half a cell diagonal (0.18 m at this pitch) away from it, so a ring of cells
+// has to be clear before a cell is used at all.
+// 0.75 m was that ring until it was measured: it fenced the bots out of 1,182 of the
+// 6,081 lower-floor cells, left 5 cells of the stair band instead of 37, and the run
+// reads as bodies shuffling in the middle of the arena while the rim goes unused. At
+// 0.5 m (two rings) the floor keeps 5,291 cells, the stair band keeps 16, and a 0.42 m
+// body anywhere in a kept cell is still clear of every obstacle the bake found two
+// cells away. It is tunable: BOT_BODY_CLEARANCE_M=0.25 gives back the whole rim.
+const BOT_BODY_CLEARANCE_M = parseFloat(process.env.BOT_BODY_CLEARANCE_M) || 0.5;
 
 // ---- Baked arena walkability ----
 // mumuy_vs_human.tscn is fifteen trimesh colliders over three floor heights, and
@@ -1428,42 +1447,42 @@ const BOT_MUMMY_ARENA_ROWS = [
     "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "####PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "######PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "#########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "##########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "###########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "###########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "###########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "##########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "##########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "##########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "#########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "#########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "#########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "jii#####PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "jjiii###PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "jiii####PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "jiii###PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "jiii###PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "iii####PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "iii###PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "iii###PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "ii####PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "ii###PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "ii###PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "i####PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "i###PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "i###PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "####PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "###PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "###PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
-    "###PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "########PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "#######PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "#######PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "jii####PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "jjiii#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "jiii##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "jiii##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "jiii#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "iii##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "iii##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "iii#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "ii##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "ii##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "ii#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "i##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "i##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "i##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "##PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "#PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
+    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
     "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPP",
@@ -1475,54 +1494,55 @@ const BOT_MUMMY_ARENA_ROWS = [
     "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPQQQQQQQQ",
     "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPQQQQQQQQQRRR",
     "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPQQQQQQQQQRRRRRRR",
-    "PPPPPPPPPPPPPPPPPPPPPPP##############################################################################",
-    "PPPPPPPPPPPPPPPPPPPPPPP##############################################################################",
-    "PPPPPPPPPPPPPPPPPPPPPPP##                             ###############################################",
-    "PPPPPPPPPPPPPPPPPPPPPPP##                             ###############################################",
-    "PPPPPPPPPPPPPPPPPPPPPPP##                             ###############################################",
-    "PPPPPPPPPPPPPPPPPPPPPPP##                             ###############################################",
-    "PPPPPPPPPPPPPPPPPPPPPPP##                             ##ttttttttttttttttttttttttttttttttttttttttttttt",
-    "PPPPPPPPPPPPPPPPPPPPPPP##                             ##ttttttttttttttttttttttttttttttttttttttttttttt",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ##############################################################",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ##############################################################",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPPPPPPPPPPPPPPP##              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPPP###############              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPPP################              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP#################              ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ###kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
-    "PPPPPPPP###                            ##############################################################",
-    "PPPPPPPP###                            ##############################################################",
-    "PPPPPPPP###                                                                                          ",
-    "PPPPPPPP###                                                                                          "
+    "PPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPPQQQQQQQQRRRRRRRRRSSS",
+    "PPPPPPPPPPPPPPPPPPPPPPPPP############################################################################",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#                             ###############################################",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#                             ###############################################",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#                             #######t#############################t#########",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#                             #tttttttttttttttttttttttttttttttttttttttttttttt",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#                             #tttttttttttttttttttttttttttttttttttttttttttttt",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#                             ##ttttttttttttttttttttttttttttttttttttttttttttt",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              ##############################################################",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPPPPPPPPPPPPPPP#              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPPP##############              #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            #kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+    "PPPPPPPPPP#                            ##############################################################",
+    "PPPPPPPPPP#                                                                                          ",
+    "PPPPPPPPPP#                                                                                          ",
+
 ];
 let botCounter = 1;
 
@@ -2699,9 +2719,34 @@ function checkArena(arena, name) {
         }
     }
     const ok = Math.abs(span - arena.half * 2) < 0.001 && arena.rows.every(row => row.length === arena.n) && standable > 0;
+    // Standable is not the same as reachable. A clearance ring that is too wide, or
+    // a table that lost a stairway, both leave cells a body can never walk to, and
+    // that is exactly the "bots only use the middle of the map" report - so the boot
+    // line says how much of the floor the piece its centre stands on actually covers.
+    const n = arena.n;
+    const pieces = arenaPieces(arena);
+    let middle = -1;
+    let bestD = Infinity;
+    for (let i = 0; i < n * n; i++) {
+        const feet = botCellFeet(arena, i);
+        if (feet === null) continue;
+        const r = (i / n) | 0;
+        const c = i % n;
+        const x = -arena.half + c * arena.cell;
+        const z = -arena.half + r * arena.cell;
+        const d = x * x + z * z;
+        if (d < bestD) { bestD = d; middle = i; }
+    }
+    const home = middle < 0 ? -1 : pieces.ids[middle];
+    let reachable = 0;
+    for (let i = 0; i < pieces.ids.length; i++) {
+        if (pieces.ids[i] === home) reachable++;
+    }
     const cut = arena.baked ? ` (the baked table had ${arena.baked.standable})` : "";
     console.log(`[ARENA] ${name} walkability: ${arena.n}x${arena.n} cells at ${arena.cell} m, ` +
         `${standable} standable keeping ${arena.clearance || 0} m clear of the map${cut}` +
+        `, ${reachable} of them on the piece of ground its middle stands on, in ${pieces.count} piece${pieces.count === 1 ? "" : "s"}` +
+        `${reachable < standable ? ` (${standable - reachable} sit behind ground no body can cross - the upper deck is one of them)` : ""}` +
         `${ok ? "" : " - TABLE MISMATCH"}`);
     if (!ok) console.error(`[ARENA] ${name} walkability table is not usable: span ${span} vs ${arena.half * 2}`);
     return ok;
@@ -2734,6 +2779,49 @@ function botCellCentre(arena, idx) {
 
 function botFeetAt(arena, x, z) {
     return botCellFeet(arena, botCellAt(arena, x, z));
+}
+
+// The floor is not one piece. The upper deck of the measured arena is standable
+// ground that no stair reaches, and a strip of the rim cut by the clearance ring
+// can be another, so a search across the whole table fails for a body standing
+// anywhere else. Labelling the pieces once - with the same step rules a walk uses
+// - lets a patrol pick a leg it can actually get to instead of setting off for an
+// island, reaching the edge of its own ground, and standing there while the match
+// plays out behind it.
+function arenaPieces(arena) {
+    if (arena.pieces) return arena.pieces;
+    const n = arena.n;
+    const ids = new Int32Array(n * n).fill(-1);
+    const stack = [];
+    let piece = 0;
+    for (let start = 0; start < ids.length; start++) {
+        if (ids[start] !== -1 || botCellFeet(arena, start) === null) continue;
+        ids[start] = piece;
+        stack.push(start);
+        while (stack.length) {
+            const cur = stack.pop();
+            const cf = botCellFeet(arena, cur);
+            const r = (cur / n) | 0;
+            const c = cur % n;
+            const around = [r > 0 ? cur - n : -1, r < n - 1 ? cur + n : -1,
+                c > 0 ? cur - 1 : -1, c < n - 1 ? cur + 1 : -1];
+            for (const nb of around) {
+                if (nb < 0 || ids[nb] !== -1) continue;
+                const nf = botCellFeet(arena, nb);
+                if (nf === null || nf - cf > BOT_STEP_UP_M || cf - nf > BOT_STEP_DOWN_M) continue;
+                ids[nb] = piece;
+                stack.push(nb);
+            }
+        }
+        piece++;
+    }
+    arena.pieces = { ids: ids, count: piece };
+    return arena.pieces;
+}
+
+function arenaPieceAt(arena, idx) {
+    if (idx < 0) return -1;
+    return arenaPieces(arena).ids[idx];
 }
 
 // Enterable means the cell stands a body up at all AND the change of floor from
@@ -3127,6 +3215,7 @@ function botSteer(room, entry, desiredYaw, speed, dt, now) {
     // The mummy arena's boundary is its baked table (the step-walk refuses
     // every cell past it), so only the generated zombie disc needs a radius.
     const radius = room.mode === ZOMBIE_MODE ? BOT_ARENA_RADIUS_ZOMBIE : Infinity;
+    const inside = (x, z) => x * x + z * z <= radius * radius;
 
     // The floor the body is really standing on, straight off the table. Every
     // height test below compares a candidate against this rather than against a
@@ -3134,6 +3223,7 @@ function botSteer(room, entry, desiredYaw, speed, dt, now) {
     const home = botFeetAt(arena, pos.x, pos.z);
     const wasX = pos.x;
     const wasZ = pos.z;
+    let stalled = false;
 
     let want = desiredYaw;
     // A body whose detour window is still open walks the beside-line it chose when
@@ -3141,47 +3231,49 @@ function botSteer(room, entry, desiredYaw, speed, dt, now) {
     if (speed > 0 && now < b.unstickUntil) want += b.unstickSide;
 
     const delta = botAngleDelta(pos.yaw || 0, want);
-    const maxTurn = BOT_TURN_SPEED * dt;
+    // A body on an open detour turns at twice the running rate. The ease is what a
+    // straight line needs; against a wall it is the difference between a slide and
+    // half a second of feet that go nowhere, which is the pause a phone reads as
+    // the bot giving up on the chase.
+    const maxTurn = BOT_TURN_SPEED * dt * (now < b.unstickUntil ? 2 : 1);
     const turn = Math.abs(delta) < maxTurn ? delta : Math.sign(delta) * maxTurn;
     const yaw = (pos.yaw || 0) + turn;
 
     const step = speed * dt;
-    let nx = pos.x + Math.sin(yaw) * step;
-    let nz = pos.z + Math.cos(yaw) * step;
+    let nx = pos.x;
+    let nz = pos.z;
 
-    // HARD BOUNDARY: Never leave the arena
-    if (nx * nx + nz * nz > radius * radius) {
-        nx = pos.x;
-        nz = pos.z;
-    }
-
-    // WALL COLLISION: Simple, strict check - if destination is invalid, don't move
+    // The commanded step is walked half a cell at a time and ends at the last
+    // point the table says a body fits: the spot in front of a wall, never a point
+    // past it. Refusing the whole step instead - which is what a destination-only
+    // check does - is the freeze a phone sees on a body pressed along a wall face:
+    // it loses that tick's metres outright, loses the next two as well, and then
+    // the stuck handling throws the route away and turns around. Walking the line
+    // keeps the slide a player gets for free and cannot earn a pass through the
+    // wall, because it is the same half-cell sample the nav searches by.
+    //
+    // A body with no floor under it is the one case that gets no say at all. The
+    // tick that picks it up and sets it down on measured ground runs before this
+    // one, so getting here means something put it there; letting it steer without
+    // the table's answer is how a body ends up walking through a wall, and it has
+    // no height to compare a step against either.
     if (home !== null) {
-        const destFeet = botFeetAt(arena, nx, nz);
-        if (destFeet === null) {
-            // Destination is inside a wall or off the map - don't move
-            nx = pos.x;
-            nz = pos.z;
-        } else {
-            // Check if the path crosses a wall
-            const pathClear = botLineClear(arena, pos, { x: nx, y: destFeet, z: nz });
-            if (!pathClear) {
-                nx = pos.x;
-                nz = pos.z;
+        const walked = botStepTo(arena, home, pos.x, pos.z,
+            pos.x + Math.sin(yaw) * step, pos.z + Math.cos(yaw) * step);
+        // The mummy arena ends at its baked table; the generated disc is a radius,
+        // so it needs saying once here rather than trusting the walk.
+        if (inside(walked.x, walked.z)) {
+            nx = walked.x;
+            nz = walked.z;
+            // Bodies are solid too: the same pass a real phone's report goes
+            // through, so a bot and a player cannot occupy one spot on a screen.
+            // A push the table refuses is a push through a wall, so it is dropped
+            // rather than taken back out of the room's geometry.
+            const separated = separateFromRoom(room, entry, nx, nz);
+            if (inside(separated.x, separated.z) && botPointEnterable(arena, home, separated.x, separated.z)) {
+                nx = separated.x;
+                nz = separated.z;
             }
-        }
-    }
-
-    if (home !== null) {
-        // Bodies are solid too. This is the same pass a real phone's report goes
-        // through, so a bot and a player cannot occupy one spot on anybody's screen.
-        const separated = separateFromRoom(room, entry, nx, nz);
-        if (botPointEnterable(arena, home, separated.x, separated.z)) {
-            nx = separated.x;
-            nz = separated.z;
-        } else if (!botPointEnterable(arena, home, nx, nz)) {
-            nx = pos.x;
-            nz = pos.z;
         }
     }
 
@@ -3197,15 +3289,21 @@ function botSteer(room, entry, desiredYaw, speed, dt, now) {
         const gainX = pos.x - wasX;
         const gainZ = pos.z - wasZ;
         const least = step * 0.25;
-        if (gainX * gainX + gainZ * gainZ < least * least) b.blockedTicks++;
+        stalled = gainX * gainX + gainZ * gainZ < least * least;
+        if (stalled) b.blockedTicks++;
         else b.blockedTicks = 0;
     } else {
         b.blockedTicks = 0;
     }
-    if (b.blockedTicks >= BOT_BLOCKED_TICKS && now >= b.unstickUntil) {
+    // A side-step that keeps being refused is the shoulder that points into the
+    // wall, and holding it for the rest of its window is the freeze a phone sees:
+    // a body in the walk clip that goes nowhere. So the reaction fires again inside
+    // an open window, and the second answer is to reverse and walk back out.
+    if (b.blockedTicks >= BOT_BLOCKED_TICKS) {
+        const insideDetour = now < b.unstickUntil;
         b.blockedTicks = 0;
-        b.unstickUntil = now + BOT_SIDESTEP_MS;
-        b.unstickSide = botOpenSide(arena, pos, yaw, b);
+        b.unstickSide = insideDetour ? Math.PI : botOpenSide(arena, pos, yaw, b);
+        b.unstickUntil = now + (insideDetour ? BOT_SIDESTEP_MS / 2 : BOT_SIDESTEP_MS);
         b.path = null;
         b.pathGoal = -1;
         b.noProgress = 0;
@@ -3216,8 +3314,10 @@ function botSteer(room, entry, desiredYaw, speed, dt, now) {
     if (feet !== null) pos.y = feet;
     // A speed of 0 means "face them, do not step": the client picks its
     // locomotion clip off this flag, so a swinging bot must not look like it
-    // is sprinting on the spot.
-    pos.moving = step > 0.0001;
+    // is sprinting on the spot. A body the map refused has to say the same thing -
+    // a commanded step it never took is reported as standing still, which is both
+    // what the phone draws and what the stuck checks above are already doing.
+    pos.moving = step > 0.0001 && !stalled;
 
     // Progress stuck detection: a body can slide along a wall for minutes and
     // move in metres without ever closing on the point the nav gave it - the
@@ -3300,7 +3400,27 @@ function botThink(room, entry, now, dt) {
     // Feet first, before anything is aimed: the body is put on the floor the arena
     // was measured with, so a chase, a line of sight and the wire all agree on
     // the height the client is about to draw.
-    const standY = botFeetAt(arenaFor(room.mode), entry.pos.x, entry.pos.z);
+    // Every guard below reads the floor under the body, so a body with no floor
+    // under it - one a push or a seat change left past the table's rim - steers
+    // with nothing to refuse it. This is the one place that picks the body back up
+    // and sets it down on measured ground, and it runs for a downed body too, so
+    // the client never draws someone standing on nothing.
+    const arena = arenaFor(room.mode);
+    let standY = botFeetAt(arena, entry.pos.x, entry.pos.z);
+    if (standY === null) {
+        const seat = botNearestStandableCell(arena, entry.pos.x, entry.pos.z);
+        const centre = botCellCentre(arena, seat);
+        standY = botCellFeet(arena, seat);
+        if (standY !== null) {
+            entry.pos.x = centre.x;
+            entry.pos.z = centre.z;
+            if (entry.bot) {
+                entry.bot.path = null;
+                entry.bot.pathGoal = -1;
+                entry.bot.progressDist = -1;
+            }
+        }
+    }
     if (standY !== null) entry.pos.y = standY;
     if (!botBodyAlive(room, mummyIdOf(entry))) {
         // Downed or eliminated: stand still so the state the client draws matches
@@ -3333,7 +3453,9 @@ function botThink(room, entry, now, dt) {
                     b.reachedPartial ? 0 : botPace(b, BOT_RUN_SPEED), dt, now);
             }
         } else {
-            entry.pos.moving = false;
+            // Every enemy is down or out of the world: keep hunting nothing by
+            // walking the arena instead of freezing on the last kill spot.
+            botRoamStep(room, entry, now, dt);
         }
         botBroadcastMove(room, entry, now);
         return;
@@ -3347,23 +3469,28 @@ function botThink(room, entry, now, dt) {
         if (threat.distance <= BOT_FLEE_START) {
             // Running away is the one thing worth pathing for: a body that only
             // knows "opposite the mummy" backs itself into a corner and dies.
-            const arena = arenaFor(room.mode);
             const escape = botStandableAhead(arena, entry.pos,
                 blendAwayFromCrowd(room, entry, away), BOT_FLEE_REACH_M);
+            // and it keeps running when the search cannot find a route to the
+            // point it picked: a body with a hunter at 5 m that stands still
+            // because its escape lay across unreachable ground is a body that
+            // died deciding. The step-walk stops it at the wall face, so pushing
+            // along one is both safe and what a cornered player does.
             botSteer(room, entry, botDrift(b, botNavigatedYaw(room, entry, escape, now)),
-                b.reachedPartial ? 0 : botPace(b, BOT_RUN_SPEED), dt, now);
+                botPace(b, BOT_RUN_SPEED), dt, now);
         } else if (threat.distance <= BOT_CAUTION_RANGE) {
             // Not close enough to sprint, but do not stand facing them either:
             // sidestep, which is what a player does while watching a mummy.
             botSteer(room, entry, botDrift(b, blendAwayFromCrowd(room, entry, away + Math.PI / 2.4)), botPace(b, BOT_WALK_SPEED), dt, now);
         } else {
-            // Safe: drift away from everybody and settle, which reads as camping.
-            const crowd = botNearest(room, entry, (other) => other.side === entry.side && botBodyAlive(room, mummyIdOf(other)));
-            const heading = crowd ? botYawTowards(crowd.entry.pos, entry.pos) : away;
-            botSteer(room, entry, botDrift(b, heading), botPace(b, BOT_WALK_SPEED) * 0.6, dt, now);
+            // Far enough away to be safe: patrol the arena instead of camping, so
+            // the whole floor gets walked between fights.
+            botRoamStep(room, entry, now, dt);
         }
     } else {
-        entry.pos.moving = false;
+        // Nothing is chasing this bot at all: same patrol, because a bot that
+        // stands still in an empty arena is the fastest tell there is.
+        botRoamStep(room, entry, now, dt);
     }
     botBroadcastMove(room, entry, now);
 }
@@ -3379,6 +3506,44 @@ function blendAwayFromCrowd(room, entry, yaw) {
     const push = botYawTowards(crowd.entry.pos, entry.pos);
     const delta = botAngleDelta(yaw, push);
     return yaw + delta * 0.5;
+}
+
+// The next place a free bot walks to. Kept until it is reached or ages out, so a
+// bot commits to a leg instead of jittering on the spot; if the table offers
+// nothing at patrol distance, the leg it already had is the best answer.
+function botRoamGoal(room, entry, now) {
+    const arena = arenaFor(room.mode);
+    const b = entry.bot;
+    if (b.roam && now < b.roamUntil && flatDistance(entry.pos, b.roam) > 1.0) return b.roam;
+    const homePiece = arenaPieceAt(arena, botCellAt(arena, entry.pos.x, entry.pos.z));
+    for (let i = 0; i < BOT_ROAM_TRIES; i++) {
+        const idx = (Math.random() * arena.n * arena.n) | 0;
+        const feet = botCellFeet(arena, idx);
+        if (feet === null) continue;
+        // A leg across a piece of ground no stair reaches is a walk that ends in
+        // the middle of the arena with nothing left to do.
+        if (arenaPieceAt(arena, idx) !== homePiece) continue;
+        const c = botCellCentre(arena, idx);
+        const d = flatDistance(entry.pos, c);
+        if (d < BOT_ROAM_MIN_M || d > BOT_ROAM_MAX_M) continue;
+        b.roam = { x: c.x, y: feet, z: c.z };
+        b.roamUntil = now + BOT_ROAM_MS;
+        return b.roam;
+    }
+    return b.roam || null;
+}
+
+// Walking that leg: the same navigator and the same stuck handling a chase gets,
+// at walking pace, so patrolling never earns a bot a new way to clip a wall.
+function botRoamStep(room, entry, now, dt) {
+    const b = entry.bot;
+    const goal = botRoamGoal(room, entry, now);
+    if (!goal) {
+        entry.pos.moving = false;
+        return;
+    }
+    const yaw = blendAwayFromCrowd(room, entry, botNavigatedYaw(room, entry, goal, now));
+    botSteer(room, entry, botDrift(b, yaw), b.reachedPartial ? 0 : botPace(b, BOT_WALK_SPEED), dt, now);
 }
 
 function tickBots() {
