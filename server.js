@@ -2025,6 +2025,219 @@ function cancelMummyWaiting(room) {
     matches.delete(room.matchId);
 }
 
+// ---------------------------------------------------------------------- bots --
+// Nobody online to fight: a lone Solo searcher gets a smart bot opponent after
+// 30-50 seconds instead of staring at a search that can never pair. This is a
+// 1v1-only mercy rule - Squad and Zombie still wait for real bodies exactly as
+// before, so a team match is never quietly padded.
+//
+// The bot is a plain hub-side object shaped like a socket - the same trick the
+// cross-server relay already uses for a phone on another region - so every rule
+// below (roles, combat, scoring, the arena's own movement frames) runs on it
+// unchanged, and the opponent's phone cannot tell it apart from a real player.
+const BOT_FILL_MIN_MS = parseInt(process.env.BOT_FILL_MIN_MS, 10) || 30000;
+const BOT_FILL_MAX_MS = parseInt(process.env.BOT_FILL_MAX_MS, 10) || 50000;
+const BOT_STEP_MS = 100;                 // matches the 10 Hz a phone reports at
+const BOT_MOVE_SPEED = 4.2;              // metres/second; a player walks 5.5, so it can be outrun
+const BOT_ATTACK_COOLDOWN_MS = 1200;     // one swing about every 1.2s once it is in reach
+const BOT_NAMES = ["RYUK", "NOVA", "ZANE", "KIRA", "ACE", "ORION"];
+// The 1v1 arena floor, read off the spawn markers in mumuy_vs_human.tscn. A bot
+// is held inside this box so a chase can never walk it off the map.
+const BOT_1V1_SPAWNS = [
+    { x: -10, y: 6.55, z: 0 },          // spawn_index 0 -> Spawn1
+    { x: 9.239, y: 6.55, z: -3.827 }    // spawn_index 1 -> Spawn2
+];
+const BOT_ARENA = { minX: -16, maxX: 16, minZ: -38, maxZ: 4 };
+
+let botCounter = 0;
+let lastBotScanAt = 0;
+
+function makeBotSocket(botId) {
+    return {
+        __bot: true,
+        isBot: true,
+        readyState: 1,      // WebSocket.OPEN, so every sendJson / send path takes it
+        isAlive: true,
+        playerUid: botId,
+        teamId: "",
+        matchId: null,
+        matchSpawnIndex: undefined,
+        matchUid: "",
+        send: () => {}      // a bot has no phone to deliver to
+    };
+}
+
+function botEntryOf(room) {
+    return room.entries.find(e => e.ws && e.ws.isBot) || null;
+}
+
+// A lone Solo searcher, 30-50 seconds in, gets a bot instead of an empty pool.
+function tickBotFill(now) {
+    // Only the hub ever owns a queue; a relay holds nothing to fill.
+    if (HUB_URL !== "") return;
+    if (now - lastBotScanAt < 1000) return;
+    lastBotScanAt = now;
+
+    const mode = MUMMY_MODE;
+    if (!queues[mode]) return;
+    const slot = 1;
+    const solos = queues[mode].filter(e => e.slot === slot && queueEntryUsable(e, mode, slot));
+    // Two real searchers are the queue's own business and pair within seconds.
+    // Only a pool that cannot possibly pair earns a bot.
+    if (solos.length !== 1) return;
+    if (usableGroups(mode, slot).length > 0) return;
+
+    const solo = solos[0];
+    if (!solo.botDelayMs) {
+        solo.botDelayMs = BOT_FILL_MIN_MS + Math.random() * (BOT_FILL_MAX_MS - BOT_FILL_MIN_MS);
+    }
+    if (now - (solo.queuedAt || now) < solo.botDelayMs) return;
+
+    seatBotOpponent(mode, slot, solo);
+}
+
+function seatBotOpponent(mode, slot, solo) {
+    const botId = `bot_${++botCounter}`;
+    const botWs = makeBotSocket(botId);
+    const botEntry = {
+        ws: botWs,
+        mode,
+        slot,
+        teamSize: 1,
+        characterId: 1 + Math.floor(Math.random() * 4),
+        bundleId: -1,
+        username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)],
+        playerUid: botId,
+        queuedAt: Date.now()
+    };
+
+    // The searcher leaves the pool before the room is built, so a real opponent
+    // arriving on this same tick cannot be seated twice.
+    const idx = queues[mode].indexOf(solo);
+    if (idx !== -1) queues[mode].splice(idx, 1);
+
+    // The room builder is the same one real matches use: it re-checks every
+    // socket, seat and side size, so a bot room is never built any looser than a
+    // human one.
+    const built = makeRoom(mode, [{ members: [solo], teamId: "" }, { members: [botEntry], teamId: "" }]);
+    if (!built) {
+        queues[mode].push(solo);
+        return;
+    }
+
+    const room = matches.get(solo.ws.matchId);
+    const bot = room && botEntryOf(room);
+    if (!room || !room.game || !bot) return;
+
+    room.isBotRoom = true;
+    // Both bodies start on the arena's own spawn points, so the chase has two
+    // real positions before the first movement frame lands.
+    for (const e of room.entries) {
+        const at = BOT_1V1_SPAWNS[e.spawnIndex] || BOT_1V1_SPAWNS[0];
+        e.pos = { x: at.x, y: at.y, z: at.z, yaw: 0 };
+    }
+    // A bot has no phone to press Ready: it is ready the moment it is seated, so
+    // the player's own Ready is what opens the round.
+    room.game.ready.add(mummyIdOf(bot));
+    broadcastMummyState(room, true);
+    console.log(`[BOT] ${botId} filled ${room.matchId} for ${solo.playerUid || "solo"} after ${Math.round((Date.now() - solo.queuedAt) / 1000)}s`);
+}
+
+// Move one bot for one tick. It plays by the same rules as a phone: it pushes a
+// position into the room, broadcasts the same `player_move` frame a phone would,
+// and lands its hits through the shared swing/attack authority.
+function tickBotBrain(room, now) {
+    const g = room.game;
+    if (!g || g.phase !== "playing" || g.settled) return;
+
+    const bot = botEntryOf(room);
+    if (!bot || bot.gone || !bot.pos) return;
+    const botId = mummyIdOf(bot);
+    if (!mummyAlive(room, botId)) return;
+
+    const role = g.roles[botId] || "human";
+    const foes = room.entries.filter(e => e !== bot
+        && g.roles[mummyIdOf(e)] !== role
+        && mummyAlive(room, mummyIdOf(e))
+        && e.pos);
+    if (foes.length === 0) return;
+
+    // Whatever the round, the bot's business is the nearest body it is not
+    // allowed to ignore: a Mummy's prey, or the Mummy a Human is escaping.
+    let target = foes[0];
+    let best = flatDistance(bot.pos, target.pos);
+    for (const f of foes) {
+        const d = flatDistance(bot.pos, f.pos);
+        if (d < best) { best = d; target = f; }
+    }
+
+    const dt = BOT_STEP_MS / 1000;
+    let dx = Number(target.pos.x) - Number(bot.pos.x);
+    let dz = Number(target.pos.z) - Number(bot.pos.z);
+    const dist = Math.hypot(dx, dz) || 1;
+    dx /= dist;
+    dz /= dist;
+
+    // A Mummy closes in, a Human keeps its distance. Either way the bot yields to
+    // the walls, so a chase never pins it in a corner of the arena.
+    const sign = role === "mummy" ? 1 : -1;
+    let nx = bot.pos.x + sign * dx * BOT_MOVE_SPEED * dt;
+    let nz = bot.pos.z + sign * dz * BOT_MOVE_SPEED * dt;
+    const cx = Math.min(BOT_ARENA.maxX, Math.max(BOT_ARENA.minX, nx));
+    const cz = Math.min(BOT_ARENA.maxZ, Math.max(BOT_ARENA.minZ, nz));
+    if (cx !== nx || cz !== nz) {
+        // Ran into a wall: slide along it instead of standing still.
+        nx = Math.min(BOT_ARENA.maxX, Math.max(BOT_ARENA.minX, bot.pos.x + sign * -dz * BOT_MOVE_SPEED * dt));
+        nz = Math.min(BOT_ARENA.maxZ, Math.max(BOT_ARENA.minZ, bot.pos.z + sign * dx * BOT_MOVE_SPEED * dt));
+    } else {
+        nx = cx;
+        nz = cz;
+    }
+
+    // Face the way it is travelling, in Godot's yaw convention (local -Z is ahead).
+    const yaw = Math.atan2(-(sign * dx), -(sign * dz));
+    const py = bot.pos.y;
+    bot.pos = { x: nx, y: py, z: nz, yaw };
+
+    // The exact frame a phone emits, so the opponent's screen animates the bot
+    // through the remote-player path it already uses for real players.
+    const frame = JSON.stringify({
+        type: "player_move",
+        match_id: room.matchId,
+        x: nx,
+        y: py,
+        z: nz,
+        yaw: yaw,
+        moving: true,
+        vy: 0,
+        grounded: true,
+        crouch: false,
+        slide: false,
+        player_uid: bot.uid,
+        spawn_index: bot.spawnIndex
+    });
+    for (const e of room.entries) {
+        if (e !== bot && e.ws.readyState === WebSocket.OPEN) e.ws.send(frame);
+    }
+
+    // Only the hunting side lands hits, and only from its own reach - both are
+    // re-checked inside performMummyAttack before a point is ever paid.
+    if (role !== "mummy") return;
+    if (flatDistance(bot.pos, target.pos) > MUMMY_ATTACK_RANGE) return;
+    if (now - (bot.lastSwingAt || 0) < BOT_ATTACK_COOLDOWN_MS) return;
+    bot.lastSwingAt = now;
+    performMummySwing(room, bot);
+    performMummyAttack(room, bot, mummyIdOf(target));
+}
+
+function tickBots(now) {
+    if (HUB_URL !== "") return;
+    tickBotFill(now);
+    for (const room of matches.values()) {
+        if (room.isBotRoom) tickBotBrain(room, now);
+    }
+}
+
 // --------------------------------------------------------------------- zombie --
 // The infection mode's room: two four-player teams, one freshly woken zombie on
 // each side, and every caught human joining the catcher's count the same tick.
@@ -2884,6 +3097,9 @@ function handleClientMessage(ws, data) {
 
 const mummyTick = setInterval(tickMummyMatches, 250);
 const zombieTick = setInterval(tickZombieMatches, 250);
+// The bot runs on its own faster clock so it moves as smoothly as a phone does
+// (10 Hz), and the fill scan inside it only looks at a pool once a second.
+const botTick = setInterval(() => tickBots(Date.now()), BOT_STEP_MS);
 
 const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
@@ -2899,6 +3115,7 @@ wss.on('close', () => {
     clearInterval(interval);
     clearInterval(mummyTick);
     clearInterval(zombieTick);
+    clearInterval(botTick);
 });
 
 server.listen(PORT, () => {
