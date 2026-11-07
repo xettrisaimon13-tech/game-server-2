@@ -30,6 +30,7 @@ function load(name) {
 }
 
 const http = require('http');
+const crypto = require('crypto');
 const wsLib = load('ws');
 const WebSocketServer = wsLib.WebSocketServer || wsLib.Server;
 const WebSocket = wsLib.WebSocket;
@@ -82,6 +83,7 @@ function handleHealth(req, res) {
     respondJson(res, 200, {
         status: "online",
         service: "Flame Strike Game Server",
+        voice: !!(process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET),
         timestamp: new Date().toISOString()
     });
 }
@@ -206,7 +208,72 @@ function handlePoll(req, res, state) {
     respondJson(res, 200, { pending: true });
 }
 
-// Everything that is not a websocket upgrade lands here: the four routes above,
+// ==========================================
+// VOICE (LiveKit)
+// ==========================================
+// Voice is relayed by LiveKit, and a client may only join a room if it carries
+// a token signed with the project's API secret. Signing it here keeps the
+// secret on the server instead of inside the game. node's own crypto does the
+// HMAC, so the image still only needs ws.
+//
+// Three environment variables on Render turn it on:
+//   LIVEKIT_URL         wss://<project>.livekit.cloud
+//   LIVEKIT_API_KEY     the project's API key
+//   LIVEKIT_API_SECRET  the project's API secret
+//
+// Until they are set, /voice/token answers 503 and the game leaves voice off.
+//
+// One token server covers every region: whichever game server a player picked,
+// they ask here and land in the same LiveKit room, so voice crosses regions.
+const VOICE_TOKEN_TTL_SECONDS = 6 * 60 * 60;
+
+function base64url(input) {
+    return Buffer.from(input).toString('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function sanitizeId(value) {
+    return String(value || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64);
+}
+
+function makeLiveKitToken(apiKey, apiSecret, identity, room) {
+    const now = Math.floor(Date.now() / 1000);
+    const header = { alg: 'HS256', typ: 'JWT' };
+    const payload = {
+        iss: apiKey, sub: identity, name: identity,
+        nbf: now - 5, exp: now + VOICE_TOKEN_TTL_SECONDS,
+        video: {
+            room: room, roomJoin: true, canPublish: true,
+            canSubscribe: true, canPublishData: true
+        }
+    };
+    const body = base64url(JSON.stringify(header)) + '.' + base64url(JSON.stringify(payload));
+    const sig = crypto.createHmac('sha256', apiSecret).update(body).digest();
+    return body + '.' + base64url(sig);
+}
+
+function handleVoiceToken(req, res) {
+    const apiKey = process.env.LIVEKIT_API_KEY;
+    const apiSecret = process.env.LIVEKIT_API_SECRET;
+    if (!apiKey || !apiSecret) {
+        respondJson(res, 503, { error: "Voice not configured" });
+        return;
+    }
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const identity = sanitizeId(params.get('identity'))
+        || ('guest-' + Math.random().toString(36).slice(2, 10));
+    const room = sanitizeId(params.get('room')) || 'lobby';
+    const token = makeLiveKitToken(apiKey, apiSecret, identity, room);
+    console.log('[VOICE] token issued for', identity, 'in room', room);
+    respondJson(res, 200, {
+        token: token,
+        url: process.env.LIVEKIT_URL || '',
+        room: room,
+        identity: identity
+    });
+}
+
+// Everything that is not a websocket upgrade lands here: the routes above,
 // and a plain 404 for the rest.
 function routeHttp(req, res) {
     const path = String(req.url || '').split('?')[0];
@@ -221,6 +288,7 @@ function routeHttp(req, res) {
         handlePoll(req, res, new URL(req.url, 'http://localhost').searchParams.get('state'));
         return;
     }
+    if (req.method === 'GET' && path === '/voice/token') { handleVoiceToken(req, res); return; }
     respondJson(res, 404, { error: "Not found" });
 }
 
