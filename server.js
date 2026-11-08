@@ -632,7 +632,20 @@ function connectToHub() {
             }
         }
     });
-    hubWs.on('message', (message) => {
+    hubWs.on('message', (message, isBinary) => {
+        if (isBinary) {
+            // Voice relay from the hub: [0x59][1-byte len][connId][voice frame].
+            if (message.length > 3 && message[0] === 0x59) {
+                const len = message[1];
+                if (2 + len <= message.length) {
+                    const target = connsById.get(message.subarray(2, 2 + len).toString("utf8"));
+                    if (target && target.readyState === WebSocket.OPEN) {
+                        target.send(message.subarray(2 + len));
+                    }
+                }
+            }
+            return;
+        }
         let data;
         try { data = JSON.parse(message.toString()); } catch (e) { return; }
         if (data.type === "hub_to") {
@@ -692,6 +705,12 @@ function makePeer(regionId, connId) {
             if (l && l.ws.readyState === WebSocket.OPEN) {
                 l.ws.send(JSON.stringify({ type: "hub_to", conn: connId, data: text }));
             }
+        },
+        sendBinary: (buf) => {
+            const l = regionLinks.get(regionId);
+            if (l && l.ws.readyState === WebSocket.OPEN) {
+                l.ws.send(makeVoiceRelay(connId, buf));
+            }
         }
     };
     if (link) {
@@ -745,6 +764,66 @@ function dropRegionLink(ws) {
     console.log(`[HUB] region ${ws.regionId} dropped (${link.peers.size} players released)`);
 }
 
+// ---- voice relay ------------------------------------------------------------
+// Android phones run voice over the game socket instead of the LiveKit plugin
+// (its native layer SIGSEGVs there). A voice room is just a sanitized key the
+// hub groups sockets under: every 0x56 PCM frame a member sends is relayed to
+// the other members only. Regions never see the key, they only ferry frames.
+
+const voiceGroups = new Map(); // voiceKey -> Set of member bodies (socket or peer)
+const VOICE_FRAME_MAX = 4096;
+
+// Lobby and match keys are short ids, so a whitelist is the whole sanitizer.
+function sanitizeVoiceKey(raw) {
+    return String(raw || "").replace(/[^A-Za-z0-9_\-]/g, "").slice(0, 64);
+}
+
+function leaveVoice(ws) {
+    const key = ws.voiceKey;
+    if (!key) return;
+    ws.voiceKey = "";
+    const set = voiceGroups.get(key);
+    if (set && set.delete(ws)) {
+        if (set.size === 0) voiceGroups.delete(key);
+        else sendVoiceList(key);
+    }
+}
+
+function sendVoiceList(key) {
+    const set = voiceGroups.get(key);
+    if (!set) return;
+    const uids = [];
+    for (const body of set) {
+        if (body.playerUid && body.readyState === WebSocket.OPEN) uids.push(body.playerUid);
+    }
+    const txt = JSON.stringify({ type: "voice_list", voice_key: key, uids: uids });
+    for (const body of set) body.send(txt);
+}
+
+// A player's own frame: [0x56][16-byte uid][int16 LE PCM]. The uid rides along
+// so clients can mute per player without trusting the relay's routing.
+function relayVoice(ws, frame) {
+    const set = ws.voiceKey ? voiceGroups.get(ws.voiceKey) : null;
+    if (!set) return;
+    for (const body of set) {
+        if (body === ws) continue;
+        if (body.sendBinary) body.sendBinary(frame);
+        else body.send(frame);
+    }
+}
+
+// Region -> hub voice framing: [0x59][1-byte len][connId][voice frame]. The
+// connId is variable length, hence the length byte.
+function makeVoiceRelay(connId, frame) {
+    const id = Buffer.from(String(connId), "utf8");
+    const out = Buffer.alloc(2 + id.length + frame.length);
+    out[0] = 0x59;
+    out[1] = id.length;
+    id.copy(out, 2);
+    frame.copy(out, 2 + id.length);
+    return out;
+}
+
 wss.on('connection', (ws) => {
     console.log('[WS] New connection');
     ws.isAlive = true;
@@ -760,7 +839,32 @@ wss.on('connection', (ws) => {
         ws.isAlive = true;
     });
 
-    ws.on('message', (message) => {
+    ws.on('message', (message, isBinary) => {
+        if (isBinary) {
+            // 0x59 from a linked region is a member's voice frame; 0x56 from a
+            // player socket is the member itself. Anything else is ignored.
+            if (message.length > 3 && message[0] === 0x59) {
+                if (ws.isRegion) {
+                    const link = regionLinks.get(ws.regionId);
+                    const len = message[1];
+                    if (link && 2 + len <= message.length) {
+                        const peer = link.peers.get(message.subarray(2, 2 + len).toString("utf8"));
+                        if (peer) relayVoice(peer, message.subarray(2 + len));
+                    }
+                }
+                return;
+            }
+            if (message[0] === 0x56 && message.length >= 19 && message.length <= VOICE_FRAME_MAX) {
+                if (HUB_URL !== "") {
+                    if (hubWs && hubWs.readyState === WebSocket.OPEN) {
+                        hubWs.send(makeVoiceRelay(ws.connId, message));
+                    }
+                } else {
+                    relayVoice(ws, message);
+                }
+            }
+            return;
+        }
         let data;
         try {
             data = JSON.parse(message.toString());
@@ -802,6 +906,7 @@ wss.on('connection', (ws) => {
 // queue, team and room this body was part of hears about it exactly once.
 function dropPeer(ws) {
     console.log('[WS] Player disconnected');
+    leaveVoice(ws);
     if (ws.playerUid && clientsByUid.get(ws.playerUid) === ws) {
         clientsByUid.delete(ws.playerUid);
     }
@@ -3087,6 +3192,31 @@ function handleClientMessage(ws, data) {
                 target.reviveAt = 0;
                 broadcastMummyState(room, true);
             }
+            break;
+        }
+
+        // The lobby key is "lobby_<team_id>" and match keys reuse the room id,
+        // so a socket that changes rooms just re-keys. Leaving sends the rest of
+        // the room a fresh member list, and a dropped socket leaves silently.
+        case 'voice_join': {
+            const uid = bindUid(ws, data);
+            const key = sanitizeVoiceKey(data.voice_key);
+            if (!key || !uid) break;
+            leaveVoice(ws);
+            ws.voiceKey = key;
+            if (!voiceGroups.has(key)) voiceGroups.set(key, new Set());
+            voiceGroups.get(key).add(ws);
+            sendVoiceList(key);
+            break;
+        }
+
+        case 'voice_leave': {
+            leaveVoice(ws);
+            break;
+        }
+
+        case 'voice_list': {
+            if (ws.voiceKey) sendVoiceList(ws.voiceKey);
             break;
         }
 
