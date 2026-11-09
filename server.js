@@ -1095,6 +1095,35 @@ function processMatchQueue(mode) {
     broadcastAllPools();
 }
 
+// A search that found nobody in three minutes is over. The phone's own 3:00
+// clock shows the message; this sweep is what ends the search for a phone that
+// was backgrounded before its clock could tick, and it takes the seat out of the
+// pool so the same body is never paired after it has been told it failed.
+const QUEUE_TIMEOUT_MS = parseInt(process.env.QUEUE_TIMEOUT_MS, 10) || 180000;
+
+function expireStaleSearches(now) {
+    let changed = false;
+    for (const mode of Object.keys(queues)) {
+        for (const entry of queues[mode].slice()) {
+            if (now - (entry.queuedAt || now) < QUEUE_TIMEOUT_MS) continue;
+            const idx = queues[mode].indexOf(entry);
+            if (idx !== -1) queues[mode].splice(idx, 1);
+            sendJson(entry.ws, { type: "match_cancelled", reason: "timeout" });
+            changed = true;
+            console.log(`[QUEUE] ${entry.playerUid || "solo"} expired after ${Math.round((now - entry.queuedAt) / 1000)}s with nobody to pair`);
+        }
+        for (const group of teamQueues[mode].slice()) {
+            if (now - (group.queuedAt || now) < QUEUE_TIMEOUT_MS) continue;
+            const idx = teamQueues[mode].indexOf(group);
+            if (idx !== -1) teamQueues[mode].splice(idx, 1);
+            for (const m of group.members) sendJson(m.ws, { type: "match_cancelled", reason: "timeout" });
+            changed = true;
+            console.log(`[QUEUE] team ${group.teamId} expired after ${Math.round((now - group.queuedAt) / 1000)}s with nobody to pair`);
+        }
+    }
+    if (changed) broadcastAllPools();
+}
+
 // The same body must never hold two seats in one pool: the newest search wins.
 function dropRepeatSoloEntries(mode, slot) {
     const seen = new Set();
@@ -3091,6 +3120,8 @@ function handleClientMessage(ws, data) {
 
 const mummyTick = setInterval(tickMummyMatches, 250);
 const zombieTick = setInterval(tickZombieMatches, 250);
+// The 3:00 search clock: a pool that has not opened in three minutes fails.
+const queueTick = setInterval(() => expireStaleSearches(Date.now()), 1000);
 
 const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
@@ -3106,6 +3137,7 @@ wss.on('close', () => {
     clearInterval(interval);
     clearInterval(mummyTick);
     clearInterval(zombieTick);
+    clearInterval(queueTick);
 });
 
 server.listen(PORT, () => {
