@@ -2380,7 +2380,11 @@ const botNav = (() => {
     const { cell, minX, minZ, cols, rows, floor_cm } = BOT_NAV;
     const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
     const standOf = (c, r) => (c < 0 || r < 0 || c >= cols || r >= rows) ? 0 : floor_cm[r][c];
-    const walkable = (c, r) => standOf(c, r) > 0;
+    // Pieces of map no body can ever step onto (the far building ledge, a roof
+    // corner with nothing within a stride) are sealed once the map is linked: the
+    // bot has no business standing somewhere a player cannot.
+    const sealed = new Set();
+    const walkable = (c, r) => standOf(c, r) > 0 && !sealed.has(r * cols + c);
 
     function cellOf(x, z) {
         return {
@@ -2419,6 +2423,48 @@ const botNav = (() => {
         const at = cellOf(x, z);
         const open = nearestWalkable(at.c, at.r);
         return open ? standOf(open.c, open.r) / 100 : BOT_STAND_FALLBACK;
+    }
+
+    // The cell a body is really standing on. A phone reports where the body is,
+    // and a body hugging a wall can have its centre inside the wall's own column -
+    // whose ray-down answer is the wall top, metres overhead. The reported height
+    // says which storey the body is on, so a cell whose floor matches it wins, and
+    // the raw column is only the fallback (a body in mid-air, a body off-grid).
+    function cellAtFloor(point, y) {
+        const at = cellOf(point.x, point.z);
+        const feet = Number(y);
+        if (!Number.isFinite(feet)) return at;
+        if (Math.abs(standOf(at.c, at.r) / 100 - feet) <= 0.75) return at;
+        let best = null;
+        let bestD = Infinity;
+        for (let dr = -2; dr <= 2; dr++) {
+            for (let dc = -2; dc <= 2; dc++) {
+                const c = at.c + dc;
+                const r = at.r + dr;
+                if (!walkable(c, r)) continue;
+                if (Math.abs(standOf(c, r) / 100 - feet) > 0.75) continue;
+                const p = centreOf(c, r);
+                const d = (p.x - point.x) ** 2 + (p.z - point.z) ** 2;
+                if (d < bestD) { bestD = d; best = { c, r }; }
+            }
+        }
+        return best || at;
+    }
+
+    const floorOf = (c, r) => standOf(c, r) / 100;
+
+    // The highest surface on the straight line between two points. A climb edge
+    // crosses the top of a wall, not just the two floors it joins, so the body
+    // has to be lifted over the parapet in between instead of gliding through it.
+    function hopApex(a, b) {
+        const gap = Math.hypot(b.x - a.x, b.z - a.z);
+        const steps = Math.max(1, Math.ceil(gap / (cell * 0.25)));
+        let apex = Math.max(standingY(a.x, a.z), standingY(b.x, b.z));
+        for (let i = 1; i < steps; i++) {
+            const t = i / steps;
+            apex = Math.max(apex, standingY(a.x + (b.x - a.x) * t, a.z + (b.z - a.z) * t));
+        }
+        return apex;
     }
 
     // Whether a body can cross from one open cell to the next: the difference in
@@ -2532,6 +2578,20 @@ const botNav = (() => {
                 gScore[ni] = tentative;
                 push(ni, tentative + heuristic(nc, nr));
             }
+            // A climb edge joins two pieces of map that share no stair. It is priced
+            // as a long walk, so it is taken only when the goal is on that piece.
+            const leaps = leapFrom.get(cur.i);
+            if (leaps) {
+                for (const leap of leaps) {
+                    if (closed[leap.i]) continue;
+                    const tentative = gScore[cur.i] + leap.cost;
+                    if (tentative >= gScore[leap.i]) continue;
+                    came[leap.i] = cur.i;
+                    gScore[leap.i] = tentative;
+                    const lc = leap.i % cols;
+                    push(leap.i, tentative + heuristic(lc, (leap.i - lc) / cols));
+                }
+            }
         }
         return [];
     }
@@ -2568,10 +2628,95 @@ const botNav = (() => {
         return best;
     }
 
-    // The reachable cell closest to a point. A body only ever reaches the main
-    // floor - the wall tops and roof strips that bake as their own islands have no
-    // way up for a player either - so when the target stands on one, this is where
-    // the bot walks to instead of standing still with an empty plan.
+    // The map is not all one stair. The wall tops and roof strips at its edges bake
+    // as pieces of their own: no stair reaches them and no floor lies within a
+    // stride. A body can still end up there (a knockback, a spawn placed by hand),
+    // and the bot has to be able to follow it - so each piece is joined to the
+    // main floor by one climb edge, nearest floor cell to nearest cell of the
+    // piece. A climb is priced at LEAP_COST cells of walking, so a plan only ever
+    // takes one to reach the piece it is going to, never as a shortcut.
+    const LEAP_COST = 100;
+    const LEAP_DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    const leapFrom = new Map();
+    (function linkPieces() {
+        const total = cols * rows;
+        const piece = new Int32Array(total).fill(-1);
+        const pieces = [];
+        for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < cols; c++) {
+                if (!walkable(c, r) || piece[r * cols + c] >= 0) continue;
+                const id = pieces.length;
+                const cells = [];
+                const stack = [r * cols + c];
+                piece[stack[0]] = id;
+                while (stack.length > 0) {
+                    const at = stack.pop();
+                    cells.push(at);
+                    const ac = at % cols;
+                    const ar = (at - ac) / cols;
+                    for (const [dc, dr] of LEAP_DIRS) {
+                        const nc = ac + dc;
+                        const nr = ar + dr;
+                        if (!walkable(nc, nr)) continue;
+                        if (!steppable(ac, ar, nc, nr)) continue;
+                        const ni = nr * cols + nc;
+                        if (piece[ni] >= 0) continue;
+                        piece[ni] = id;
+                        stack.push(ni);
+                    }
+                }
+                pieces.push(cells);
+            }
+        }
+        if (pieces.length < 2) return;
+        let mainId = 0;
+        for (let id = 1; id < pieces.length; id++) {
+            if (pieces[id].length > pieces[mainId].length) mainId = id;
+        }
+        const at = (i) => {
+            const c = i % cols;
+            return centreOf(c, (i - c) / cols);
+        };
+        const joined = pieces.map((_, id) => id === mainId);
+        for (let id = 0; id < pieces.length; id++) {
+            if (joined[id]) continue;
+            // One climb per cell of the piece, to the nearest floor within a
+            // stride: a long wall top should be entered wherever the bot reaches
+            // it, not only at its far end.
+            let linked = 0;
+            for (const a of pieces[id]) {
+                const pa = at(a);
+                let best = null;
+                for (let mid = 0; mid < pieces.length; mid++) {
+                    if (!joined[mid]) continue;
+                    for (const b of pieces[mid]) {
+                        const pb = at(b);
+                        const d = (pa.x - pb.x) ** 2 + (pa.z - pb.z) ** 2;
+                        if (d > 3 * 3) continue;
+                        if (!best || d < best.d) best = { d, a, b };
+                    }
+                }
+                if (!best) continue;
+                if (!leapFrom.has(best.a)) leapFrom.set(best.a, []);
+                if (!leapFrom.has(best.b)) leapFrom.set(best.b, []);
+                leapFrom.get(best.a).push({ i: best.b, cost: LEAP_COST });
+                leapFrom.get(best.b).push({ i: best.a, cost: LEAP_COST });
+                linked++;
+            }
+            // A piece no cell of which is within a stride of the floor is not part
+            // of the arena: seal it instead of letting the bot leap across the map.
+            if (linked === 0) {
+                for (const cell of pieces[id]) sealed.add(cell);
+                continue;
+            }
+            joined[id] = true;
+        }
+    })();
+
+    // The reachable cell closest to a point. Every piece of map that could be
+    // climbed to has a climb edge, so this is the last resort for a goal that is
+    // sealed (nothing within a stride of any floor): the bot walks as close as the
+    // map allows instead of standing still with an empty plan.
     function closestCell(from, point) {
         const start = nearestWalkable(from.c, from.r);
         if (!start) return null;
@@ -2602,7 +2747,7 @@ const botNav = (() => {
         return best;
     }
 
-    return { cellOf, centreOf, standingY, nearestWalkable, walkable, lineClear, findPath, retreatCell, closestCell };
+    return { cellOf, centreOf, standingY, nearestWalkable, walkable, cellAtFloor, floorOf, lineClear, hopApex, findPath, retreatCell, closestCell };
 })();
 
 // Where the spawner drops a bot: a real spawn marker, at the height a body
@@ -2742,8 +2887,8 @@ function tickBotBrain(room, now) {
     // Route over the baked grid: a Mummy walks a path to the body it hunts, a
     // Human walks a path away from it. Walls are part of the grid, so neither of
     // them can leave the arena through one.
-    const botCell = botNav.cellOf(bot.pos.x, bot.pos.z);
-    const targetCell = botNav.cellOf(target.pos.x, target.pos.z);
+    const botCell = botNav.cellAtFloor(bot.pos, bot.pos.y);
+    const targetCell = botNav.cellAtFloor(target.pos, target.pos.y);
     const fleeCell = role === "mummy" ? null : botNav.retreatCell(botCell, target.pos);
     const goal = role === "mummy" ? targetCell : (fleeCell || botCell);
     const sig = `${goal.c},${goal.r}`;
@@ -2764,7 +2909,19 @@ function tickBotBrain(room, now) {
     // because every tick spends the same distance budget on it. A Mummy already
     // in reach plants its feet and swings instead of shuffling on the spot.
     const dt = BOT_STEP_MS / 1000;
-    const hold = role === "mummy" && flatDistance(bot.pos, target.pos) <= MUMMY_ATTACK_RANGE * 0.9;
+    // In reach means on the target's own floor, not merely a body length away in
+    // the air: a target on a wall top is climbed to, not swung at from the floor
+    // beneath it. Feet also have to be on that floor - stopping mid-climb is what
+    // used to leave the body bobbing at the foot of a wall it was trying to scale.
+    const botFloor = botNav.floorOf(botCell.c, botCell.r);
+    const targetFloor = botNav.floorOf(targetCell.c, targetCell.r);
+    const sameFloor = Math.abs(botFloor - targetFloor) <= BOT_MAX_STEP_CM / 100;
+    // Feet on that floor, not hanging in the air over it: mid-climb the body is
+    // still beside the wall it is scaling, and planting it there would leave it
+    // swinging at a target it has not reached yet.
+    const grounded = Math.abs(botNav.standingY(bot.pos.x, bot.pos.z) - Number(bot.pos.y)) <= 0.3;
+    const hold = role === "mummy" && sameFloor && grounded
+        && flatDistance(bot.pos, target.pos) <= MUMMY_ATTACK_RANGE * 0.9;
     let budget = hold ? 0 : BOT_MOVE_SPEED * dt;
     let x = Number(bot.pos.x);
     let z = Number(bot.pos.z);
@@ -2777,8 +2934,23 @@ function tickBotBrain(room, now) {
         if (!botNav.lineClear({ x, z }, bot.nav.path[BOT_LOOKAHEAD_CELLS - 1])) break;
         bot.nav.path.shift();
     }
+    let climbing = false;
+    let climbY = 0;
     while (budget > 0 && bot.nav.path.length > 0) {
         const wp = bot.nav.path[0];
+        // A climb edge is a wall between two pieces of map: lift the body over the
+        // highest surface on the line (a parapet sits above the wall top it hides)
+        // before walking on, so it reads as a climb rather than a glide through
+        // brickwork.
+        const rise = botNav.standingY(wp.x, wp.z) - botNav.standingY(x, z);
+        if (rise > BOT_MAX_STEP_CM / 100 + 0.05) {
+            const apex = botNav.hopApex({ x, z }, wp);
+            if (Number(bot.pos.y) < apex - 0.05) {
+                climbing = true;
+                climbY = apex;
+                break;
+            }
+        }
         const dx = wp.x - x;
         const dz = wp.z - z;
         const gap = Math.hypot(dx, dz);
@@ -2807,8 +2979,8 @@ function tickBotBrain(room, now) {
     // looks down, is "ahead".
     const yaw = Math.atan2(fx, fz);
     // The floor under it, eased: a step changes cells in one frame and the body
-    // should walk up it, not teleport.
-    const standY = botNav.standingY(x, z);
+    // should walk up it, not teleport. A climb aims at the apex it is clearing.
+    const standY = climbing ? climbY : botNav.standingY(x, z);
     const py = bot.pos.y + Math.max(-BOT_CLIMB_SPEED * dt, Math.min(BOT_CLIMB_SPEED * dt, standY - bot.pos.y));
     const moved = Math.hypot(x - Number(bot.pos.x), z - Number(bot.pos.z)) > 0.001;
     bot.pos = { x, y: py, z, yaw };
@@ -2835,8 +3007,11 @@ function tickBotBrain(room, now) {
     }
 
     // Only the hunting side lands hits, and only from its own reach - both are
-    // re-checked inside performMummyAttack before a point is ever paid.
+    // re-checked inside performMummyAttack before a point is ever paid. A target
+    // a storey above the bot is not in reach yet: it has to climb first.
     if (role !== "mummy") return;
+    if (!sameFloor) return;
+    if (Math.abs(botNav.standingY(x, z) - py) > 0.3) return;
     if (flatDistance(bot.pos, target.pos) > MUMMY_ATTACK_RANGE) return;
     if (now - (bot.lastSwingAt || 0) < BOT_ATTACK_COOLDOWN_MS) return;
     bot.lastSwingAt = now;
