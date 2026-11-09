@@ -2211,21 +2211,240 @@ const BOT_STEP_MS = 100;                 // matches the 10 Hz a phone reports at
 const BOT_MOVE_SPEED = 4.2;              // metres/second; a player walks 5.5, so it can be outrun
 const BOT_ATTACK_COOLDOWN_MS = 1200;     // one swing about every 1.2s once it is in reach
 const BOT_NAMES = ["RYUK", "NOVA", "ZANE", "KIRA", "ACE", "ORION"];
-// The 1v1 arena floor, read off the spawn markers in mumuy_vs_human.tscn. A bot
-// is held inside this box so a chase can never walk it off the map.
-//
-// The markers are authored 6.55 m up, but the floor a body really stands on under
-// both of them is 2.883 - the marker height is where the ray starts, not where
-// anybody ends up. A phone reports the y its own body is at; a bot has no phone,
-// so it streams this standing height (floor + the player's 0.132 rest clearance)
-// on every frame. Streaming the marker height instead left the bot hanging in
-// the air a full body-length above the ground.
-const BOT_GROUND_Y = 3.015;
-const BOT_1V1_SPAWNS = [
-    { x: -10, y: BOT_GROUND_Y, z: 0 },          // spawn_index 0 -> Spawn1
-    { x: 9.239, y: BOT_GROUND_Y, z: -3.827 }    // spawn_index 1 -> Spawn2
+// The spawner: a bot is seated on one of the arena's own spawn markers
+// (Spawn1..Spawn8 in mumuy_vs_human.tscn), exactly where a phone is dropped -
+// never on a coordinate of our own. Its height comes from the baked floor grid
+// below, because the markers themselves are authored 6.55 m above the floor.
+const BOT_SPAWN_SEATS = [
+    { x: -10, z: 0 },              // Spawn1
+    { x: 9.239, z: -3.827 },       // Spawn2
+    { x: -9.239, z: -3.827 },      // Spawn3
+    { x: -11.784, z: -33.238 },    // Spawn4
+    { x: -7.071, z: -18.787 },     // Spawn5
+    { x: 3.827, z: -9.239 },       // Spawn6
+    { x: -3.827, z: -9.239 },      // Spawn7
+    { x: 0, z: -10 }               // Spawn8
 ];
-const BOT_ARENA = { minX: -16, maxX: 16, minZ: -38, maxZ: 4 };
+// A bot is not a phone squinting at a screen: a Mummy bot knows where every body
+// in the round is, so its chase range is the whole arena. The nearest living
+// player is always the one it goes for.
+const BOT_CHASE_RANGE = 80;
+// How often a walking bot re-plans its route. One cell of this 1 m grid late is
+// invisible at 10 Hz, and a plan built every tick would be wasted work.
+const BOT_REPLAN_MS = 700;
+// Heights in the grid are the safe standing height; a body leaving a step
+// changes cells in one frame, so the streamed y is eased instead of snapped.
+const BOT_CLIMB_SPEED = 12.0;            // metres/second of y correction
+const BOT_STAND_FALLBACK = 3.015;        // floor 2.883 + the body's 0.132 rest
+
+// -------------------------------------------------------------------- grid --
+// The server has no map, so a bot that only clamps to a rectangle walks through
+// walls: it heads straight for the player and leaves the arena through whatever
+// lies between. This grid is the real arena, baked with _bot_nav_bake.gd from
+// mumuy_vs_human.tscn: at every cell centre it drops a ray onto the floor and
+// then asks whether a body-sized capsule (0.5 m radius, 1.8 m tall) actually
+// fits there. A cell is walkable only if both answers are yes, so walls, pillars,
+// railings and the hills around the arena are all solid to a bot.
+//
+// Each walkable cell also carries the y a body stands at on that floor, so the
+// height the bot streams follows the ground it is walking on - steps, ramps and
+// ledges included - instead of being one flat number for the whole map.
+const BOT_NAV = {
+	cell: 1.0, minX: -16.0, minZ: -38.0, cols: 32, rows: 42,
+	// floor_cm[row][col]: 0 = blocked, otherwise the standing y in cm
+	// (floor + the body's 0.132 m rest clearance).
+	floor_cm: [
+		[299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  // z = -37.5
+		[299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  // z = -36.5
+		[299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  // z = -35.5
+		[299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 299, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  // z = -34.5
+		[299, 299, 299, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  // z = -33.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  // z = -32.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  // z = -31.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  // z = -30.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  // z = -29.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  // z = -28.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  // z = -27.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 545, 545, 545, 302, 302, 302, 302, 302, 302, 317],  // z = -26.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 545, 545, 545, 302, 302, 302, 302, 302, 302, 317],  // z = -25.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 545, 545, 545, 302, 302, 302, 0, 302, 302, 317],  // z = -24.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 302, 302, 317],  // z = -23.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 302, 302, 302, 0, 302, 302, 317],  // z = -22.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 302, 302, 302, 0, 302, 302, 317],  // z = -21.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 0],  // z = -20.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 302, 302, 302, 317],  // z = -19.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 317],  // z = -18.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -17.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -16.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -15.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -14.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -13.5
+		[302, 302, 302, 302, 302, 302, 0, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -12.5
+		[302, 302, 302, 302, 302, 302, 0, 0, 0, 0, 0, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -11.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -10.5
+		[302, 302, 302, 302, 302, 0, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -9.5
+		[302, 302, 302, 302, 302, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -8.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -7.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -6.5
+		[302, 302, 302, 302, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -5.5
+		[302, 302, 302, 302, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -4.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -3.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -2.5
+		[302, 302, 302, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -1.5
+		[302, 302, 302, 302, 0, 0, 0, 302, 302, 302, 302, 302, 302, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = -0.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 302, 302, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = 0.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302],  // z = 1.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],  // z = 2.5
+		[302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 302, 0, 0, 0, 0, 0, 0, 0, 0, 293, 308, 324, 337, 346]  // z = 3.5
+	]
+};
+
+const botNav = (() => {
+    const { cell, minX, minZ, cols, rows, floor_cm } = BOT_NAV;
+    const DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+    const standOf = (c, r) => (c < 0 || r < 0 || c >= cols || r >= rows) ? 0 : floor_cm[r][c];
+    const walkable = (c, r) => standOf(c, r) > 0;
+
+    function cellOf(x, z) {
+        return {
+            c: Math.max(0, Math.min(cols - 1, Math.floor((Number(x) - minX) / cell))),
+            r: Math.max(0, Math.min(rows - 1, Math.floor((Number(z) - minZ) / cell)))
+        };
+    }
+
+    function centreOf(c, r) {
+        return { x: minX + (c + 0.5) * cell, z: minZ + (r + 0.5) * cell };
+    }
+
+    // The closest open cell, so a body that is one step into a wall column still
+    // gets a plan instead of freezing.
+    function nearestWalkable(c0, r0) {
+        if (walkable(c0, r0)) return { c: c0, r: r0 };
+        for (let rad = 1; rad <= 4; rad++) {
+            let best = null;
+            let bestD = Infinity;
+            for (let dr = -rad; dr <= rad; dr++) {
+                for (let dc = -rad; dc <= rad; dc++) {
+                    if (Math.max(Math.abs(dc), Math.abs(dr)) !== rad) continue;
+                    if (!walkable(c0 + dc, r0 + dr)) continue;
+                    const d = dc * dc + dr * dr;
+                    if (d < bestD) { bestD = d; best = { c: c0 + dc, r: r0 + dr }; }
+                }
+            }
+            if (best) return best;
+        }
+        return null;
+    }
+
+    // The height a body stands at over this floor. Off the grid (which a bot
+    // should never be) it answers with the arena's own floor height.
+    function standingY(x, z) {
+        const at = cellOf(x, z);
+        const open = nearestWalkable(at.c, at.r);
+        return open ? standOf(open.c, open.r) / 100 : BOT_STAND_FALLBACK;
+    }
+
+    // A* over open cells. A diagonal step needs both of its side cells open too,
+    // so a chase never cuts a corner through a wall.
+    function findPath(from, to) {
+        const start = nearestWalkable(from.c, from.r);
+        const goal = nearestWalkable(to.c, to.r);
+        if (!start || !goal) return [];
+        if (start.c === goal.c && start.r === goal.r) return [centreOf(goal.c, goal.r)];
+
+        const total = cols * rows;
+        const gScore = new Float64Array(total).fill(Infinity);
+        const came = new Int32Array(total).fill(-1);
+        const closed = new Uint8Array(total);
+        const open = [];
+        const index = (c, r) => r * cols + c;
+        const heuristic = (c, r) => {
+            const dc = Math.abs(c - goal.c);
+            const dr = Math.abs(r - goal.r);
+            return (dc + dr) + (Math.SQRT2 - 2) * Math.min(dc, dr);
+        };
+        const startIdx = index(start.c, start.r);
+        gScore[startIdx] = 0;
+        open.push({ i: startIdx, f: heuristic(start.c, start.r) });
+
+        while (open.length > 0) {
+            // A 32x42 grid: scanning for the best f beats a heap at this size.
+            let best = 0;
+            for (let i = 1; i < open.length; i++) if (open[i].f < open[best].f) best = i;
+            const cur = open.splice(best, 1)[0];
+            if (closed[cur.i]) continue;
+            closed[cur.i] = 1;
+            const cc = cur.i % cols;
+            const cr = (cur.i - cc) / cols;
+            if (cc === goal.c && cr === goal.r) {
+                const path = [];
+                let at = cur.i;
+                while (at !== -1) {
+                    path.push(centreOf(at % cols, (at - at % cols) / cols));
+                    at = came[at];
+                }
+                path.reverse();
+                path.shift();      // the cell the body already stands in
+                return path;
+            }
+            for (const [dc, dr] of DIRS) {
+                const nc = cc + dc;
+                const nr = cr + dr;
+                if (!walkable(nc, nr)) continue;
+                if (dc !== 0 && dr !== 0 && (!walkable(cc + dc, cr) || !walkable(cc, cr + dr))) continue;
+                const ni = index(nc, nr);
+                if (closed[ni]) continue;
+                const step = (dc !== 0 && dr !== 0) ? Math.SQRT2 : 1;
+                const tentative = gScore[cur.i] + step;
+                if (tentative >= gScore[ni]) continue;
+                came[ni] = cur.i;
+                gScore[ni] = tentative;
+                open.push({ i: ni, f: tentative + heuristic(nc, nr) });
+            }
+        }
+        return [];
+    }
+
+    // The open cell the bot can actually reach that is farthest from the hunter:
+    // a Human bot runs away along real floor instead of into a wall.
+    function retreatCell(from, threat) {
+        const start = nearestWalkable(from.c, from.r);
+        if (!start) return null;
+        const seen = new Uint8Array(cols * rows);
+        const queue = [start.r * cols + start.c];
+        seen[queue[0]] = 1;
+        let best = start;
+        let bestD = -1;
+        for (let qi = 0; qi < queue.length; qi++) {
+            const at = queue[qi];
+            const c = at % cols;
+            const r = (at - c) / cols;
+            const p = centreOf(c, r);
+            const d = (p.x - threat.x) ** 2 + (p.z - threat.z) ** 2;
+            if (d > bestD) { bestD = d; best = { c, r }; }
+            for (const [dc, dr] of DIRS) {
+                const nc = c + dc;
+                const nr = r + dr;
+                if (!walkable(nc, nr)) continue;
+                if (dc !== 0 && dr !== 0 && (!walkable(c + dc, r) || !walkable(c, r + dr))) continue;
+                const ni = nr * cols + nc;
+                if (seen[ni]) continue;
+                seen[ni] = 1;
+                queue.push(ni);
+            }
+        }
+        return best;
+    }
+
+    return { cellOf, centreOf, standingY, nearestWalkable, walkable, findPath, retreatCell };
+})();
+
+// Where the spawner drops a bot: a real spawn marker, at the height a body
+// stands on that floor.
+function botSpawnAt(index) {
+    const seat = BOT_SPAWN_SEATS[index] || BOT_SPAWN_SEATS[0];
+    return { x: seat.x, y: botNav.standingY(seat.x, seat.z), z: seat.z, yaw: 0 };
+}
 
 let botCounter = 0;
 let lastBotScanAt = 0;
@@ -2308,11 +2527,11 @@ function seatBotOpponent(mode, slot, solo) {
     if (!room || !room.game || !bot) return;
 
     room.isBotRoom = true;
-    // Both bodies start on the arena's own spawn points, so the chase has two
-    // real positions before the first movement frame lands.
+    // The spawner seats both sides on the arena's own markers, so the chase has
+    // two real positions - and two real floor heights - before the first
+    // movement frame lands.
     for (const e of room.entries) {
-        const at = BOT_1V1_SPAWNS[e.spawnIndex] || BOT_1V1_SPAWNS[0];
-        e.pos = { x: at.x, y: at.y, z: at.z, yaw: 0 };
+        e.pos = botSpawnAt(e.spawnIndex || 0);
     }
     // A bot has no phone to press Ready: it is ready the moment it is seated, so
     // the player's own Ready is what opens the round.
@@ -2334,10 +2553,13 @@ function tickBotBrain(room, now) {
     if (!mummyAlive(room, botId)) return;
 
     const role = g.roles[botId] || "human";
+    // A Mummy bot is aware of every body in the round, not just the ones in
+    // front of it, so its chase range is BOT_CHASE_RANGE (the whole arena).
     const foes = room.entries.filter(e => e !== bot
         && g.roles[mummyIdOf(e)] !== role
         && mummyAlive(room, mummyIdOf(e))
-        && e.pos);
+        && e.pos
+        && (role !== "mummy" || flatDistance(bot.pos, e.pos) <= BOT_CHASE_RANGE));
     if (foes.length === 0) return;
 
     // Whatever the round, the bot's business is the nearest body it is not
@@ -2349,46 +2571,79 @@ function tickBotBrain(room, now) {
         if (d < best) { best = d; target = f; }
     }
 
-    const dt = BOT_STEP_MS / 1000;
-    let dx = Number(target.pos.x) - Number(bot.pos.x);
-    let dz = Number(target.pos.z) - Number(bot.pos.z);
-    const dist = Math.hypot(dx, dz) || 1;
-    dx /= dist;
-    dz /= dist;
+    // Route over the baked grid: a Mummy walks a path to the body it hunts, a
+    // Human walks a path away from it. Walls are part of the grid, so neither of
+    // them can leave the arena through one.
+    const botCell = botNav.cellOf(bot.pos.x, bot.pos.z);
+    const targetCell = botNav.cellOf(target.pos.x, target.pos.z);
+    const fleeCell = role === "mummy" ? null : botNav.retreatCell(botCell, target.pos);
+    const goal = role === "mummy" ? targetCell : (fleeCell || botCell);
+    const sig = `${goal.c},${goal.r}`;
+    if (!bot.nav || bot.nav.sig !== sig || now - bot.nav.at >= BOT_REPLAN_MS
+        || (role === "mummy" && bot.nav.path.length === 0)) {
+        bot.nav = {
+            at: now,
+            sig,
+            path: botNav.findPath(botCell, goal)
+        };
+    }
 
-    // A Mummy closes in, a Human keeps its distance. Either way the bot yields to
-    // the walls, so a chase never pins it in a corner of the arena.
-    const sign = role === "mummy" ? 1 : -1;
-    let nx = bot.pos.x + sign * dx * BOT_MOVE_SPEED * dt;
-    let nz = bot.pos.z + sign * dz * BOT_MOVE_SPEED * dt;
-    const cx = Math.min(BOT_ARENA.maxX, Math.max(BOT_ARENA.minX, nx));
-    const cz = Math.min(BOT_ARENA.maxZ, Math.max(BOT_ARENA.minZ, nz));
-    if (cx !== nx || cz !== nz) {
-        // Ran into a wall: slide along it instead of standing still.
-        nx = Math.min(BOT_ARENA.maxX, Math.max(BOT_ARENA.minX, bot.pos.x + sign * -dz * BOT_MOVE_SPEED * dt));
-        nz = Math.min(BOT_ARENA.maxZ, Math.max(BOT_ARENA.minZ, bot.pos.z + sign * dx * BOT_MOVE_SPEED * dt));
-    } else {
-        nx = cx;
-        nz = cz;
+    // Walk the plan. The speed is the same whether the path is one cell or thirty,
+    // because every tick spends the same distance budget on it. A Mummy already
+    // in reach plants its feet and swings instead of shuffling on the spot.
+    const dt = BOT_STEP_MS / 1000;
+    const hold = role === "mummy" && flatDistance(bot.pos, target.pos) <= MUMMY_ATTACK_RANGE * 0.9;
+    let budget = hold ? 0 : BOT_MOVE_SPEED * dt;
+    let x = Number(bot.pos.x);
+    let z = Number(bot.pos.z);
+    let fx = 0;
+    let fz = 0;
+    while (budget > 0 && bot.nav.path.length > 0) {
+        const wp = bot.nav.path[0];
+        const dx = wp.x - x;
+        const dz = wp.z - z;
+        const gap = Math.hypot(dx, dz);
+        if (gap <= 1e-4) { bot.nav.path.shift(); continue; }
+        const step = Math.min(budget, gap);
+        x += (dx / gap) * step;
+        z += (dz / gap) * step;
+        fx = dx / gap;
+        fz = dz / gap;
+        budget -= step;
+        if (step >= gap - 1e-4) bot.nav.path.shift();
+    }
+    // No waypoint left (already on the goal cell, or the plan is empty): keep the
+    // body pointed the way it is fighting or running.
+    if (fx === 0 && fz === 0) {
+        const dx = Number(target.pos.x) - x;
+        const dz = Number(target.pos.z) - z;
+        const gap = Math.hypot(dx, dz) || 1;
+        const sign = role === "mummy" ? 1 : -1;
+        fx = (dx / gap) * sign;
+        fz = (dz / gap) * sign;
     }
 
     // Face the way it is travelling. The models face +Z at yaw 0 - the same
     // convention a phone reports for its own model - so +Z, not the -Z a camera
-    // looks down, is "ahead"; with the old sign the bot ran backwards.
-    const yaw = Math.atan2(sign * dx, sign * dz);
-    const py = bot.pos.y;
-    bot.pos = { x: nx, y: py, z: nz, yaw };
+    // looks down, is "ahead".
+    const yaw = Math.atan2(fx, fz);
+    // The floor under it, eased: a step changes cells in one frame and the body
+    // should walk up it, not teleport.
+    const standY = botNav.standingY(x, z);
+    const py = bot.pos.y + Math.max(-BOT_CLIMB_SPEED * dt, Math.min(BOT_CLIMB_SPEED * dt, standY - bot.pos.y));
+    const moved = Math.hypot(x - Number(bot.pos.x), z - Number(bot.pos.z)) > 0.001;
+    bot.pos = { x, y: py, z, yaw };
 
     // The exact frame a phone emits, so the opponent's screen animates the bot
     // through the remote-player path it already uses for real players.
     const frame = JSON.stringify({
         type: "player_move",
         match_id: room.matchId,
-        x: nx,
+        x: x,
         y: py,
-        z: nz,
+        z: z,
         yaw: yaw,
-        moving: true,
+        moving: moved,
         vy: 0,
         grounded: true,
         crouch: false,
