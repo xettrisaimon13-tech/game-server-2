@@ -1283,9 +1283,11 @@ const CLONE_MAX_HITS = 3;          // or a Mummy lands three swings first
 const ABILITY_COOLDOWN_MS = 70000;
 // Mirrors ATTACK_RANGE in mummy_match.gd: the reach a catcher actually swings.
 const MUMMY_ATTACK_RANGE = parseFloat(process.env.MUMMY_ATTACK_RANGE) || 2.6;
-// How far either side of the Human's facing a clone stands.
-const CLONE_FLANK_METRES = 1.6;
-// Clones then walk straight ahead from the flank they appeared at.
+// The decoys step out ahead of the Human, so they lead the caster instead of
+// appearing at their shoulder. A small side offset keeps the two of them apart.
+const CLONE_FRONT_METRES = 1.8;
+const CLONE_SPREAD_METRES = 0.55;
+// Clones then walk straight ahead from where they appeared.
 // Both ends use these two numbers: the phone draws the body on this line, and
 // the server moves its own copy down the same line, so a swing at what a player
 // sees is a swing on the body the server is counting.
@@ -1514,8 +1516,9 @@ function tickMummyClones(room, now) {
         c.movedAt = now;
         const step = Math.min(CLONE_WALK_SPEED * dt, CLONE_WALK_LIMIT - c.walked);
         if (step > 0) {
-            c.x -= Math.sin(c.yaw) * step;
-            c.z -= Math.cos(c.yaw) * step;
+            // +Z is the way the model faces at yaw 0, so this walks it forwards.
+            c.x += Math.sin(c.yaw) * step;
+            c.z += Math.cos(c.yaw) * step;
             c.walked += step;
         }
     }
@@ -1610,11 +1613,13 @@ function activateMummyAbility(room, entry, now) {
         return "";
     }
 
-    // The holograms flank the body that cast them, turned the way that body is
-    // already facing, so a clone never appears behind a player who has just
-    // spun around to run.
+    // The copies are placed ahead of the body that cast them, on that body's own
+    // heading, so they lead the caster instead of trailing at its shoulder. The
+    // roster's models face +Z at yaw 0 (the phone reports that same model yaw), so
+    // "ahead" is +Z; the opposite sign stood the pair behind the caster.
     const at = entry.pos || { x: 0, y: 0, z: 0, yaw: 0 };
     const yaw = Number(at.yaw) || 0;
+    const forward = { x: Math.sin(yaw), z: Math.cos(yaw) };
     const right = { x: Math.cos(yaw), z: -Math.sin(yaw) };
     const created = [];
     for (let i = 0; i < CLONE_COUNT; i++) {
@@ -1622,9 +1627,9 @@ function activateMummyAbility(room, entry, now) {
         const id = `${self}#${g.cloneSeq++}`;
         const clone = {
             owner: self,
-            x: Number(at.x) + right.x * CLONE_FLANK_METRES * side,
+            x: Number(at.x) + forward.x * CLONE_FRONT_METRES + right.x * CLONE_SPREAD_METRES * side,
             y: Number(at.y),
-            z: Number(at.z) + right.z * CLONE_FLANK_METRES * side,
+            z: Number(at.z) + forward.z * CLONE_FRONT_METRES + right.z * CLONE_SPREAD_METRES * side,
             yaw: yaw,
             hits: 0,
             lastHitAt: 0,
@@ -2208,9 +2213,17 @@ const BOT_ATTACK_COOLDOWN_MS = 1200;     // one swing about every 1.2s once it i
 const BOT_NAMES = ["RYUK", "NOVA", "ZANE", "KIRA", "ACE", "ORION"];
 // The 1v1 arena floor, read off the spawn markers in mumuy_vs_human.tscn. A bot
 // is held inside this box so a chase can never walk it off the map.
+//
+// The markers are authored 6.55 m up, but the floor a body really stands on under
+// both of them is 2.883 - the marker height is where the ray starts, not where
+// anybody ends up. A phone reports the y its own body is at; a bot has no phone,
+// so it streams this standing height (floor + the player's 0.132 rest clearance)
+// on every frame. Streaming the marker height instead left the bot hanging in
+// the air a full body-length above the ground.
+const BOT_GROUND_Y = 3.015;
 const BOT_1V1_SPAWNS = [
-    { x: -10, y: 6.55, z: 0 },          // spawn_index 0 -> Spawn1
-    { x: 9.239, y: 6.55, z: -3.827 }    // spawn_index 1 -> Spawn2
+    { x: -10, y: BOT_GROUND_Y, z: 0 },          // spawn_index 0 -> Spawn1
+    { x: 9.239, y: BOT_GROUND_Y, z: -3.827 }    // spawn_index 1 -> Spawn2
 ];
 const BOT_ARENA = { minX: -16, maxX: 16, minZ: -38, maxZ: 4 };
 
@@ -2359,8 +2372,10 @@ function tickBotBrain(room, now) {
         nz = cz;
     }
 
-    // Face the way it is travelling, in Godot's yaw convention (local -Z is ahead).
-    const yaw = Math.atan2(-(sign * dx), -(sign * dz));
+    // Face the way it is travelling. The models face +Z at yaw 0 - the same
+    // convention a phone reports for its own model - so +Z, not the -Z a camera
+    // looks down, is "ahead"; with the old sign the bot ran backwards.
+    const yaw = Math.atan2(sign * dx, sign * dz);
     const py = bot.pos.y;
     bot.pos = { x: nx, y: py, z: nz, yaw };
 
