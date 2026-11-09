@@ -2208,7 +2208,10 @@ function cancelMummyWaiting(room) {
 const BOT_FILL_MIN_MS = parseInt(process.env.BOT_FILL_MIN_MS, 10) || 30000;
 const BOT_FILL_MAX_MS = parseInt(process.env.BOT_FILL_MAX_MS, 10) || 50000;
 const BOT_STEP_MS = 100;                 // matches the 10 Hz a phone reports at
-const BOT_MOVE_SPEED = 8.4;              // metres/second; a chase crosses the map
+// Exactly the walk a phone gets from player_movement.gd (SPEED = 5.5 m/s, sprint
+// 8.5). The bot is a player's opponent, not a cheat: it may never cover ground
+// faster than the body chasing it could.
+const BOT_MOVE_SPEED = 5.5;
 const BOT_ATTACK_COOLDOWN_MS = 1200;     // one swing about every 1.2s once it is in reach
 const BOT_NAMES = ["RYUK", "NOVA", "ZANE", "KIRA", "ACE", "ORION"];
 // The spawner: a bot is seated on one of the arena's own spawn markers
@@ -2232,6 +2235,10 @@ const BOT_CHASE_RANGE = 200;
 // How often a walking bot re-plans its route. One cell of this 1 m grid late is
 // invisible at 10 Hz, and a plan built every tick would be wasted work.
 const BOT_REPLAN_MS = 700;
+// How far ahead of its next step the bot will steer. A body that only aims at the
+// next cell centre walks a visible zigzag and slows down at every corner; holding
+// a straight line two cells out is what makes it move like a player's thumb.
+const BOT_LOOKAHEAD_CELLS = 2;
 // Heights in the grid are the safe standing height; a body leaving a step
 // changes cells in one frame, so the streamed y is eased instead of snapped.
 const BOT_CLIMB_SPEED = 12.0;            // metres/second of y correction
@@ -2416,6 +2423,27 @@ const botNav = (() => {
     const steppable = (c0, r0, c1, r1) =>
         Math.abs(standOf(c1, r1) - standOf(c0, r0)) <= BOT_MAX_STEP_CM;
 
+    // Can a body walk the straight line between two points? Every sampled cell
+    // has to be open, every crossing steppable, and a diagonal crossing needs
+    // both of its side cells open - the exact rules A* uses, so a shortcut never
+    // sneaks through a wall or over a ledge the plan itself would refuse.
+    function lineClear(a, b) {
+        const gap = Math.hypot(b.x - a.x, b.z - a.z);
+        const steps = Math.max(1, Math.ceil(gap / (cell * 0.25)));
+        let prev = cellOf(a.x, a.z);
+        if (!walkable(prev.c, prev.r)) return false;
+        for (let i = 1; i <= steps; i++) {
+            const t = i / steps;
+            const at = cellOf(a.x + (b.x - a.x) * t, a.z + (b.z - a.z) * t);
+            if (!walkable(at.c, at.r)) return false;
+            if (!steppable(prev.c, prev.r, at.c, at.r)) return false;
+            if (at.c !== prev.c && at.r !== prev.r
+                && (!walkable(at.c, prev.r) || !walkable(prev.c, at.r))) return false;
+            prev = at;
+        }
+        return true;
+    }
+
     // A* over open cells. A diagonal step needs both of its side cells open too,
     // so a chase never cuts a corner through a wall.
     function findPath(from, to) {
@@ -2537,7 +2565,7 @@ const botNav = (() => {
         return best;
     }
 
-    return { cellOf, centreOf, standingY, nearestWalkable, walkable, findPath, retreatCell };
+    return { cellOf, centreOf, standingY, nearestWalkable, walkable, lineClear, findPath, retreatCell };
 })();
 
 // Where the spawner drops a bot: a real spawn marker, at the height a body
@@ -2602,7 +2630,9 @@ function seatBotOpponent(mode, slot, solo) {
         mode,
         slot,
         teamSize: 1,
-        characterId: 1 + Math.floor(Math.random() * 4),
+        // The bot wears the same character body as the player whose seat it fills,
+        // so the body it is drawn with has exactly a player's arena scale.
+        characterId: solo.characterId || 1,
         bundleId: -1,
         username: BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)],
         playerUid: botId,
@@ -2699,6 +2729,13 @@ function tickBotBrain(room, now) {
     let z = Number(bot.pos.z);
     let fx = 0;
     let fz = 0;
+    // Steer for the far end of a straight run, not its near end: while the line to
+    // the waypoint BOT_LOOKAHEAD_CELLS out is walkable, drop the nearer ones and
+    // take it. That is what keeps a grid walk from zigzagging cell to cell.
+    while (!hold && bot.nav.path.length > BOT_LOOKAHEAD_CELLS - 1) {
+        if (!botNav.lineClear({ x, z }, bot.nav.path[BOT_LOOKAHEAD_CELLS - 1])) break;
+        bot.nav.path.shift();
+    }
     while (budget > 0 && bot.nav.path.length > 0) {
         const wp = bot.nav.path[0];
         const dx = wp.x - x;
