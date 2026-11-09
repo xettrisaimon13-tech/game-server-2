@@ -1276,7 +1276,7 @@ const ZOMBIE_TEAM_NAMES = ["TEAM TIGER", "TEAM LION"];
 // Which character owns which ability is decided here, not in the client's CATALOG,
 // so a tampered message cannot hand a player an ability they never equipped. Keep
 // this table and character_manager.gd's CATALOG "ability" rows in step.
-const CHARACTER_ABILITIES = { 2: "clone", 3: "aura", 4: "shield" };
+const CHARACTER_ABILITIES = { 2: "clone", 3: "aura", 4: "shield", 5: "hp_shield" };
 const CLONE_COUNT = 2;
 const CLONE_LIFETIME_MS = 10000;   // then it fades out on its own
 const CLONE_MAX_HITS = 3;          // or a Mummy lands three swings first
@@ -1317,6 +1317,17 @@ const SHIELD_DESTROY_AT = 18;   // the dome gives out
 // One swing lands on one shell, however many bodies it reached: a catcher standing
 // in a crowd of four used to be able to spend a single press on four hits.
 const SHIELD_HIT_GAP_MS = 300;
+
+// ---- Character 5: Shadow Ranger personal shield ----
+// Extra HP layered over the normal bar. Damage spends this first; whatever is
+// left after 20 seconds disappears. The blue body shell is drawn by every client.
+const HP_SHIELD_AMOUNT = 100;
+const HP_SHIELD_LIFETIME_MS = 20000;
+const HP_SHIELD_COOLDOWN_MS = 80000;
+
+function abilityCooldownMs(kind) {
+    return kind === "hp_shield" ? HP_SHIELD_COOLDOWN_MS : ABILITY_COOLDOWN_MS;
+}
 
 // 1v1 runs three minutes, every team size runs five.
 function mummyRoundMs(sideSize) {
@@ -1368,6 +1379,8 @@ function resetMummyCombat(room) {
     for (const e of room.entries) {
         g.combat[mummyIdOf(e)] = {
             hp: MUMMY_HP,
+            shield: 0,
+            shieldUntil: 0,
             downed: false,
             downedSince: 0,
             eliminated: false,
@@ -1516,6 +1529,27 @@ function activateMummyAbility(room, entry, now) {
     if (kind === "none") return "none";
     const mine = g.abilities[self] || (g.abilities[self] = { cooldownUntil: 0 });
     if (mine.cooldownUntil > now) return "cooldown";
+
+    if (kind === "hp_shield") {
+        const state = g.combat[self];
+        if (!state || state.downed || state.eliminated) return "none";
+        state.shield = HP_SHIELD_AMOUNT;
+        state.shieldUntil = now + HP_SHIELD_LIFETIME_MS;
+        mine.cooldownUntil = now + HP_SHIELD_COOLDOWN_MS;
+        for (const e of room.entries) {
+            sendJson(e.ws, {
+                type: "ability_spawn",
+                match_id: room.matchId,
+                player_id: self,
+                ability_type: "hp_shield",
+                shield_hp: HP_SHIELD_AMOUNT,
+                duration_ms: HP_SHIELD_LIFETIME_MS
+            });
+        }
+        broadcastMummyState(room, true);
+        console.log(`[MUMMY] ${self} raised a ${HP_SHIELD_AMOUNT} HP shadow shield in ${room.matchId}`);
+        return "";
+    }
 
     // The green aura is a burst on the spot: no body to track, no countdown beyond
     // the cooldown. Everyone is told where it bloomed so the phones agree.
@@ -1718,6 +1752,23 @@ function tickMummyShields(room, now) {
         }
     }
     return destroyMummyShields(room, dead);
+}
+
+// The blue body shield lasts exactly 20 seconds, and the server's clock is what
+// ends it so every phone drops the effect on the same tick.
+function tickMummyHpShields(room, now) {
+    const g = room.game;
+    let changed = false;
+    for (const id of Object.keys(g.combat)) {
+        const c = g.combat[id];
+        if (!c) continue;
+        if ((c.shield || 0) > 0 && c.shieldUntil > 0 && c.shieldUntil <= now) {
+            c.shield = 0;
+            c.shieldUntil = 0;
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 // The dome that covers `targetId`: it has to be the target's own team's shield, and
@@ -2040,10 +2091,12 @@ function mummyStatePayload(room, self) {
             type: abilityFor(self),
             left_ms: cooldownLeft,
             ready: g.phase === "playing" && cooldownLeft === 0,
-            cooldown_ms: ABILITY_COOLDOWN_MS,
+            cooldown_ms: abilityCooldownMs(abilityFor(self)),
             // How long this character's cast stands for, and what it takes to end it.
-            duration_ms: abilityFor(self) === "shield" ? SHIELD_LIFETIME_MS : CLONE_LIFETIME_MS,
-            hits_to_destroy: abilityFor(self) === "shield" ? SHIELD_DESTROY_AT : CLONE_MAX_HITS
+            duration_ms: abilityFor(self) === "hp_shield" ? HP_SHIELD_LIFETIME_MS
+                : abilityFor(self) === "shield" ? SHIELD_LIFETIME_MS : CLONE_LIFETIME_MS,
+            hits_to_destroy: abilityFor(self) === "shield" ? SHIELD_DESTROY_AT : CLONE_MAX_HITS,
+            shield_hp: abilityFor(self) === "hp_shield" ? HP_SHIELD_AMOUNT : 0
         },
         // Every client rebuilds the holograms from this list, so a spawn or a
         // destroy that lands on one phone and not another self-corrects.
@@ -2053,8 +2106,10 @@ function mummyStatePayload(room, self) {
         shields: shieldPayload(room, now),
         players: room.entries.map(e => {
             const id = mummyIdOf(e);
-            const c = g.combat[id] || { hp: MUMMY_HP, downed: false, eliminated: false, reviveMs: 0, revivers: {} };
+            const c = g.combat[id] || { hp: MUMMY_HP, shield: 0, shieldUntil: 0, downed: false, eliminated: false, reviveMs: 0, revivers: {} };
             const downLeft = c.downed ? Math.max(0, Math.ceil((c.downedSince + MUMMY_DOWN_MS - now) / 1000)) : 0;
+            const shieldLeft = (c.shield || 0) > 0 && c.shieldUntil > 0
+                ? Math.max(0, Math.ceil((c.shieldUntil - now) / 1000)) : 0;
             return {
                 id: id,
                 player_uid: e.uid,
@@ -2065,6 +2120,9 @@ function mummyStatePayload(room, self) {
                 side: e.side,
                 role: g.roles[id] || "",
                 hp: c.hp,
+                shield: c.shield || 0,
+                shield_max: HP_SHIELD_AMOUNT,
+                shield_seconds_left: shieldLeft,
                 downed: c.downed,
                 eliminated: c.eliminated,
                 down_seconds_left: downLeft,
@@ -2099,6 +2157,8 @@ function tickMummyMatches() {
         // A dome's 15 seconds run on this clock too, so it closes on every phone at
         // the same tick whether or not the caster's own screen is still there.
         if (g.phase !== "finished") tickMummyShields(room, now);
+        // The Shadow Ranger shield's 20 seconds run on the same clock.
+        if (g.phase !== "finished") tickMummyHpShields(room, now);
 
         if (g.phase === "playing" && !g.settled) {
             tickMummyCombat(room, now);
@@ -2589,9 +2649,21 @@ function performMummyAttack(room, attacker, targetId) {
         return true;
     }
 
-    // Apply damage
-    target.hp = Math.max(0, target.hp - MUMMY_DAMAGE_PER_HIT);
-    console.log(`[MUMMY] ${attackerId} hit ${targetId} for ${MUMMY_DAMAGE_PER_HIT} damage, HP now ${target.hp}`);
+    // Apply damage: the blue shield is extra HP laid over the normal bar, so it
+    // spends first and the body only starts losing HP once it is gone.
+    let incoming = MUMMY_DAMAGE_PER_HIT;
+    if ((target.shield || 0) > 0) {
+        const absorbed = Math.min(target.shield, incoming);
+        target.shield -= absorbed;
+        incoming -= absorbed;
+        if (target.shield <= 0) {
+            target.shield = 0;
+            target.shieldUntil = 0;
+        }
+        console.log(`[MUMMY] ${targetId}'s shadow shield absorbed ${absorbed}, ${target.shield} left`);
+    }
+    target.hp = Math.max(0, target.hp - incoming);
+    console.log(`[MUMMY] ${attackerId} hit ${targetId} for ${incoming} damage, HP now ${target.hp}`);
 
     // Check if HP reached zero
     if (target.hp <= 0) {
