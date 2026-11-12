@@ -24,731 +24,1159 @@ function load(name) {
             `[BOOT]   Start Command  = node server.js\n` +
             `[BOOT]   Node Version   = 18 or newer`
         );
-        process.exit(1);
+        process.exitCode = 1;
+        throw err;
     }
 }
 
-const http = load('http');
-const WebSocket = load('ws');
+const http = require('http');
+const crypto = require('crypto');
+const wsLib = load('ws');
+const WebSocketServer = wsLib.WebSocketServer || wsLib.Server;
+const WebSocket = wsLib.WebSocket;
 
-// Every deployed instance can be a matchmaker. The very first one becomes the
-// hub that owns every queue, every team and every room (reached by a stable
-// URL). Every later instance is a relay: it holds the players' sockets but
-// forwards matchmaking, teams and game logic to that hub, so a player who lands
-// on any box still enters the same queue as everyone else. Hubs talk to hubs
-// too - when a region's queue sits waiting, the hub hands its roster to another
-// region's hub so a match can be built across them.
-//   HUB_URL            - empty => I am the hub (the first, canonical process).
-//                        set   => the hub I relay to (and, for a hub, my peer).
-//   REGION_ID          - this instance's name, sent as part of every handoff.
-//   HUB_WAKE_URL       - URL a new relay pings to spin the sleeping hub up.
-//   HUB_WAKE_INTERVAL  - ms between wake pings while the hub is still down.
-const PORT = process.env.PORT || 10000;
-const HUB_URL = (process.env.HUB_URL || "").trim();
-const REGION_ID = (process.env.REGION_ID || process.env.RENDER_SERVICE_NAME || "region-" + PORT).trim();
-const HUB_WAKE_URL = (process.env.HUB_WAKE_URL || HUB_URL).trim();
-const HUB_WAKE_INTERVAL = Math.max(5000, parseInt(process.env.HUB_WAKE_INTERVAL, 10) || 15000);
-const ROSTER_STALE_MS = 15000;        // a hub that stopped reporting is treated as empty
-const FEDERATE_AFTER_MS = 8000;       // queue age before we look for a cross-region pair
+const PORT = process.env.PORT || 3000;
 
-// Data in, whatever the source: the phone, this process, or a hub on another
-// continent. A send can throw on a socket that is closing, and a typed string
-// is the only contract the rest of the server relies on.
-function sendJson(ws, obj) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    try { ws.send(JSON.stringify(obj)); } catch (_e) { /* closing socket */ }
+// ==========================================
+// 1. OAUTH TOKEN MEMORY STORE
+// ==========================================
+const oauthTokens = new Map(); // state -> { access_token, refresh_token, expires_at, user }
+
+// ---- the handful of things express was doing ----
+// Written against node's own http so the only package this service needs to boot
+// is ws. Every response stays permissive exactly as cors() left it, and a body is
+// capped because a POST to this port can come from anywhere.
+const MAX_BODY_BYTES = 64 * 1024;
+
+function respond(res, status, type, body) {
+    res.writeHead(status, {
+        'Content-Type': type,
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Headers': 'Content-Type',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS'
+    });
+    res.end(body);
 }
 
-function safeJsonParse(raw) {
-    try { return JSON.parse(raw); } catch (_e) { return null; }
+function respondJson(res, status, obj) {
+    respond(res, status, 'application/json; charset=utf-8', JSON.stringify(obj));
 }
 
-const server = http.createServer((req, res) => {
-    // GET / -> health check for Render (it marks the deploy live once this
-    // answers). Anything else closes cleanly; there is no HTTP API here.
-    if (req.method === 'GET' && (req.url === '/' || req.url === '/healthz')) {
-        const body = HUB_URL === ""
-            ? `Flame Strike matchmaking hub (${REGION_ID})\n`
-            : `Flame Strike matchmaking relay (${REGION_ID} -> ${HUB_URL})\n`;
-        res.writeHead(200, { 'Content-Type': 'text/plain' });
-        res.end(body);
-        return;
-    }
-    res.writeHead(404);
-    res.end();
-});
-
-// The actual game clients connect here. A hub also accepts its relays on the
-// very same socket, so one port serves both roles with no second listener.
-const wss = new WebSocket.Server({ server, maxPayload: 16 * 1024 });
-
-let nextMatchId = 1;
-let nextRelayId = 1;
-let nextTeamId = 1;
-let nextRemoteId = 1;
-let nextMirrorId = 1;
-
-// The hub hands a waiting roster to a peer hub that can complete it. A
-// "mirror" room is a booking the receiver keeps: a found_match has already
-// been sent to every player on that side, so the moment the other side's
-// booking arrives the receiver builds the real room out of both rosters and
-// drops the mirrors. Nothing about this lives on the wire to a phone.
-const mirrorRooms = new Map();     // mirrorId -> mirror room
-
-// ---------------------------------------------------------------- relay -> hub
-// Open only on a relay box. Every message that needs global state (teams,
-// matchmaking, a live room's logic) is wrapped and sent upstream; the hub
-// answers to this socket and deliverTo routes the reply back to the right
-// local player. A broken link is retried with backoff, and the local maps
-// never pretend to own what only the hub knows.
-let hub = null;                    // WebSocket to the hub (relay side only)
-let hubReady = false;
-let hubRetryAt = 0;
-let hubBackoff = 1000;
-let hubWoke = false;
-
-// The hub's view of every box connected to it, keyed by the relay socket.
-// state.games / state.teams / state.clients are maps keyed by the remote id
-// the hub minted for that player, so a reply can be routed back to the exact
-// relay that owns the real socket.
-const relays = new Map();          // relay ws -> { id, region, state:{games,teams,clients} }
-
-// Hubs that announced themselves as peers. A roster we hand off travels to
-// the least-loaded one that still answers, and a roster handed to us arrives
-// on the same link.
-const peers = new Map();           // hub-peer ws -> { region, load, rosters, reportedAt }
-
-function wakeHub() {
-    // A sleeping hub cannot accept a websocket; a plain HTTP GET is enough to
-    // wake it on Render. Retried on an interval until the socket is up, and it
-    // never talks to this process's own listener.
-    if (HUB_URL === "" || hubReady || hubWoke || HUB_WAKE_URL === "") return;
-    if (HUB_WAKE_URL.indexOf(':' + String(PORT)) !== -1) return;
-    hubWoke = true;
-    const ping = () => {
-        if (hubReady) return;
-        try {
-            const u = new URL(HUB_WAKE_URL);
-            const mod = u.protocol === 'https:' ? load('https') : http;
-            const req = mod.get({
-                hostname: u.hostname,
-                port: u.port || (u.protocol === 'https:' ? 443 : 80),
-                path: u.pathname || '/',
-                timeout: 8000,
-                headers: { 'User-Agent': 'FlameStrike-Relay/1.0' }
-            }, (res) => { res.resume(); });
-            req.on('timeout', () => req.destroy());
-            req.on('error', () => {});
-        } catch (_e) {}
-        if (!hubReady) setTimeout(ping, HUB_WAKE_INTERVAL);
-    };
-    ping();
-}
-
-function connectToHub() {
-    if (HUB_URL === "" || hub || Date.now() < hubRetryAt) return;
-    let sock;
-    try {
-        sock = new WebSocket(HUB_URL);
-    } catch (_e) {
-        hubRetryAt = Date.now() + hubBackoff;
-        hubBackoff = Math.min(hubBackoff * 2, 15000);
-        return;
-    }
-    hub = sock;
-
-    sock.on('open', () => {
-        hubReady = true;
-        hubBackoff = 1000;
-        console.log(`[RELAY] linked to hub ${HUB_URL} as ${REGION_ID}`);
-        // A hub that restarts loses every remote id it minted, so the relay
-        // re-introduces itself and asks the hub to forget this box's ghosts.
-        sendJson(sock, { type: "relay_hello", region: REGION_ID });
-        // Anyone who was sitting in a queue or on a team when the hub died must
-        // be told plainly: their next action is a fresh search, not a wait on a
-        // room that no longer exists anywhere.
-        for (const ws of wss.clients) {
-            if (ws.queued || ws.teamRemote) {
-                ws.queued = false;
-                ws.teamRemote = null;
-                sendJson(ws, { type: "match_cancelled", reason: "hub_lost" });
-            }
+function readBody(req, res, done) {
+    let raw = '';
+    let failed = false;
+    req.on('data', (chunk) => {
+        if (failed) return;
+        raw += chunk;
+        if (raw.length > MAX_BODY_BYTES) {
+            failed = true;
+            respondJson(res, 413, { error: "Body too large" });
+            req.destroy();
         }
     });
+    req.on('end', () => { if (!failed) done(raw); });
+    req.on('error', () => {});
+}
 
-    sock.on('message', (raw) => {
-        let msg;
-        try { msg = JSON.parse(String(raw)); } catch (_e) { return; }
-        handleHubMessage(msg);
+// Health check endpoint
+function handleHealth(req, res) {
+    respondJson(res, 200, {
+        status: "online",
+        service: "Flame Strike Game Server",
+        voice: !!(process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET),
+        timestamp: new Date().toISOString()
     });
+}
 
-    const gone = () => {
-        if (hub !== sock) return;
-        hub = null;
-        hubReady = false;
-        hubRetryAt = Date.now() + hubBackoff;
-        hubBackoff = Math.min(hubBackoff * 2, 15000);
-        console.log(`[RELAY] hub link lost, retrying in ${Math.round((hubRetryAt - Date.now()) / 1000)}s`);
+// OAuth Callback from Supabase / Google
+// Supabase OAuth redirects with hash fragment (#access_token=...&refresh_token=...&state=...)
+// This page reads the hash and submits it back to the server
+function handleCallback(req, res) {
+    respond(res, 200, 'text/html; charset=utf-8', `
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Logging in...</title>
+    <style>
+        body { background: #0b0f19; color: #38bdf8; font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+        .box { text-align: center; background: #131d31; padding: 30px; border-radius: 12px; border: 1px solid #1e293b; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h2>Flame Strike Authentication</h2>
+        <p>Logging in, please return to your game...</p>
+        <p id="debug" style="font-size: 12px; color: #666;"></p>
+    </div>
+    <script>
+        // Check both hash and query string for tokens
+        const hash = window.location.hash.substring(1);
+        const search = window.location.search.substring(1);
+        const params = new URLSearchParams(hash || search);
+        
+        const accessToken = params.get('access_token');
+        const refreshToken = params.get('refresh_token');
+        const state = params.get('state');
+        
+        document.getElementById('debug').innerText = 'State: ' + (state || 'none') + ' | Token: ' + (accessToken ? 'found' : 'missing');
+        
+        if (accessToken) {
+            // If no state, use a fallback global state
+            const finalState = state || 'global_fallback';
+            
+            fetch('/auth/save-token', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ state: finalState, access_token: accessToken, refresh_token: refreshToken })
+            }).then(() => {
+                document.querySelector('p').innerText = "Logged in successfully! You can switch back to the game.";
+                setTimeout(() => window.close(), 1500);
+            }).catch(err => {
+                document.querySelector('p').innerText = "Error: " + err.message;
+            });
+        } else {
+            document.querySelector('p').innerText = "No token found. Please try again.";
+        }
+    </script>
+</body>
+</html>
+    `);
+}
+
+// Internal endpoint to store extracted token
+function handleSaveToken(req, res) {
+    readBody(req, res, (raw) => {
+        let body = {};
+        try { body = JSON.parse(raw || '{}'); } catch (err) { body = {}; }
+        const { state, access_token, refresh_token } = body;
+        console.log('[AUTH] Save-token called. State:', state, 'Token present:', !!access_token);
+
+        if (access_token) {
+            const finalState = state || 'global_fallback';
+            oauthTokens.set(finalState, {
+                access_token,
+                refresh_token,
+                created_at: Date.now()
+            });
+            // Also store under global_fallback for Zero-State bridge
+            oauthTokens.set('global_fallback', {
+                access_token,
+                refresh_token,
+                created_at: Date.now()
+            });
+            // Auto cleanup after 5 minutes
+            setTimeout(() => {
+                oauthTokens.delete(finalState);
+                oauthTokens.delete('global_fallback');
+            }, 5 * 60 * 1000);
+            console.log('[AUTH] Token saved successfully for state:', finalState);
+            respondJson(res, 200, { success: true });
+            return;
+        }
+        respondJson(res, 400, { error: "Missing token" });
+    });
+}
+
+// Godot polls this endpoint during login
+function handlePoll(req, res, state) {
+    if (!state) {
+        return respondJson(res, 400, { error: "Missing state query param" });
+    }
+
+    // Try exact state match first
+    if (oauthTokens.has(state)) {
+        const tokenData = oauthTokens.get(state);
+        oauthTokens.delete(state); // One-time use
+        return respondJson(res, 200, {
+            access_token: tokenData.access_token,
+            refresh_token: tokenData.refresh_token,
+            pending: false
+        });
+    }
+
+    // Zero-State fallback: if global_fallback exists, use it
+    if (oauthTokens.has('global_fallback')) {
+        const tokenData = oauthTokens.get('global_fallback');
+        oauthTokens.delete('global_fallback'); // One-time use
+        return respondJson(res, 200, {
+            access_token: tokenData.access_token,
+            refresh_token: tokenData.refresh_token,
+            pending: false
+        });
+    }
+
+    respondJson(res, 200, { pending: true });
+}
+
+// ==========================================
+// VOICE (LiveKit) ACCESS TOKENS
+// ==========================================
+// The lobby voice chat runs on a LiveKit server. A client cannot be trusted
+// with the signing secret, so it asks this endpoint for a short-lived access
+// token instead. The token is a plain HS256 JWT, which node's own crypto can
+// sign - that keeps this service's only dependency at ws.
+//
+// The LiveKit server URL and its key/secret come from the environment, so the
+// same build works for LiveKit Cloud or a self-hosted box:
+//   LIVEKIT_URL         wss://xxxxx.livekit.cloud
+//   LIVEKIT_API_KEY     the project's API key
+//   LIVEKIT_API_SECRET  the project's API secret
+// Until those are set, /voice/token answers 503 and the game keeps voice off.
+const VOICE_TOKEN_TTL_SECONDS = 6 * 60 * 60;
+
+function base64url(input) {
+    return Buffer.from(input).toString('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+// Keeps an identity/room name to safe characters so it cannot smuggle
+// separators or grow without bound.
+function sanitizeId(value) {
+    return String(value || '').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 64);
+}
+
+function makeLiveKitToken(apiKey, apiSecret, identity, room) {
+    const now = Math.floor(Date.now() / 1000);
+    const header = { alg: 'HS256', typ: 'JWT' };
+    const payload = {
+        iss: apiKey,
+        sub: identity,
+        name: identity,
+        nbf: now - 5,
+        exp: now + VOICE_TOKEN_TTL_SECONDS,
+        video: {
+            room: room,
+            roomJoin: true,
+            canPublish: true,
+            canSubscribe: true,
+            canPublishData: true
+        }
     };
-    sock.on('close', gone);
-    sock.on('error', () => { try { sock.terminate(); } catch (_e) {} });
+    const body = base64url(JSON.stringify(header)) + '.' + base64url(JSON.stringify(payload));
+    const sig = crypto.createHmac('sha256', apiSecret).update(body).digest();
+    return body + '.' + base64url(sig);
 }
 
-function relaySend(obj) {
-    // A relay only ever talks to its hub; when the link is down the caller is
-    // responsible for telling the player, because the hub is the source of truth.
-    if (!hubReady || !hub) return false;
-    sendJson(hub, obj);
-    return true;
+function handleVoiceToken(req, res) {
+    const apiKey = process.env.LIVEKIT_API_KEY;
+    const apiSecret = process.env.LIVEKIT_API_SECRET;
+    if (!apiKey || !apiSecret) {
+        return respondJson(res, 503, { error: "Voice not configured" });
+    }
+    const params = new URL(req.url, 'http://localhost').searchParams;
+    const identity = sanitizeId(params.get('identity'))
+        || ('guest-' + Math.random().toString(36).slice(2, 10));
+    const room = sanitizeId(params.get('room')) || 'lobby';
+    const token = makeLiveKitToken(apiKey, apiSecret, identity, room);
+    console.log('[VOICE] token issued for', identity, 'in room', room);
+    respondJson(res, 200, {
+        token: token,
+        url: process.env.LIVEKIT_URL || '',
+        room: room,
+        identity: identity
+    });
 }
 
-// A reply from the hub names the remote id of the player it concerns. The
-// relay maps that id to the live local socket and hands the payload over
-// untouched, so the client never learns it spoke through a relay at all.
-function handleHubMessage(msg) {
-    if (!msg || typeof msg !== "object") return;
-    const kind = msg._kind;
-
-    if (kind === "to_client") {
-        const ws = remoteClients.get(String(msg.remote || ""));
-        if (ws) sendJson(ws, msg.payload || {});
+// Everything that is not a websocket upgrade lands here: the routes above,
+// and a plain 404 for the rest.
+function routeHttp(req, res) {
+    const path = String(req.url || '').split('?')[0];
+    if (req.method === 'OPTIONS') {
+        respond(res, 204, 'text/plain; charset=utf-8', '');
         return;
     }
-
-    // A match the hub built (possibly from a roster another hub sent). Bind
-    // every local seat to the room id and tell the phone exactly what the hub
-    // decided: who is on which side, which spawn, which team.
-    if (kind === "room_start") {
-        const roomId = String(msg.roomId || "");
-        const members = Array.isArray(msg.members) ? msg.members : [];
-        for (const m of members) {
-            const ws = remoteClients.get(String(m.remote || ""));
-            if (!ws) continue;
-            ws.matchId = roomId;
-            ws.matchUid = String(m.playerUid || "");
-            ws.matchSpawnIndex = typeof m.spawnIndex === "number" ? m.spawnIndex : -1;
-            ws.matchSide = typeof m.side === "number" ? m.side : -1;
-            ws.queued = false;
-        }
-        // Fan the found_match out locally, but keep the relay-only "remote"
-        // tag off the wire to the phone.
-        for (const m of members) {
-            const ws = remoteClients.get(String(m.remote || ""));
-            if (!ws) continue;
-            const out = Object.assign({}, msg.payload || {});
-            sendJson(ws, out);
-        }
+    if (req.method === 'GET' && path === '/') { handleHealth(req, res); return; }
+    if (req.method === 'GET' && path === '/auth/callback') { handleCallback(req, res); return; }
+    if (req.method === 'POST' && path === '/auth/save-token') { handleSaveToken(req, res); return; }
+    if (req.method === 'GET' && path === '/voice/token') { handleVoiceToken(req, res); return; }
+    if (req.method === 'GET' && path === '/auth/poll') {
+        handlePoll(req, res, new URL(req.url, 'http://localhost').searchParams.get('state'));
         return;
     }
-
-    // A team snapshot the hub computed for this relay's member. Cache the
-    // remote team id so later team actions (invite, leave, kick) can be routed
-    // back to the right group on the hub.
-    if (kind === "team_state") {
-        const ws = remoteClients.get(String(msg.remote || ""));
-        if (!ws) return;
-        const payload = msg.payload || {};
-        if (payload.team && payload.team.team_id) ws.teamRemote = String(payload.team.team_id);
-        else ws.teamRemote = null;
-        sendJson(ws, payload);
-        return;
-    }
+    respondJson(res, 404, { error: "Not found" });
 }
 
-// ---------------------------------------------------------------- hub state --
-// Only meaningful on the box that is the hub (HUB_URL empty). A relay's
-// player is represented here by a "proxy" - a plain object that looks enough
-// like a WebSocket (readyState, send, a couple of ids) for the existing
-// room/queue/team code to treat it as a seat, while send() actually forwards
-// the bytes back down the relay link.
-const remoteClients = new Map();   // remoteId (relay-side key) -> local ws
-// hub-side: remote id string -> proxy seat
+// ==========================================
+// 2. WEBSOCKET REAL-TIME MATCHMAKING
+// ==========================================
+const server = http.createServer(routeHttp);
+const wss = new WebSocketServer({ server });
 
-function makeProxy(relaySock, remoteId, region) {
-    return {
-        readyState: WebSocket.OPEN,
-        _proxy: true,
-        _relay: relaySock,
-        _remote: String(remoteId),
-        _region: region || "relay",
-        isAlive: true,
-        matchId: null,
-        matchUid: "",
-        matchSpawnIndex: -1,
-        matchSide: -1,
-        queued: false,
-        teamId: null,
-        teamRemote: null,
-        voiceKey: "",
-        // The room code calls ws.send(text). Forward it to the relay that owns
-        // the real socket; the relay will hand the text to the phone.
-        send: function (text) {
-            if (!this._relay || this._relay.readyState !== WebSocket.OPEN) return;
-            sendJson(this._relay, { _kind: "to_client", remote: this._remote, payload: safeJsonParse(text) || {} });
-        },
-        // A proxy never pings; its liveness is the relay link itself.
-        ping: function () {},
-        terminate: function () {},
-        close: function () {}
-    };
-}
+// Mode queues: array of { ws, uid, team_size, character_id, username, player_uid }
+const queues = {
+    "MUMMY_VS_HUMAN": [],
+    "ZOMBIE_ECLIPSE": []
+};
 
-// Drop every seat a relay owned: pull them out of queues, teams and rooms the
-// same way a real disconnect would, so a relay that vanishes does not leave
-// ghost bodies holding spots.
-function dropRelay(relaySock) {
-    const info = relays.get(relaySock);
-    if (!info) return;
-    relays.delete(relaySock);
-    for (const [rid, seat] of info.state.clients.entries()) {
-        // Reuse the normal close path by marking the proxy closed and running
-        // the same cleanup a socket close would trigger.
-        seat.readyState = WebSocket.CLOSED;
-        removeFromAllQueues(seat);
-        leaveTeam(seat);
-        leaveVoice(seat);
-        const room = seat.matchId && matches.get(seat.matchId);
-        if (room) {
-            room.players = room.players.filter(p => p !== seat);
-            const entry = room.entries.find(e => e.ws === seat);
-            if (entry) entry.ws = seat; // keep a stable reference for state builds
-            // A proxy that drops mid-match is a disconnect: treat like a gone
-            // socket so the grace timer / forfeit rules still apply.
-            if (room.game && room.game.phase !== "finished") {
-                const ent = room.entries.find(e => e.uid === seat.matchUid || e.ws === seat);
-                if (ent) ent.gone = true;
-                armGraceTimer(room);
-            }
-        }
-    }
-    info.state.clients.clear();
-}
+// Team queues: mode -> array of { teamId, slot, teamSize, members: [same shape as above] }
+const teamQueues = {
+    "MUMMY_VS_HUMAN": [],
+    "ZOMBIE_ECLIPSE": []
+};
 
-// ---------------------------------------------------------------- teams / queue
-const teams = new Map();           // teamId -> { id, leaderUid, maxSize, mode, members:[{ws,uid,username,characterId,bundleId}], inviters:{} }
-const queues = Object.create(null); // mode -> [solo entries]
-const teamQueues = Object.create(null);
-const MUMMY_MODE = "MUMMY_VS_HUMAN";
-const ZOMBIE_MODE = "ZOMBIE_ECLIPSE";
-const ZOMBIE_TEAM_SIZE = 4;
-queues[MUMMY_MODE] = [];
-queues[ZOMBIE_MODE] = [];
-teamQueues[MUMMY_MODE] = [];
-teamQueues[ZOMBIE_MODE] = [];
-
+// The team slots a search can ask for. A queue is a separate pool per
+// (mode, slot), so Solo can only ever meet Solo and Squad only Squad.
 const TEAM_SLOTS = [1, 2, 3, 4];
-const SQUAD_TEAM_SIZE = 4;
-const QUEUE_STALE_MS = 120000;     // drop bodies that sat waiting longer than this
-const NO_TEAM = { type: "team_update", team: null };
 
-function uidKey(v) {
-    const n = Number(v);
-    if (Number.isFinite(n) && n > 0) return String(Math.trunc(n));
-    return String(v || "").trim();
+// Active match rooms: match_id -> { players: [ws1, ws2], mode }
+const matches = new Map();
+let matchCounter = 1000;
+
+// A phone that drops mid-match gets this long to come back before the match is
+// forfeited: mobile nets flap for seconds at a time, so an instant loss on the
+// first closed socket was punishing a wobble like a rage-quit. The harness
+// shortens it via RECONNECT_GRACE_MS so forfeit tests do not wait 15 real seconds.
+const RECONNECT_GRACE_MS = Number(process.env.RECONNECT_GRACE_MS) || 15000;
+
+// ---- Authoritative team (party) state ----
+const clientsByUid = new Map();   // player_uid -> ws (last connection wins)
+const teams = new Map();          // team_id -> { id, leaderUid, maxSize, members: [{ws, uid, username, characterId, bundleId}] }
+let teamCounter = 5000;
+
+// Supabase hands UIDs back as floats, so the same player can arrive as
+// "667336" or "667336.0". Everything is keyed on the integer form.
+function uidKey(value) {
+    const raw = String(value === undefined || value === null ? "" : value).trim();
+    if (raw === "") return "";
+    const asInt = parseInt(raw, 10);
+    return isNaN(asInt) || asInt <= 0 ? "" : String(asInt);
+}
+
+function sendJson(ws, payload) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
 }
 
 function bindUid(ws, data) {
-    const uid = uidKey((data && (data.uid || data.player_uid)) || ws.uid || "");
-    if (uid) ws.uid = uid;
-    return uid;
-}
-
-function refreshIdentity(uid, data) {
-    if (!uid) return;
-    const name = String((data && data.username) || "").trim();
-    const cid = data && data.character_id;
-    const bid = data ? bundleIdOf(data) : undefined;
-    // Keep the team roster current for a member whose profile loaded after the
-    // team was formed (or who changed character in the lobby).
-    for (const team of teams.values()) {
-        const m = team.members.find(x => x.uid === uid);
-        if (!m) continue;
-        if (name) m.username = name;
-        if (cid) m.characterId = cid;
-        if (bid !== undefined) m.bundleId = bid;
+    const key = uidKey(data && data.player_uid);
+    if (key && key !== ws.playerUid) {
+        if (ws.playerUid && clientsByUid.get(ws.playerUid) === ws) clientsByUid.delete(ws.playerUid);
+        ws.playerUid = key;
+        clientsByUid.set(key, ws);
     }
-}
-
-function bundleIdOf(obj) {
-    if (!obj) return 0;
-    const raw = obj.bundle_id !== undefined ? obj.bundle_id : obj.bundleId;
-    const n = parseInt(raw, 10);
-    return Number.isFinite(n) ? n : 0;
-}
-
-function bundleOf(member) {
-    return member ? bundleIdOf(member) : 0;
+    return ws.playerUid || "";
 }
 
 function teamOf(ws) {
-    if (!ws || !ws.teamId) return null;
-    const team = teams.get(ws.teamId);
-    if (!team) { ws.teamId = null; return null; }
-    return team;
+    return ws.teamId && teams.has(ws.teamId) ? teams.get(ws.teamId) : null;
 }
 
-function teamPayload(team) {
-    if (!team) return null;
+function bundleOf(row) {
+    // -1 means "wearing the character's own default look". The client maps any
+    // slot it does not have to the same fallback, so an unknown number is only
+    // ever cosmetic, never a crash.
+    return row.bundleId === undefined || row.bundleId === null ? -1 : row.bundleId;
+}
+
+function bundleIdOf(data) {
+    const v = parseInt(data && data.bundle_id, 10);
+    return isNaN(v) || v < -1 ? -1 : v;
+}
+
+function memberInfo(m) {
     return {
-        team_id: team.id,
-        leader_uid: team.leaderUid,
-        max_size: team.maxSize,
-        mode: team.mode || "",
-        members: team.members.map(m => ({
-            uid: m.uid,
-            username: m.username,
-            character_id: m.characterId,
-            bundle_id: bundleOf(m)
-        }))
+        player_uid: m.uid,
+        username: m.username,
+        character_id: m.characterId,
+        bundle_id: bundleOf(m)
     };
 }
 
-function broadcastTeam(team) {
-    const payload = JSON.stringify({ type: "team_update", team: teamPayload(team) });
-    for (const m of team.members) {
-        if (m.ws && m.ws.readyState === WebSocket.OPEN) {
-            try { m.ws.send(payload); } catch (_e) {}
+// Clients attach their identity (UID, name, equipped character) to every team
+// message, so a player who equips or buys a character while already in a party —
+// or while queued — is carried with their new model instead of the one they
+// registered with.
+function refreshIdentity(uid, data) {
+    if (!uid) return;
+    const name = String(data.username || "").trim();
+    const charId = parseInt(data.character_id, 10);
+    const bundleId = parseInt(data.bundle_id, 10);
+    const patch = (row) => {
+        if (name !== "") row.username = name;
+        if (!isNaN(charId) && charId > 0) row.characterId = charId;
+        if (!isNaN(bundleId) && bundleId >= -1) row.bundleId = bundleId;
+    };
+    for (const team of teams.values()) {
+        const member = team.members.find(m => m.uid === uid);
+        if (member) patch(member);
+    }
+    for (const mode of Object.keys(queues)) {
+        for (const entry of queues[mode]) {
+            if (entry.playerUid === uid) patch(entry);
+        }
+    }
+    for (const mode of Object.keys(teamQueues)) {
+        for (const group of teamQueues[mode]) {
+            for (const entry of group.members) {
+                if (entry.playerUid === uid) patch(entry);
+            }
         }
     }
 }
 
-function teamError(ws, text) {
-    sendJson(ws, { type: "team_error", message: String(text || "Team action failed") });
+function teamPayload(team) {
+    return {
+        type: "team_update",
+        team_id: team.id,
+        leader_uid: team.leaderUid,
+        max_size: team.maxSize,
+        members: team.members.map(memberInfo)
+    };
+}
+
+// The "you have no team" message doubles as the lobby-clear signal client-side.
+const NO_TEAM = { type: "team_update", team_id: "", leader_uid: "", max_size: 1, members: [] };
+
+function teamError(ws, reason) {
+    sendJson(ws, { type: "team_error", reason: String(reason || "") });
+}
+
+function broadcastTeam(team) {
+    const payload = teamPayload(team);
+    for (const m of team.members) sendJson(m.ws, payload);
 }
 
 function createTeam(ws, uid, username, characterId, bundleId, maxSize) {
-    const id = "team-" + String(nextTeamId++);
+    const id = "team_" + (teamCounter++);
     const team = {
         id: id,
         leaderUid: uid,
-        maxSize: Math.min(4, Math.max(1, parseInt(maxSize, 10) || 1)),
-        mode: "",
-        inviters: Object.create(null),
-        members: [{
-            ws: ws,
-            uid: uid,
-            username: String(username || "Player"),
-            characterId: characterId || 1,
-            bundleId: bundleId || 0
-        }]
+        maxSize: maxSize,
+        inviters: {},
+        members: [{ ws: ws, uid: uid, username: username, characterId: characterId, bundleId: bundleId }]
     };
-    ws.teamId = id;
     teams.set(id, team);
+    ws.teamId = id;
     return team;
 }
 
-function disbandTeam(team, reasonText) {
-    if (!team) return;
-    removeFromTeamQueue(team.id);
-    const members = team.members.slice();
-    for (const m of members) {
-        if (m.ws) m.ws.teamId = null;
+function removeFromTeamQueue(teamId) {
+    for (const mode of Object.keys(teamQueues)) {
+        teamQueues[mode] = teamQueues[mode].filter(g => g.teamId !== teamId);
     }
+}
+
+function forgetTeam(team) {
     teams.delete(team.id);
-    for (const m of members) {
-        sendJson(m.ws, { type: "team_disbanded", reason: String(reasonText || "") });
-        sendJson(m.ws, NO_TEAM);
+    removeFromTeamQueue(team.id);
+    for (const m of team.members) {
+        if (m.ws.teamId === team.id) m.ws.teamId = null;
     }
+}
+
+function disbandTeam(team) {
+    const members = team.members.slice();
+    forgetTeam(team);
+    for (const m of members) {
+        sendJson(m.ws, NO_TEAM);
+        sendJson(m.ws, { type: "match_cancelled" });
+    }
+}
+
+// A party of one is not a party: as soon as a team drops below two members the
+// remaining player is released and may pick Solo/Duo/Squad again.
+function shrinkTeam(team, leavingWs, kickedMessage) {
+    const members = team.members.slice();
+    team.members = team.members.filter(m => m.ws !== leavingWs);
+    if (leavingWs) {
+        leavingWs.teamId = null;
+        if (kickedMessage) sendJson(leavingWs, kickedMessage);
+        sendJson(leavingWs, NO_TEAM);
+        sendJson(leavingWs, { type: "match_cancelled" });
+    }
+
+    if (team.members.length < 2) {
+        forgetTeam(team);
+        for (const m of team.members) {
+            m.ws.teamId = null;
+            sendJson(m.ws, NO_TEAM);
+            sendJson(m.ws, { type: "match_cancelled" });
+        }
+        return;
+    }
+
+    // A queue entry must never hold a departed member, and the rest have to stop
+    // searching: the roster they queued with no longer exists.
+    removeFromTeamQueue(team.id);
+    for (const m of team.members) sendJson(m.ws, { type: "match_cancelled" });
+    broadcastTeam(team);
 }
 
 function leaveTeam(ws) {
     const team = teamOf(ws);
-    if (!team) { sendJson(ws, NO_TEAM); return; }
-    const uid = uidKey(ws.uid);
-    const idx = team.members.findIndex(m => m.uid === uid || m.ws === ws);
-    if (idx < 0) { ws.teamId = null; sendJson(ws, NO_TEAM); return; }
-
-    // Pulling out of a party also pulls the party out of any queue it sat in:
-    // a half-party cannot keep a reserved slot.
-    removeFromTeamQueue(team.id);
-    team.members.splice(idx, 1);
-    ws.teamId = null;
-    sendJson(ws, NO_TEAM);
-
-    if (team.members.length <= 0) {
-        teams.delete(team.id);
+    if (!team) {
+        sendJson(ws, NO_TEAM);
         return;
     }
-
-    if (team.leaderUid === uid) {
-        // The leader leaving dissolves the group entirely (members go back to solo),
-        // which matches the lobby's "only the leader can search / own the party" model.
-        disbandTeam(team, "The team leader left");
+    if (team.leaderUid === ws.playerUid) {
+        // The leader owns the party: everyone is released, leader included.
+        team.members = team.members.filter(m => m.ws !== ws);
+        ws.teamId = null;
+        sendJson(ws, NO_TEAM);
+        disbandTeam(team);
         return;
     }
-
-    broadcastTeam(team);
+    shrinkTeam(team, ws);
 }
 
-function kickMember(ws, targetUid) {
-    const team = teamOf(ws);
-    if (!team) { teamError(ws, "You are not in a team"); return; }
-    const uid = uidKey(ws.uid);
-    if (team.leaderUid !== uid) { teamError(ws, "Only the team leader can kick"); return; }
-    if (targetUid === uid) { teamError(ws, "You cannot kick yourself"); return; }
-    const idx = team.members.findIndex(m => m.uid === targetUid);
-    if (idx < 0) { teamError(ws, "That player is not in your team"); return; }
+const KICKED_MESSAGE = "The leader has removed you from the team.";
 
-    removeFromTeamQueue(team.id);
-    const [removed] = team.members.splice(idx, 1);
-    if (removed && removed.ws) removed.ws.teamId = null;
-    sendJson(removed && removed.ws, { type: "team_kicked" });
-    sendJson(removed && removed.ws, NO_TEAM);
+function kickMember(leaderWs, targetUid) {
+    const team = teamOf(leaderWs);
+    if (!team) { teamError(leaderWs, "You are not in a team"); return; }
+    if (team.leaderUid !== leaderWs.playerUid) { teamError(leaderWs, "Only the team leader can remove players"); return; }
+    if (targetUid === team.leaderUid) { teamError(leaderWs, "The leader cannot be removed"); return; }
 
-    if (team.members.length <= 1) {
-        disbandTeam(team, "The team no longer has enough members");
-        return;
-    }
-    broadcastTeam(team);
-}
+    const target = team.members.find(m => m.uid === targetUid);
+    if (!target) { teamError(leaderWs, "That player is not in your team"); return; }
 
-function removeFromTeamQueue(teamId) {
-    if (!teamId) return;
-    for (const mode of Object.keys(teamQueues)) {
-        const before = teamQueues[mode].length;
-        teamQueues[mode] = teamQueues[mode].filter(g => g.teamId !== teamId);
-        if (teamQueues[mode].length !== before) broadcastPoolStatus(mode, 0); // cheap full refresh via per-slot below
-    }
+    shrinkTeam(team, target.ws, {
+        type: "team_kicked",
+        team_id: team.id,
+        reason: KICKED_MESSAGE
+    });
+    console.log(`[TEAM] leader ${leaderWs.playerUid} removed ${targetUid} from ${team.id}`);
 }
 
 function removeFromAllQueues(ws) {
     for (const mode of Object.keys(queues)) {
-        const before = queues[mode].length;
-        queues[mode] = queues[mode].filter(e => e.ws !== ws);
-        if (queues[mode].length !== before) {
-            // We don't know every slot cheaply; refresh all slots for this mode.
-            for (const s of TEAM_SLOTS) broadcastPoolStatus(mode, s);
+        const idx = queues[mode].findIndex(p => p.ws === ws);
+        if (idx !== -1) {
+            queues[mode].splice(idx, 1);
+            console.log(`[QUEUE] Player removed from ${mode}. Queue size: ${queues[mode].length}`);
         }
     }
     for (const mode of Object.keys(teamQueues)) {
-        const before = teamQueues[mode].length;
-        teamQueues[mode] = teamQueues[mode].filter(g => !g.members.some(m => m.ws === ws));
-        if (teamQueues[mode].length !== before) {
-            for (const s of TEAM_SLOTS) broadcastPoolStatus(mode, s);
+        for (const group of teamQueues[mode]) {
+            group.members = group.members.filter(m => m.ws !== ws);
         }
+        teamQueues[mode] = teamQueues[mode].filter(g => g.members.length > 0);
     }
 }
 
-function pruneStaleQueues() {
-    const now = Date.now();
-    for (const mode of Object.keys(queues)) {
-        let changed = false;
-        queues[mode] = queues[mode].filter(e => {
-            if (!e || !e.ws || e.ws.readyState !== WebSocket.OPEN) { changed = true; return false; }
-            if (e.ws.matchId && matches.has(e.ws.matchId)) { changed = true; return false; }
-            if (now - (e.queuedAt || 0) > QUEUE_STALE_MS) { changed = true; sendJson(e.ws, { type: "match_cancelled", reason: "timeout" }); return false; }
-            return true;
-        });
-        if (changed) for (const s of TEAM_SLOTS) broadcastPoolStatus(mode, s);
+// ==========================================
+// 0. CROSS-SERVER: HUB AND RELAY
+// ==========================================
+// One deployment is the hub (Asia 1) and owns every team, queue and room. The
+// other seven forward every player packet to it, so a player on Europe meets a
+// player on Oceania exactly like two players on the same server. On the hub a
+// relayed player is a plain object that mimics a socket (send/readyState), which
+// is why the whole game engine below works on both without knowing which one it
+// holds.
+// The fleet runs this one file with no per-service configuration: each
+// deployment reads its own RENDER_EXTERNAL_URL, and the service whose address is
+// HUB_HOST becomes the hub while every other one links itself to it. An explicit
+// HUB_URL still wins, which is how the local test harness runs eight processes
+// on one machine.
+const HUB_HOST = String(process.env.HUB_HOST || "dark-ward-sever.onrender.com").trim().toLowerCase();
+const HUB_RECONNECT_MS = 3000;
+
+function hostOf(url) {
+    return String(url || "").trim().toLowerCase()
+        .replace(/^wss?:\/\//, "").replace(/^https?:\/\//, "")
+        .split("/")[0].split("@").pop();
+}
+
+// A scheme the ws client can dial, or "" - never a throw, because a typo in one
+// dashboard field was enough to crash-loop a deployment out of existence.
+function asWsUrl(url) {
+    const raw = String(url || "").trim();
+    if (raw === "") return "";
+    if (/^(wss|ws):\/\//i.test(raw)) return raw;
+    if (/^https?:\/\//i.test(raw)) return raw.replace(/^http/i, "ws");
+    return "";
+}
+
+const selfHost = hostOf(process.env.RENDER_EXTERNAL_URL || process.env.SERVICE_URL || "");
+const autoHubUrl = (selfHost !== "" && selfHost !== HUB_HOST) ? "wss://" + HUB_HOST : "";
+
+let HUB_URL = autoHubUrl;
+if (process.env.HUB_URL !== undefined) {
+    const clean = asWsUrl(process.env.HUB_URL);
+    if (clean === "" && String(process.env.HUB_URL).trim() !== "") {
+        // A typo in the dashboard must not split the fleet: fall back to what this
+        // service's own address says its role is instead of quietly going private.
+        console.warn(`[CONFIG] HUB_URL="${process.env.HUB_URL}" is not a ws(s):// address. ` +
+            (autoHubUrl === "" ? "Running as the hub." : `Relaying to ${autoHubUrl} instead.`));
+    } else {
+        HUB_URL = clean;
     }
-    for (const mode of Object.keys(teamQueues)) {
-        let changed = false;
-        teamQueues[mode] = teamQueues[mode].filter(g => {
-            if (!g || !Array.isArray(g.members) || g.members.length === 0) { changed = true; return false; }
-            if (g.members.some(m => !m.ws || m.ws.readyState !== WebSocket.OPEN)) { changed = true; return false; }
-            if (g.members.some(m => m.ws.matchId && matches.has(m.ws.matchId))) { changed = true; return false; }
-            if (now - (g.queuedAt || 0) > QUEUE_STALE_MS) {
-                changed = true;
-                for (const m of g.members) sendJson(m.ws, { type: "match_cancelled", reason: "timeout" });
-                return false;
+}
+// The hub pointing at itself is a loop, not a link: a relayed packet would leave
+// this process and come straight back to it.
+if (HUB_URL !== "" && hostOf(HUB_URL) === selfHost) HUB_URL = "";
+
+const REGION_ID = String(process.env.REGION_ID || selfHost ||
+    ("region_" + PORT + "_" + Math.random().toString(36).slice(2, 8)));
+
+// ---- relay mode (this process forwards its players to the hub) ----
+const connsById = new Map(); // connId -> local player socket
+let relayConnCounter = 0;
+let hubWs = null;
+let hubTimer = null;
+
+function connectToHub() {
+    if (HUB_URL === "") return;
+    if (hubWs && (hubWs.readyState === WebSocket.OPEN || hubWs.readyState === WebSocket.CONNECTING)) return;
+    try {
+        hubWs = new WebSocket(HUB_URL);
+    } catch (err) {
+        console.error('[RELAY] cannot dial hub URL:', err.message);
+        hubWs = null;
+        clearTimeout(hubTimer);
+        hubTimer = setTimeout(connectToHub, HUB_RECONNECT_MS);
+        return;
+    }
+    hubWs.on('open', () => {
+        console.log(`[RELAY] linked to hub ${HUB_URL} as ${REGION_ID}`);
+        hubWs.send(JSON.stringify({ type: "hub_register", region_id: REGION_ID }));
+        // Players who joined while the link was down are announced again.
+        for (const ws of wss.clients) {
+            if (!ws.isRegion && ws.connId) {
+                hubWs.send(JSON.stringify({ type: "relay_open", conn: ws.connId }));
             }
-            return true;
-        });
-        if (changed) for (const s of TEAM_SLOTS) broadcastPoolStatus(mode, s);
-    }
-}
-
-function roomId() {
-    return "match-" + String(nextMatchId++);
-}
-
-function spawnIndexForSeat(mode, side, sideIndex, sideSize) {
-    // Mummy matches place Team A on Spawn1/2/3/4 and Team B on Spawn5/6/7/8.
-    // 1v1 uses (Spawn1, Spawn5), 2v2 uses (Spawn1,2, Spawn5,6), etc.
-    // Zombie Eclipse stays on a full contiguous 4v4 ring (Spawn1-8) to preserve
-    // existing zombie scene/placement logic.
-    if (mode === ZOMBIE_MODE) {
-        return side * ZOMBIE_TEAM_SIZE + sideIndex;
-    }
-    const base = side === 0 ? 0 : 4;
-    return base + sideIndex;
-}
-
-function cloneEntryForRoom(e, teamId, allyUids) {
-    return {
-        ws: e.ws,
-        uid: e.playerUid || uidKey(e.ws && e.ws.uid),
-        username: e.username || "Player",
-        characterId: e.characterId || 1,
-        bundleId: bundleIdOf(e),
-        spawnIndex: -1,
-        side: -1,
-        teamId: teamId || "",
-        team: teamId ? 1 : 0,
-        allies: Array.isArray(allyUids) ? allyUids.slice() : [],
-        ready: false,
-        gone: false,
-        pos: { x: 0, y: 0, z: 0, yaw: 0 },
-        lastStateSent: ""
-    };
-}
-
-function makeRoom(mode, slot, sideA, sideB) {
-    const id = roomId();
-    const entries = [];
-    const usedSpawns = new Set();
-    const players = [];
-
-    const pushSide = (sideObj, side) => {
-        for (let i = 0; i < sideObj.members.length; i++) {
-            const m = sideObj.members[i];
-            const ent = cloneEntryForRoom(m, sideObj.teamId, m.allyUids || []);
-            ent.side = side;
-            ent.spawnIndex = spawnIndexForSeat(mode, side, i, sideObj.members.length);
-            ent.team = side + 1;
-            if (!ent.ws || ent.ws.readyState !== WebSocket.OPEN) return false;
-            if (usedSpawns.has(ent.spawnIndex)) return false;
-            usedSpawns.add(ent.spawnIndex);
-            entries.push(ent);
-            players.push(ent.ws);
         }
-        return true;
-    };
+    });
+    hubWs.on('message', (message, isBinary) => {
+        if (isBinary) {
+            // Voice relay from the hub: [0x59][1-byte len][connId][voice frame].
+            if (message.length > 3 && message[0] === 0x59) {
+                const len = message[1];
+                if (2 + len <= message.length) {
+                    const target = connsById.get(message.subarray(2, 2 + len).toString("utf8"));
+                    if (target && target.readyState === WebSocket.OPEN) {
+                        target.send(message.subarray(2 + len));
+                    }
+                }
+            }
+            return;
+        }
+        let data;
+        try { data = JSON.parse(message.toString()); } catch (e) { return; }
+        if (data.type === "hub_to") {
+            const target = connsById.get(String(data.conn));
+            if (target && target.readyState === WebSocket.OPEN) target.send(String(data.data));
+        }
+    });
+    hubWs.on('close', () => {
+        console.log('[RELAY] hub link dropped, retrying...');
+        hubWs = null;
+        wakeHub();
+        clearTimeout(hubTimer);
+        hubTimer = setTimeout(connectToHub, HUB_RECONNECT_MS);
+    });
+    hubWs.on('error', () => {});
+}
 
-    if (!pushSide(sideA, 0) || !pushSide(sideB, 1)) return null;
-    if (entries.length !== slot * 2) return null;
+// The hub is the one service every region depends on, and a free instance sleeps
+// when nobody is knocking. A relay's own socket attempt does not wake it, so this
+// plain HTTP GET to its health root does - at most once a minute.
+let lastWakeAt = 0;
+
+function wakeHub() {
+    if (HUB_URL === "") return;
+    const now = Date.now();
+    if (now - lastWakeAt < 60000) return;
+    lastWakeAt = now;
+    try {
+        const host = hostOf(HUB_URL);
+        const req = http.get({ host: host, path: "/", timeout: 5000 }, (res) => res.resume());
+        req.on('error', () => {});
+        req.on('timeout', () => req.destroy());
+    } catch (err) {
+        console.error('[RELAY] hub wake-up failed:', err.message);
+    }
+}
+
+function relayToHub(ws, data) {
+    if (!hubWs || hubWs.readyState !== WebSocket.OPEN) return;
+    hubWs.send(JSON.stringify({ type: "relay_msg", conn: ws.connId, data: data }));
+}
+
+// ---- hub mode (this process owns the game and hears every region) ----
+const regionLinks = new Map(); // regionId -> { ws, peers: Map(connId -> peer) }
+let regionCounter = 0;
+
+function makePeer(regionId, connId) {
+    const link = regionLinks.get(regionId);
+    const peer = {
+        __peer: true,
+        regionId: regionId,
+        connId: connId,
+        readyState: 1, // WebSocket.OPEN
+        isAlive: true,
+        send: (text) => {
+            const l = regionLinks.get(regionId);
+            if (l && l.ws.readyState === WebSocket.OPEN) {
+                l.ws.send(JSON.stringify({ type: "hub_to", conn: connId, data: text }));
+            }
+        },
+        sendBinary: (buf) => {
+            const l = regionLinks.get(regionId);
+            if (l && l.ws.readyState === WebSocket.OPEN) {
+                l.ws.send(makeVoiceRelay(connId, buf));
+            }
+        }
+    };
+    if (link) {
+        if (link.peers.has(connId)) return link.peers.get(connId);
+        link.peers.set(connId, peer);
+    }
+    return peer;
+}
+
+function registerRegion(ws, data) {
+    const regionId = String(data.region_id || ("region_" + (++regionCounter)));
+    ws.isRegion = true;
+    ws.regionId = regionId;
+    if (regionLinks.has(regionId)) {
+        // The same id linking twice means the old socket is a zombie of a
+        // half-dropped link: retire it so its close handler frees nothing twice.
+        try { regionLinks.get(regionId).ws.close(); } catch (e) {}
+    }
+    regionLinks.set(regionId, { ws: ws, peers: new Map() });
+    console.log(`[HUB] region ${regionId} linked`);
+}
+
+function handleRegionControl(ws, data) {
+    const link = regionLinks.get(ws.regionId);
+    if (!link) return;
+    if (data.type === "relay_open") {
+        makePeer(ws.regionId, String(data.conn));
+        console.log(`[HUB] player ${data.conn} opened on ${ws.regionId}`);
+    } else if (data.type === "relay_msg") {
+        const peer = link.peers.get(String(data.conn));
+        if (!peer) return;
+        try {
+            handleClientMessage(peer, data.data);
+        } catch (err) {
+            console.error('[HUB] relayed message error:', err);
+        }
+    } else if (data.type === "relay_close") {
+        const peer = link.peers.get(String(data.conn));
+        if (peer) {
+            link.peers.delete(String(data.conn));
+            dropPeer(peer);
+        }
+    }
+}
+
+function dropRegionLink(ws) {
+    const link = regionLinks.get(ws.regionId);
+    if (!link) return;
+    regionLinks.delete(ws.regionId);
+    for (const peer of link.peers.values()) dropPeer(peer);
+    console.log(`[HUB] region ${ws.regionId} dropped (${link.peers.size} players released)`);
+}
+
+// ---- voice relay ------------------------------------------------------------
+// Android phones run voice over the game socket instead of the LiveKit plugin
+// (its native layer SIGSEGVs there). A voice room is just a sanitized key the
+// hub groups sockets under: every 0x56 PCM frame a member sends is relayed to
+// the other members only. Regions never see the key, they only ferry frames.
+
+const voiceGroups = new Map(); // voiceKey -> Set of member bodies (socket or peer)
+const VOICE_FRAME_MAX = 4096;
+
+// Lobby and match keys are short ids, so a whitelist is the whole sanitizer.
+function sanitizeVoiceKey(raw) {
+    return String(raw || "").replace(/[^A-Za-z0-9_\-]/g, "").slice(0, 64);
+}
+
+function leaveVoice(ws) {
+    const key = ws.voiceKey;
+    if (!key) return;
+    ws.voiceKey = "";
+    const set = voiceGroups.get(key);
+    if (set && set.delete(ws)) {
+        if (set.size === 0) voiceGroups.delete(key);
+        else sendVoiceList(key);
+    }
+}
+
+function sendVoiceList(key) {
+    const set = voiceGroups.get(key);
+    if (!set) return;
+    const uids = [];
+    for (const body of set) {
+        if (body.playerUid && body.readyState === WebSocket.OPEN) uids.push(body.playerUid);
+    }
+    const txt = JSON.stringify({ type: "voice_list", voice_key: key, uids: uids });
+    for (const body of set) body.send(txt);
+}
+
+// A player's own frame: [0x56][16-byte uid][int16 LE PCM]. The uid rides along
+// so clients can mute per player without trusting the relay's routing.
+function relayVoice(ws, frame) {
+    const set = ws.voiceKey ? voiceGroups.get(ws.voiceKey) : null;
+    if (!set) return;
+    for (const body of set) {
+        if (body === ws) continue;
+        if (body.sendBinary) body.sendBinary(frame);
+        else body.send(frame);
+    }
+}
+
+// Region -> hub voice framing: [0x59][1-byte len][connId][voice frame]. The
+// connId is variable length, hence the length byte.
+function makeVoiceRelay(connId, frame) {
+    const id = Buffer.from(String(connId), "utf8");
+    const out = Buffer.alloc(2 + id.length + frame.length);
+    out[0] = 0x59;
+    out[1] = id.length;
+    id.copy(out, 2);
+    frame.copy(out, 2 + id.length);
+    return out;
+}
+
+wss.on('connection', (ws) => {
+    console.log('[WS] New connection');
+    ws.isAlive = true;
+    ws.isRegion = false;
+    ws.regionId = "";
+    if (HUB_URL !== "") {
+        ws.connId = "c" + (++relayConnCounter);
+        connsById.set(ws.connId, ws);
+    }
+    let firstMsg = true;
+
+    ws.on('pong', () => {
+        ws.isAlive = true;
+    });
+
+    ws.on('message', (message, isBinary) => {
+        if (isBinary) {
+            // 0x59 from a linked region is a member's voice frame; 0x56 from a
+            // player socket is the member itself. Anything else is ignored.
+            if (message.length > 3 && message[0] === 0x59) {
+                if (ws.isRegion) {
+                    const link = regionLinks.get(ws.regionId);
+                    const len = message[1];
+                    if (link && 2 + len <= message.length) {
+                        const peer = link.peers.get(message.subarray(2, 2 + len).toString("utf8"));
+                        if (peer) relayVoice(peer, message.subarray(2 + len));
+                    }
+                }
+                return;
+            }
+            if (message[0] === 0x56 && message.length >= 19 && message.length <= VOICE_FRAME_MAX) {
+                if (HUB_URL !== "") {
+                    if (hubWs && hubWs.readyState === WebSocket.OPEN) {
+                        hubWs.send(makeVoiceRelay(ws.connId, message));
+                    }
+                } else {
+                    relayVoice(ws, message);
+                }
+            }
+            return;
+        }
+        let data;
+        try {
+            data = JSON.parse(message.toString());
+        } catch (err) {
+            console.error('[WS ERROR] Failed to parse message:', err);
+            return;
+        }
+        // A relay's first frame is its handshake; anything else is a player.
+        if (firstMsg) {
+            firstMsg = false;
+            if (HUB_URL === "" && data.type === "hub_register") {
+                registerRegion(ws, data);
+                return;
+            }
+        }
+        if (ws.isRegion) { handleRegionControl(ws, data); return; }
+        if (HUB_URL !== "") { relayToHub(ws, data); return; }
+        handleClientMessage(ws, data);
+    });
+
+    ws.on('close', () => {
+        if (ws.isRegion) { dropRegionLink(ws); return; }
+        if (HUB_URL !== "") {
+            connsById.delete(ws.connId);
+            if (hubWs && hubWs.readyState === WebSocket.OPEN) {
+                hubWs.send(JSON.stringify({ type: "relay_close", conn: ws.connId }));
+            }
+            return;
+        }
+        dropPeer(ws);
+    });
+
+    if (HUB_URL !== "" && hubWs && hubWs.readyState === WebSocket.OPEN) {
+        hubWs.send(JSON.stringify({ type: "relay_open", conn: ws.connId }));
+    }
+});
+
+// A player left, on a real socket or through a dropped region link: every
+// queue, team and room this body was part of hears about it exactly once.
+function dropPeer(ws) {
+    console.log('[WS] Player disconnected');
+    leaveVoice(ws);
+    if (ws.playerUid && clientsByUid.get(ws.playerUid) === ws) {
+        clientsByUid.delete(ws.playerUid);
+    }
+    removeFromAllQueues(ws);
+    leaveTeam(ws);
+    // Everyone still waiting sees their pool shrink instead of counting a
+    // closed socket toward the required body count.
+    broadcastAllPools();
+
+    if (ws.matchId && matches.has(ws.matchId)) {
+        const room = matches.get(ws.matchId);
+        const gone = room.entries.find(e => e.ws === ws);
+
+        if (room.game && room.game.phase !== "finished") {
+            // Loaded arenas are the only way a match starts, so a player who
+            // drops out beforehand releases the rest instead of freezing them.
+            if (room.game.phase === "waiting") {
+                cancelMummyWaiting(room);
+                return;
+            }
+            // Walking out of a live match is a forfeit, whatever the round was
+            // doing: the side still in the arena takes the match outright, so
+            // nobody is left fighting a ghost until the clock runs out. But a
+            // dropped phone is not necessarily a walk-out - mobile nets flap -
+            // so the entry stays seated, marked gone, for RECONNECT_GRACE_MS.
+            // The room forfeits only if the player never comes back.
+            if (gone) {
+                gone.gone = true;
+                room.players = room.players.filter(other => other !== ws);
+                const txt = JSON.stringify({
+                    type: "player_disconnected",
+                    player_uid: gone.uid,
+                    spawn_index: gone.spawnIndex
+                });
+                for (const otherWs of room.players) {
+                    if (otherWs.readyState === WebSocket.OPEN) otherWs.send(txt);
+                }
+                armGraceTimer(room);
+                return;
+            }
+        }
+
+        room.players = room.players.filter(other => other !== ws);
+        room.entries = room.entries.filter(e => e.ws !== ws);
+        const txt = JSON.stringify({
+            type: "player_disconnected",
+            player_uid: gone ? gone.uid : "",
+            spawn_index: gone ? gone.spawnIndex : -1
+        });
+        for (const otherWs of room.players) {
+            if (otherWs.readyState === WebSocket.OPEN) otherWs.send(txt);
+        }
+        // A shared room only closes once nobody is left in it.
+        if (room.players.length === 0) matches.delete(ws.matchId);
+    }
+}
+
+function spawnIndexForSeat(mode, sideIndex, seatIndex, slotSize) {
+    // Team spawn layout (Spawn 1..8 markers in Godot, 0-based indices here):
+    // 1v1: A=Spawn1, B=Spawn5
+    // 2v2: A=Spawn1,2, B=Spawn5,6
+    // 3v3: A=Spawn1,2,3, B=Spawn5,6,7
+    // 4v4: A=Spawn1,2,3,4, B=Spawn5,6,7,8
+    // Zombie Eclipse is authored/ring-mapped as 4v4 using contiguous 0..7.
+    if (mode === ZOMBIE_MODE) {
+        return sideIndex * slotSize + seatIndex;
+    }
+    const teamABase = 0; // Spawn 1
+    const teamBBase = 4; // Spawn 5
+    const base = sideIndex === 0 ? teamABase : teamBBase;
+    return base + seatIndex;
+}
+
+function makeRoom(mode, sides) {
+    // One shared room for the whole opposing set: 1v1 = 2 players, 2v2 = 4,
+    // 3v3 = 6, 4v4 = 8. Each side keeps a contiguous block of spawn indexes so
+    // teams start on opposite sides of the arena, never stacked.
+    //
+    // Last line of defence: an uneven pair of sides, a closed socket or a player
+    // already seated elsewhere never turns into a room, whatever the queue did.
+    const sizeA = sides[0] ? sides[0].members.length : 0;
+    const sizeB = sides[1] ? sides[1].members.length : 0;
+    if (sizeA === 0 || sizeB === 0 || sizeA !== sizeB) {
+        console.warn(`[MATCH REJECTED] uneven sides ${sizeA}v${sizeB} for ${mode}`);
+        return false;
+    }
+    // The infection mode is written for full squads: an 8-body room is what the
+    // rules, the counters and the arena's two team halves are all built on.
+    if (mode === ZOMBIE_MODE && sizeA !== ZOMBIE_TEAM_SIZE) {
+        console.warn(`[MATCH REJECTED] zombie rooms are ${ZOMBIE_TEAM_SIZE}v${ZOMBIE_TEAM_SIZE}, not ${sizeA}v${sizeB}`);
+        return false;
+    }
+    const seats = sides.reduce((all, g) => all.concat(g.members), []);
+    if (seats.some(m => !m.ws || m.ws.readyState !== WebSocket.OPEN)) {
+        console.warn(`[MATCH REJECTED] a socket closed before the room opened for ${mode}`);
+        return false;
+    }
+    if (new Set(seats.map(m => m.ws)).size !== seats.length) {
+        console.warn(`[MATCH REJECTED] the same player was seated twice for ${mode}`);
+        return false;
+    }
+
+    const slotSize = sizeA;
+    const usedSpawns = new Set();
+    const matchId = `match_${matchCounter++}`;
+    const entries = [];
+
+    sides.forEach((group, sideIndex) => {
+        group.members.forEach((m, i) => {
+            // The queue snapshot is a few seconds old by pairing time, while the
+            // live party roster is not — so a member who equipped a different
+            // character after the leader queued enters with the new one.
+            const team = m.ws && m.ws.teamId ? teams.get(m.ws.teamId) : null;
+            const live = team ? team.members.find(x => x.uid === m.playerUid) : null;
+            const spawnIndex = spawnIndexForSeat(mode, sideIndex, i, slotSize);
+            if (usedSpawns.has(spawnIndex)) {
+                console.warn(`[MATCH REJECTED] duplicate spawn ${spawnIndex} in ${mode}`);
+                return;
+            }
+            usedSpawns.add(spawnIndex);
+            entries.push({
+                ws: m.ws,
+                uid: m.playerUid || "",
+                username: (live && live.username) || m.username || "Player",
+                characterId: (live && live.characterId) || m.characterId || 1,
+                bundleId: live && live.bundleId !== undefined ? live.bundleId : bundleOf(m),
+                teamId: group.teamId || "",
+                side: sideIndex,
+                team: sideIndex === 0 ? "A" : "B",
+                teamName: MUMMY_TEAM_NAMES[sideIndex] || (sideIndex === 0 ? "TEAM A" : "TEAM B"),
+                spawnIndex: spawnIndex,
+                spawnId: spawnIndex + 1
+            });
+        });
+    });
+
+    if (entries.length !== seats.length || entries.length !== slotSize * 2) {
+        console.warn(`[MATCH REJECTED] seat/spawn assignment incomplete for ${mode} (${entries.length}/${slotSize * 2})`);
+        return false;
+    }
 
     const room = {
-        matchId: id,
+        players: entries.map(e => e.ws),
         mode: mode,
-        slot: slot,
-        sideSize: slot,
-        entries: entries,
-        players: players,
-        game: null,
-        graceTimer: null
+        matchId: matchId,
+        slotSize: slotSize,
+        entries: entries
     };
-    matches.set(id, room);
+    matches.set(matchId, room);
+    console.log(`[MATCH FOUND] ${entries.length} bodies in ${matchId} for ${mode} ${slotSize}v${slotSize} (${sides.map(s => s.teamId || 'solo').join(' vs ')})`);
 
-    for (const e of entries) {
-        e.ws.matchId = id;
-        e.ws.matchUid = e.uid;
-        e.ws.matchSpawnIndex = e.spawnIndex;
-        e.ws.matchSide = e.side;
-    }
-
-    // Authoritative per-client match payload (team/side/spawn IDs stay in sync).
-    for (const e of entries) {
-        const opponent = entries.find(x => x.side !== e.side) || entries[0];
-        const allies = entries.filter(x => x !== e && x.side === e.side).map(x => x.uid);
-        sendJson(e.ws, {
-            type: "found_match",
-            match_id: id,
+    for (const self of entries) {
+        const enemy = entries.find(e => e.side !== self.side) || null;
+        const payload = {
+            type: "match_found",
             mode: mode,
-            team_size: slot,
-            side_size: slot,
-            required_players: slot * 2,
-            player_id: e.uid,
-            player_uid: e.uid,
-            username: e.username,
-            character_id: e.characterId,
-            bundle_id: bundleOf(e),
-            spawn_index: e.spawnIndex,
-            spawn_id: e.spawnIndex + 1,
-            side: e.side,
-            team: e.side + 1,
-            team_name: (mode === ZOMBIE_MODE ? ZOMBIE_TEAM_NAMES[e.side] : MUMMY_TEAM_NAMES[e.side]) || "",
-            team_id: e.teamId || "",
-            ally_uids: allies,
-            opponent_id: opponent.uid,
-            opponent_uid: opponent.uid,
-            opponent_name: opponent.username,
-            opponent_character_id: opponent.characterId,
-            opponent_bundle_id: bundleOf(opponent),
-            opponent_spawn_index: opponent.spawnIndex,
-            players: entries.map(x => ({
-                id: x.uid,
-                player_uid: x.uid,
-                username: x.username,
-                character_id: x.characterId,
-                bundle_id: bundleOf(x),
-                spawn_index: x.spawnIndex,
-                spawn_id: x.spawnIndex + 1,
-                side: x.side,
-                team: x.side + 1,
-                team_name: (mode === ZOMBIE_MODE ? ZOMBIE_TEAM_NAMES[x.side] : MUMMY_TEAM_NAMES[x.side]) || ""
-            }))
-        });
+            match_id: matchId,
+            spawn_index: self.spawnIndex,
+            spawn_id: self.spawnId,
+            side: self.side,
+            team: self.team,
+            team_name: self.teamName,
+            total_players: entries.length,
+            team_size: slotSize,
+            team_id: self.teamId,
+            players: entries.map(e => ({
+                id: mummyIdOf(e),
+                player_uid: e.uid,
+                username: e.username,
+                character_id: e.characterId,
+                bundle_id: bundleOf(e),
+                spawn_index: e.spawnIndex,
+                spawn_id: e.spawnId,
+                side: e.side,
+                team: e.team,
+                team_name: e.teamName,
+                team_id: e.teamId
+            })),
+            // Kept for the arena client, which still labels the first enemy it sees.
+            opponent: enemy ? {
+                character_id: enemy.characterId,
+                username: enemy.username,
+                player_uid: enemy.uid,
+                spawn_index: enemy.spawnIndex,
+                spawn_id: enemy.spawnId,
+                side: enemy.side,
+                team: enemy.team
+            } : {}
+        };
+        self.ws.matchId = matchId;
+        self.ws.matchSpawnIndex = self.spawnIndex;
+        self.ws.matchUid = self.uid;
+        self.ws.matchSide = self.side;
+        self.ws.matchTeam = self.team;
+        sendJson(self.ws, payload);
     }
 
-    if (mode === ZOMBIE_MODE) initZombieMatch(room);
-    else initMummyMatch(room);
-    console.log(`[MATCH] ${id} started (${mode}, ${slot}v${slot}, ${entries.length} players)`);
-    return room;
+    if (mode === MUMMY_MODE) initMummyMatch(room);
+    else if (mode === ZOMBIE_MODE) initZombieMatch(room);
+    return true;
 }
 
-// A queued body is only usable while its socket is open, it is still asking for
-// this exact mode and slot, and it has not meanwhile been placed in a room.
-function queueEntryUsable(entry, mode, slot) {
-    return !!entry && !!entry.ws
-        && entry.ws.readyState === WebSocket.OPEN
-        && entry.mode === mode
-        && entry.slot === slot
-        && !(entry.ws.matchId && matches.has(entry.ws.matchId));
-}
-
-// Everyone searching one (mode, slot) is competing for the same seats, so the
-// number a waiting phone is shown counts every body already sitting in that
-// pool: the lone searchers plus the members of any party short of the slot.
-function broadcastPoolStatus(mode, slot) {
-    if (!queues[mode]) return;
-    const pool = queues[mode].filter(e => e.slot === slot);
-    const required = slot * 2;
-    let bodies = pool.filter(e => queueEntryUsable(e, mode, slot)).length;
-    for (const g of usableGroups(mode, slot)) bodies += g.members.length;
-    for (const e of pool) {
-        sendJson(e.ws, {
-            type: "player_joined",
-            mode: mode,
-            team_size: slot,
-            player_count: Math.min(bodies, required),
-            required_players: required
-        });
+// ---- One queue, both pools ----
+// A search is keyed on (mode, slot) and nothing else: a party keeps its own
+// roster and seats a whole side, and the seats it left open are filled by the
+// players who searched that exact slot alone. Nothing is invented and nothing
+// is resized - a room opens only when every side is exactly the slot the players
+// themselves picked, so a pool that cannot reach slot * 2 real bodies just keeps
+// waiting. Fewest strangers first, so two parties that are already full meet
+// each other before a single one of their seats is handed to someone off the
+// street.
+function processMatchQueue(mode) {
+    if (!queues[mode] || !teamQueues[mode]) return;
+    for (const slot of TEAM_SLOTS) {
+        dropRepeatSoloEntries(mode, slot);
+        for (let guard = 0; guard < 16; guard++) {
+            const plan = planRoom(mode, slot);
+            if (!plan) break;
+            // makeRoom re-checks every socket, seat and side size one last time;
+            // a refusal leaves the whole pool exactly as it was.
+            if (!makeRoom(mode, plan.sides)) break;
+            for (const g of plan.groups) {
+                const idx = teamQueues[mode].indexOf(g);
+                if (idx !== -1) teamQueues[mode].splice(idx, 1);
+            }
+            for (const e of plan.solos) {
+                const idx = queues[mode].indexOf(e);
+                if (idx !== -1) queues[mode].splice(idx, 1);
+            }
+        }
     }
+    broadcastAllPools();
 }
 
-function broadcastAllPools() {
-    for (const mode of Object.keys(queues)) {
-        for (const slot of TEAM_SLOTS) broadcastPoolStatus(mode, slot);
-    }
+// The same body must never hold two seats in one pool: the newest search wins.
+function dropRepeatSoloEntries(mode, slot) {
+    const seen = new Set();
+    queues[mode] = queues[mode].filter(e => {
+        if (e.slot !== slot) return true;
+        if (seen.has(e.ws)) return false;
+        seen.add(e.ws);
+        return true;
+    });
 }
 
 function usableGroups(mode, slot) {
-    return (teamQueues[mode] || []).filter(g =>
-        g && g.mode === mode && g.slot === slot &&
-        Array.isArray(g.members) && g.members.length > 0 && g.members.length <= slot &&
-        g.members.every(m => queueEntryUsable(m, mode, slot))
-    );
+    return teamQueues[mode].filter(g => g.slot === slot
+        && g.members.length <= slot
+        && g.members.every(m => queueEntryUsable(m, mode, slot)));
 }
 
+// Every way of filling one side out of whole parties, with the lone seats each
+// leaves. A slot is at most 4, so enumerating the subsets costs nothing and it
+// is the only honest way to find that a 3-party plus one searcher is a team.
 function sidePacks(groups, slot) {
-    const packs = [];
-    const n = groups.length;
-    // Enumerate every subset of groups and keep those whose total size is <= slot.
-    // A "side" is one such pack (whole parties only, never split) plus however
-    // many solo searchers are needed to reach the slot.
-    for (let mask = 1; mask < (1 << n); mask++) {
-        let seats = 0;
-        const chosen = [];
-        for (let i = 0; i < n; i++) {
-            if (!(mask & (1 << i))) continue;
-            seats += groups[i].members.length;
-            chosen.push(groups[i]);
+    const packs = [{ groups: [], openSeats: slot }];
+    for (const g of groups) {
+        const added = [];
+        for (const p of packs) {
+            const open = p.openSeats - g.members.length;
+            if (open < 0) continue;
+            added.push({ groups: p.groups.concat([g]), openSeats: open });
         }
-        if (seats > 0 && seats <= slot) {
-            packs.push({ groups: chosen, seats: seats, openSeats: slot - seats });
-        }
+        packs.push(...added);
     }
+    packs.sort((a, b) => a.openSeats - b.openSeats || b.groups.length - a.groups.length);
     return packs;
 }
 
@@ -769,17 +1197,6 @@ function planRoom(mode, slot) {
             };
         }
     }
-    // Pure-solo fallback: enough lone searchers to build both full sides.
-    if (groups.length === 0 && solos.length >= slot * 2) {
-        return {
-            sides: [
-                { teamId: "", members: solos.slice(0, slot) },
-                { teamId: "", members: solos.slice(slot, slot * 2) }
-            ],
-            groups: [],
-            solos: solos.slice(0, slot * 2)
-        };
-    }
     return null;
 }
 
@@ -796,9 +1213,9 @@ function mixSide(pack, soloSlice) {
 }
 
 function squadTargetSlot(mode, requestedSlot) {
-    // Squad matchmaking (Free Fire style): Mummy matches build 4-player squads
-    // by combining compatible parties/solos while keeping parties together.
-    if (mode === MUMMY_MODE) return 4;
+    // Match at the slot the player picked (1v1/2v2/3v3/4v4).
+    // Solo/party fillers are combined only within that same slot.
+    if (mode === MUMMY_MODE) return requestedSlot;
     return requestedSlot;
 }
 
@@ -840,25 +1257,79 @@ function queueTeam(mode, team, requestedSlot) {
     processMatchQueue(mode);
 }
 
-function processMatchQueue(mode) {
-    pruneStaleQueues();
-    for (const slot of TEAM_SLOTS) {
-        for (;;) {
-            const plan = planRoom(mode, slot);
-            if (!plan) break;
+// A queued body is only usable while its socket is open, it is still asking for
+// this exact mode and slot, and it has not meanwhile been placed in a room.
+function queueEntryUsable(entry, mode, slot) {
+    return !!entry && !!entry.ws
+        && entry.ws.readyState === WebSocket.OPEN
+        && entry.mode === mode
+        && entry.slot === slot
+        && !(entry.ws.matchId && matches.has(entry.ws.matchId));
+}
 
-            const room = makeRoom(mode, slot, plan.sides[0], plan.sides[1]);
-            if (!room) break;
-
-            // Remove every consumed solo and every consumed group from the pools.
-            const usedSolo = new Set(plan.solos.map(e => e.ws));
-            const usedGroups = new Set(plan.groups.map(g => g.teamId));
-            queues[mode] = queues[mode].filter(e => !usedSolo.has(e.ws));
-            teamQueues[mode] = teamQueues[mode].filter(g => !usedGroups.has(g.teamId));
-            broadcastPoolStatus(mode, slot);
-        }
+// Everyone searching one (mode, slot) is competing for the same seats, so the
+// number a waiting phone is shown counts every body already sitting in that
+// pool: the lone searchers plus the members of any party short of the slot.
+function broadcastPoolStatus(mode, slot) {
+    if (!queues[mode]) return;
+    const pool = queues[mode].filter(e => e.slot === slot);
+    const required = slot * 2;
+    let bodies = pool.filter(e => queueEntryUsable(e, mode, slot)).length;
+    for (const g of usableGroups(mode, slot)) bodies += g.members.length;
+    for (const e of pool) {
+        sendJson(e.ws, {
+            type: "player_joined",
+            mode: mode,
+            team_size: slot,
+            player_count: Math.min(bodies, required),
+            required_players: required
+        });
     }
 }
+
+function broadcastAllPools() {
+    for (const mode of Object.keys(queues)) {
+        for (const slot of TEAM_SLOTS) broadcastPoolStatus(mode, slot);
+    }
+}
+
+
+// ---- Mummy vs Human: server-authoritative 1v1 / 2v2 / 3v3 / 4v4 match ----
+// The clients only report proximity; every role, timer tick, knockdown, revive,
+// elimination, point and the final result is decided here so all screens agree.
+const MUMMY_MODE = "MUMMY_VS_HUMAN";
+// The two teams are the two sides of the arena. A team wins the match, not a
+// round, so the point table is indexed by side and every client draws the same
+// two names from it.
+const MUMMY_TEAM_NAMES = ["TEAM TIGER", "TEAM LION"];
+const MUMMY_WIN_POINTS = parseInt(process.env.MUMMY_WIN_POINTS, 10) || 4;
+// The knockdown bar: once downed, a Human bleeds this whole HP away over
+// MUMMY_DOWN_SECONDS and is eliminated when it empties.
+const MUMMY_HP = 400;
+const MUMMY_DAMAGE_PER_HIT = 67;  // 6 hits to defeat (6 * 67 = 402, capped at 400)
+const MUMMY_DOWN_SECONDS = parseInt(process.env.MUMMY_DOWN_SECONDS, 10) || 30;
+const MUMMY_REVIVE_SECONDS = parseInt(process.env.MUMMY_REVIVE_SECONDS, 10) || 5;
+const MUMMY_DOWN_MS = MUMMY_DOWN_SECONDS * 1000;
+const MUMMY_REVIVE_MS = MUMMY_REVIVE_SECONDS * 1000;
+// A reviver stops counting the moment its heartbeats go silent (dropped socket,
+// run away, scene quit) instead of leaving a channel frozen at 4/5 seconds.
+const MUMMY_REVIVE_HEARTBEAT_MS = 2000;
+// The gap that lets a fully-eliminated side be confirmed before the next round.
+const MUMMY_BREAK_MS = (parseInt(process.env.MUMMY_BREAK_SECONDS, 10) || 3) * 1000;
+
+// ---- Zombie Infection mode (ZOMBIE_ECLIPSE) ----
+// Strictly 4v4. Every round one player on each team wakes as a zombie; one touch
+// from a zombie turns any enemy human on the spot, and every turn is +1 on the
+// catcher's team counter. A round is exactly two minutes and the higher counter
+// takes it; the match is eight rounds and the higher round tally takes the match.
+const ZOMBIE_MODE = "ZOMBIE_ECLIPSE";
+const ZOMBIE_TEAM_SIZE = 4;
+const ZOMBIE_ROUNDS = parseInt(process.env.ZOMBIE_ROUNDS, 10) || 8;
+const ZOMBIE_ROUND_MS = (parseInt(process.env.ZOMBIE_ROUND_SECONDS, 10) || 120) * 1000;
+const ZOMBIE_BREAK_MS = (parseInt(process.env.ZOMBIE_BREAK_SECONDS, 10) || 5) * 1000;
+// Mirrors ATTACK_RANGE in zombie_match.gd: the reach a zombie actually swings.
+const ZOMBIE_ATTACK_RANGE = parseFloat(process.env.ZOMBIE_ATTACK_RANGE) || 2.6;
+const ZOMBIE_TEAM_NAMES = ["TEAM TIGER", "TEAM LION"];
 
 // ---- Human side ability: Holographic Clones ----
 // Which character owns which ability is decided here, not in the client's CATALOG,
@@ -879,116 +1350,105 @@ const CLONE_SPREAD_METRES = 0.55;
 // Both ends use these two numbers: the phone draws the body on this line, and
 // the server moves its own copy down the same line, so a swing at what a player
 // sees is a swing on the body the server is counting.
-const CLONE_WALK_SPEED = 1.25;     // metres per second, in a straight line
-const CLONE_WALK_CAP_METRES = 8.0; // never further than this from the birth spot
-// ---- Ashes Turner ability: Azure Rampart ----
-// A glowing shell that rides with the caster and turns a fixed number of Mummy
-// swings into a draw. Unlike the decoy the wall does not take the catcher's
-// place: it simply drinks the blow, so the player inside it can still be
-// surrounded but cannot be cut down while the count holds.
-const SHIELD_LIFETIME_MS = 15000;
-const SHIELD_RADIUS = 1.15;        // horizontal reach of the shell, body inclusive
-const SHIELD_HEIGHT = 2.4;         // tall enough to read as a dome over the body
-const SHIELD_DESTROY_AT = 5;       // gone on the fifth clean Mummy swing
-// ---- Shadow Ranger ability: soul shield ----
-// A blue extra HP bar laid over the normal one. A Mummy has to spend this bar
-// before any swing can touch the body HP underneath, and the armour dissolves on
-// its own after 20 seconds even if it was never fully spent.
-const HP_SHIELD_LIFETIME_MS = 20000;
-const HP_SHIELD_AMOUNT = 50;
-// A sheet of glass still lets a body swap places with the person inside it.
-// Only the two solid shells - Azure Rampart and the 50-HP soul shield - count
-// as a wall nobody walks through.
-function shieldBlocksPassage(g, playerId) {
-    return !!(g.shields && g.shields[playerId]) || hpShieldActive(g.combat[playerId]);
-}
-// ---- Ashes Turner ability: Crimson Benediction ----
-// A red cloud under the caster's feet that tops their whole team back up over 10
-// seconds. The caster heals anywhere inside it; a teammate only while standing in
-// the same cloud, so the radius is the radius the healer owns.
-const AURA_LIFETIME_MS = 10000;
-const AURA_COOLDOWN_MS = 120000;   // 2 minutes, separate from the other 70s abilities
-const AURA_RADIUS = 2.5;           // how far the heal reaches from the caster
-const AURA_HEAL_TOTAL = 100;       // spread across the full 10s, for any Human in range
+const CLONE_WALK_SPEED = 5.0;      // metres per second, straight ahead (a player walks at 5.5)
+const CLONE_WALK_LIMIT = 20.0;     // metres from where the clone appeared
+// A hologram can only be knocked once this often, however many reports arrive. A
+// Mummy standing in a crowd of four Humans used to be able to spend a whole swing
+// on one clone per target it reached.
+const CLONE_HIT_GAP_MS = 300;
+// The green aura also patches its caster up: HP is server-owned, so the trickle is
+// counted here over the same 10 seconds the client draws the aura for. 120 of the
+// 400 HP bar is roughly two swings' worth, slow enough to read as a heal.
+const AURA_HEAL_MS = 10000;
+const AURA_HEAL_TOTAL = 120;
+// Mirrors aura_radius in green_aura.gd: a teammate standing inside the drawn
+// circle gains the same HP trickle (HP only - the speed buff stays on the caster).
+const AURA_RADIUS = 4.0;
 
-function abilityFor(entry) {
-    return CHARACTER_ABILITIES[entry.characterId] || "";
-}
+// ---- Character 4: the green shield ----
+// The dome is planted at the point it was cast and never follows its caster. Only the
+// caster's own side may stand inside it; anybody else is held on the shell by the
+// client, and a swing at a teammate who is inside spends itself on the dome.
+// Keep SHIELD_RADIUS in step with `radius` in character4_ability.gd.
+const SHIELD_LIFETIME_MS = 15000;
+const SHIELD_RADIUS = 3.5;
+const SHIELD_CRACK_AT = 8;      // first split opens
+const SHIELD_BREAK_AT = 12;     // and the wider one
+const SHIELD_DESTROY_AT = 18;   // the dome gives out
+// One swing lands on one shell, however many bodies it reached: a catcher standing
+// in a crowd of four used to be able to spend a single press on four hits.
+const SHIELD_HIT_GAP_MS = 300;
+
+// ---- Character 5: Shadow Ranger personal shield ----
+// Extra HP layered over the normal bar. Damage spends this first; whatever is
+// left after 20 seconds disappears. The green body shell is drawn by every client.
+const HP_SHIELD_AMOUNT = 100;
+const HP_SHIELD_LIFETIME_MS = 20000;
+const HP_SHIELD_COOLDOWN_MS = 80000;
 
 function abilityCooldownMs(kind) {
-    // Benediction is a 2-minute prayer; the decoy and the rampart keep 70s.
-    return kind === "aura" ? AURA_COOLDOWN_MS : ABILITY_COOLDOWN_MS;
+    return kind === "hp_shield" ? HP_SHIELD_COOLDOWN_MS : ABILITY_COOLDOWN_MS;
+}
+
+// 1v1 runs three minutes, every team size runs five.
+function mummyRoundMs(sideSize) {
+    const forced = parseInt(process.env.MUMMY_ROUND_SECONDS, 10) || 0;
+    if (forced > 0) return forced * 1000;
+    const fromEnv = parseInt(sideSize <= 1 ? process.env.MUMMY_SOLO_ROUND_SECONDS : process.env.MUMMY_TEAM_ROUND_SECONDS, 10) || 0;
+    return (fromEnv > 0 ? fromEnv : sideSize <= 1 ? 180 : 300) * 1000;
+}
+
+// Rooms are keyed on the profile UID, but a player whose profile has not bound
+// yet still occupies exactly one slot, so the spawn index doubles as identity.
+function mummyIdOf(entry) {
+    return entry.uid !== "" ? String(entry.uid) : `slot_${entry.spawnIndex}`;
 }
 
 function initMummyMatch(room) {
-    // The roles are decided per round, not per match, because a Mummy can only
-    // ever score by knocking a Human out and a Human only by lasting the clock.
-    // Whoever hunts first is a coin flip, and the teams swap every round after,
-    // so the same side never chases twice in a row. The match ends the moment a
-    // team reaches five.
+    const sideSize = room.entries.filter(e => e.side === 0).length;
     room.game = {
-        kind: "mummy",             // the ticker ignores a room that is not this kind
-        phase: "waiting",          // waiting -> playing -> round_break -> ... -> finished
+        phase: "waiting",          // waiting -> playing -> round_break -> playing ... -> finished
         ready: new Set(),
         round: 0,
-        sideSize: room.entries.filter(e => e.side === 0).length,
-        roundMs: 30000,
-        sideScore: [0, 0],         // points per arena side (0 = Team A, 1 = Team B)
-        hunterSide: 0,             // which side is the Mummy this round
-        roles: {},                 // id -> "mummy" | "human", redrawn each round
-        swingSeq: {},              // attacker id -> swings so far, so the punch clips alternate
-        combat: {},                // id -> { hp, downed, eliminated, downedSince, reviveMs, reviveAt, revivers }
-        abilities: {},             // caster id -> { cooldownUntil }
-        nextCloneNum: 1,           // hands every hologram a unique, never-reused id
-        clones: {},                // cloneId -> { casterId, x, z, yaw, hits, expiresAt }
-        shields: {},               // caster id -> { hits, expiresAt } while a dome stands
-        settled: false,
-        roundOutcome: "",          // "mummy" | "human" once the round is decided
-        winnerSide: -1,
+        sideSize: sideSize,
+        roundMs: mummyRoundMs(sideSize),
+        // One score per team, indexed by side: 0 = TEAM TIGER, 1 = TEAM LION.
+        sideScore: [0, 0],
+        hunterSide: 0,             // the team hunting this round; it flips every round
+        winnerSide: -1,            // -1 while the match is still live
+        roles: {},                 // id -> "mummy" | "human"
+        combat: {},                // id -> { hp, downed, downedSince, eliminated, scored, reviveMs, revivers }
+        settled: false,            // one result per round, however it ends
+        roundOutcome: "",
+        abilities: {},             // id -> { cooldownUntil } for the equipped character's ability
+        swingSeq: {},              // mummy id -> swings so far, so sword/jab alternate on every screen
+        clones: {},                // clone id -> { owner, x, y, z, hits, expiresAt }
+        cloneSeq: 0,
+        shields: {},               // owner id -> { hits, x, y, z, expiresAt, lastHitAt }
         endsAt: 0
     };
+    resetMummyCombat(room);
+    resetMummyAbilities(room);
     broadcastMummyState(room, true);
 }
 
-// Every Human on the board, whether they are standing, downed or already out.
-// A Human is a role, not a health state, so a bleed-out never stops counting.
-function mummyHumanIds(room) {
-    const g = room.game;
-    return room.entries
-        .map(e => mummyIdOf(e))
-        .filter(id => g.roles[id] === "human");
-}
-
-function mummyIdOf(entry) {
-    // A stable id per seat: prefer the authenticated uid, fall back to spawn.
-    const uid = uidKey(entry && entry.uid);
-    if (uid) return uid;
-    return "spawn:" + String(entry && entry.spawnIndex >= 0 ? entry.spawnIndex : "?");
-}
-
-const MUMMY_HP = 100;
-const MUMMY_DAMAGE_PER_HIT = 34;
-const MUMMY_DOWN_MS = 20000;       // how long a downed Human bleeds before they are out
-const MUMMY_DOWN_SECONDS = 20;
-const MUMMY_REVIVE_MS = 5000;      // held near a downed teammate to pull them back up
-const MUMMY_REVIVE_SECONDS = 5;
-const MUMMY_REVIVE_HEARTBEAT_MS = 600;
-const MUMMY_WIN_POINTS = 5;
-const MUMMY_TEAM_NAMES = ["TEAM A", "TEAM B"];
-const MUMMY_BREAK_MS = 4000;       // breather between rounds, long enough to read the board
-const RECONNECT_GRACE_MS = 12000;  // a dropped phone has this long to reclaim its seat
-
+// A fresh round, and the 1v1 respawn, both start from this same table: nobody
+// carries bleed-out or revive progress across a round boundary.
 function resetMummyCombat(room) {
     const g = room.game;
     g.combat = {};
     for (const e of room.entries) {
         g.combat[mummyIdOf(e)] = {
             hp: MUMMY_HP,
-            shield: 0,           // the blue over-HP bar the Shadow Ranger raises
-            shieldUntil: 0,      // wall-clock time that bar dissolves on its own
+            shield: 0,
+            shieldUntil: 0,
             downed: false,
-            eliminated: false,
             downedSince: 0,
+            eliminated: false,
+            // One player can only ever be paid out once per round, however many
+            // times the bleed-out tick, a duplicate report or a reconnect lands
+            // on the same elimination.
+            scored: false,
             reviveMs: 0,
             reviveAt: 0,
             revivers: {}
@@ -996,40 +1456,446 @@ function resetMummyCombat(room) {
     }
 }
 
+// A fresh round also clears every clone and restarts every cooldown, so nobody
+// carries a distraction or a locked button across a round boundary.
 function resetMummyAbilities(room) {
     const g = room.game;
-    for (const e of room.entries) {
-        const id = mummyIdOf(e);
-        if (!g.abilities[id]) g.abilities[id] = { cooldownUntil: 0, healAt: 0, healUntil: 0 };
-        g.abilities[id].healAt = 0;
-        g.abilities[id].healUntil = 0;
-    }
-    g.nextCloneNum = 1;
+    g.abilities = {};
     g.clones = {};
+    g.cloneSeq = 0;
     g.shields = {};
+    for (const e of room.entries) {
+        g.abilities[mummyIdOf(e)] = { cooldownUntil: 0, healUntil: 0, healAt: 0 };
+    }
+}
+
+function abilityFor(entry) {
+    return CHARACTER_ABILITIES[String(entry.characterId)] || "none";
+}
+
+// Ground distance only - the arena is played on one floor and a jump should not
+// put a body out of reach.
+function flatDistance(a, b) {
+    if (!a || !b) return Infinity;
+    const dx = Number(a.x) - Number(b.x);
+    const dz = Number(a.z) - Number(b.z);
+    return Math.sqrt(dx * dx + dz * dz);
+}
+
+// Player bodies are circles on that same floor plane, and these are the exact
+// radii the arena client draws with (mummy_match.gd). Resolving the positions the
+// room relays against them means no phone ever receives two bodies standing in
+// each other, which is what keeps the client-side push from having to fight.
+const PLAYER_RADIUS_HUMAN = 0.35;
+const PLAYER_RADIUS_MUMMY = 0.42;
+const PLAYER_COLLISION_SKIN = 0.02;
+
+function playerRadius(room, entry) {
+    const g = room.game;
+    return (g && g.roles && g.roles[mummyIdOf(entry)] === "mummy")
+        ? PLAYER_RADIUS_MUMMY : PLAYER_RADIUS_HUMAN;
+}
+
+// A body that is out of the round stops being reported, so its last position is a
+// statue. Treating it as solid would hide an invisible wall where a corpse lies.
+function collidesInRoom(room, entry) {
+    const g = room.game;
+    const c = g && g.combat ? g.combat[mummyIdOf(entry)] : null;
+    return !(c && c.eliminated);
+}
+
+// Slide a reported position out of every other live body in the room. The mover
+// yields: it is the only body whose owner can still correct for the move, and the
+// others have already been resolved the same way on their own report.
+function separateFromRoom(room, mover, x, z) {
+    for (const other of room.entries) {
+        if (other === mover || !other.pos || !collidesInRoom(room, other)) continue;
+        const need = playerRadius(room, mover) + playerRadius(room, other) + PLAYER_COLLISION_SKIN;
+        let dx = x - other.pos.x;
+        let dz = z - other.pos.z;
+        const d = Math.sqrt(dx * dx + dz * dz);
+        if (d >= need) continue;
+        if (d < 0.0001) {
+            // Dead centre has no direction of its own: step out along +x rather
+            // than leaving the two bodies stacked on one metre.
+            x += need;
+            continue;
+        }
+        const scale = (need - d) / d;
+        x += dx * scale;
+        z += dz * scale;
+    }
+    return { x, z };
+}
+
+function clonePayload(g, now) {
+    return Object.keys(g.clones).map(id => {
+        const c = g.clones[id];
+        return {
+            id: id,
+            owner: c.owner,
+            x: c.x,
+            y: c.y,
+            z: c.z,
+            yaw: c.yaw,
+            hits: c.hits,
+            seconds_left: Math.max(0, Math.ceil((c.expiresAt - now) / 1000))
+        };
+    });
+}
+
+function destroyMummyClones(room, ids) {
+    const g = room.game;
+    const live = ids.filter(id => !!g.clones[id]);
+    if (live.length === 0) return false;
+    for (const id of live) delete g.clones[id];
+    for (const e of room.entries) {
+        sendJson(e.ws, { type: "clone_destroy", match_id: room.matchId, clone_ids: live });
+    }
+    return true;
+}
+
+// A clone belongs to a live Human. Whatever takes that player out - the clock, a
+// knockdown, a dropped socket - takes their holograms with it, so the arena never
+// keeps a distraction that nobody can still be defending.
+function tickMummyClones(room, now) {
+    const g = room.game;
+    const dead = [];
+    for (const id of Object.keys(g.clones)) {
+        const c = g.clones[id];
+        const state = g.combat[c.owner];
+        const stillHere = room.entries.some(e => mummyIdOf(e) === c.owner);
+        if (c.expiresAt <= now || !stillHere || !state || state.downed || state.eliminated || g.roles[c.owner] !== "human") {
+            dead.push(id);
+            continue;
+        }
+        // Straight ahead, on the heading the clone was placed with - the phone
+        // draws the same step, so the two stay on one line.
+        const dt = Math.min(0.5, Math.max(0, (now - c.movedAt) / 1000));
+        c.movedAt = now;
+        const step = Math.min(CLONE_WALK_SPEED * dt, CLONE_WALK_LIMIT - c.walked);
+        if (step > 0) {
+            // +Z is the way the model faces at yaw 0, so this walks it forwards.
+            c.x += Math.sin(c.yaw) * step;
+            c.z += Math.cos(c.yaw) * step;
+            c.walked += step;
+        }
+    }
+    return destroyMummyClones(room, dead);
+}
+
+function activateMummyAbility(room, entry, now) {
+    const g = room.game;
+    const self = mummyIdOf(entry);
+    const kind = abilityFor(entry);
+    if (kind === "none") return "none";
+    const mine = g.abilities[self] || (g.abilities[self] = { cooldownUntil: 0 });
+    if (mine.cooldownUntil > now) return "cooldown";
+
+    if (kind === "hp_shield") {
+        const state = g.combat[self];
+        if (!state || state.downed || state.eliminated) return "none";
+        state.shield = HP_SHIELD_AMOUNT;
+        state.shieldUntil = now + HP_SHIELD_LIFETIME_MS;
+        mine.cooldownUntil = now + HP_SHIELD_COOLDOWN_MS;
+        for (const e of room.entries) {
+            sendJson(e.ws, {
+                type: "ability_spawn",
+                match_id: room.matchId,
+                player_id: self,
+                ability_type: "hp_shield",
+                shield_hp: HP_SHIELD_AMOUNT,
+                duration_ms: HP_SHIELD_LIFETIME_MS
+            });
+        }
+        broadcastMummyState(room, true);
+        console.log(`[MUMMY] ${self} raised a ${HP_SHIELD_AMOUNT} HP shadow shield in ${room.matchId}`);
+        return "";
+    }
+
+    // The green aura is a burst on the spot: no body to track, no countdown beyond
+    // the cooldown. Everyone is told where it bloomed so the phones agree.
+    if (kind === "aura") {
+        const at = entry.pos || { x: 0, y: 0, z: 0, yaw: 0 };
+        mine.cooldownUntil = now + ABILITY_COOLDOWN_MS;
+        // The caster's HP is healed from the server's clock for the aura's whole
+        // window, so every screen sees the same green climb instead of each phone
+        // inventing its own.
+        mine.healUntil = now + AURA_HEAL_MS;
+        mine.healAt = now;
+        for (const e of room.entries) {
+            sendJson(e.ws, {
+                type: "ability_spawn",
+                match_id: room.matchId,
+                player_id: self,
+                ability_type: "aura",
+                x: Number(at.x),
+                y: Number(at.y),
+                z: Number(at.z),
+                yaw: Number(at.yaw) || 0
+            });
+        }
+        console.log(`[MUMMY] ${self} burst a green aura in ${room.matchId}`);
+        return "";
+    }
+
+    // The green dome is planted where it was cast and stays there: the centre is
+    // stored once, at activation, so a caster who runs off leaves the shell behind
+    // for the rest of its 15 seconds.
+    if (kind === "shield") {
+        const at = entry.pos || { x: 0, y: 0, z: 0, yaw: 0 };
+        g.shields[self] = {
+            hits: 0,
+            lastHitAt: 0,
+            expiresAt: now + SHIELD_LIFETIME_MS,
+            x: Number(at.x) || 0,
+            y: Number(at.y) || 0,
+            z: Number(at.z) || 0
+        };
+        mine.cooldownUntil = now + ABILITY_COOLDOWN_MS;
+        for (const e of room.entries) {
+            sendJson(e.ws, {
+                type: "ability_spawn",
+                match_id: room.matchId,
+                player_id: self,
+                ability_type: "shield",
+                x: Number(at.x),
+                y: Number(at.y),
+                z: Number(at.z),
+                yaw: Number(at.yaw) || 0,
+                radius: SHIELD_RADIUS,
+                duration_ms: SHIELD_LIFETIME_MS,
+                destroy_at: SHIELD_DESTROY_AT
+            });
+        }
+        console.log(`[MUMMY] ${self} raised a green shield in ${room.matchId}`);
+        return "";
+    }
+
+    // The holograms step out in front of the body that cast them, turned the way
+    // that body is already facing, so a clone leads the caster instead of standing
+    // at their shoulder - and it never appears behind a player who has just spun
+    // around to run. The roster's models face +Z at yaw 0 (the player controller
+    // aims them with atan2(dx, dz), and the phone reports that same model yaw), so
+    // "ahead" is +Z here - the opposite sign would put the pair behind the caster.
+    const at = entry.pos || { x: 0, y: 0, z: 0, yaw: 0 };
+    const yaw = Number(at.yaw) || 0;
+    const forward = { x: Math.sin(yaw), z: Math.cos(yaw) };
+    const right = { x: Math.cos(yaw), z: -Math.sin(yaw) };
+    const created = [];
+    for (let i = 0; i < CLONE_COUNT; i++) {
+        const side = i === 0 ? 1 : -1;
+        const id = `${self}#${g.cloneSeq++}`;
+        const clone = {
+            owner: self,
+            x: Number(at.x) + forward.x * CLONE_FRONT_METRES + right.x * CLONE_SPREAD_METRES * side,
+            y: Number(at.y),
+            z: Number(at.z) + forward.z * CLONE_FRONT_METRES + right.z * CLONE_SPREAD_METRES * side,
+            yaw: yaw,
+            hits: 0,
+            lastHitAt: 0,
+            walked: 0,
+            movedAt: now,
+            expiresAt: now + CLONE_LIFETIME_MS
+        };
+        g.clones[id] = clone;
+        created.push({ id: id, owner: self, x: clone.x, y: clone.y, z: clone.z, yaw: yaw });
+    }
+    mine.cooldownUntil = now + ABILITY_COOLDOWN_MS;
+    for (const e of room.entries) {
+        sendJson(e.ws, {
+            type: "ability_spawn",
+            match_id: room.matchId,
+            player_id: self,
+            ability_type: "clone",
+            clones: created
+        });
+    }
+    console.log(`[MUMMY] ${self} spawned ${created.length} clones in ${room.matchId}`);
+    return "";
+}
+
+// One swing landed on one hologram. The catcher reports it the same way it
+// reports a hit on a body, and the server owns the count to three. A clone can
+// only be knocked once every CLONE_HIT_GAP_MS, however many reports arrive, so a
+// catcher swinging through a crowd cannot spend one swing on every body it
+// reaches.
+function landCloneHit(room, cloneId, now) {
+    const g = room.game;
+    const clone = g.clones[cloneId];
+    if (!clone) return false;
+    if (now - (clone.lastHitAt || 0) < CLONE_HIT_GAP_MS) return false;
+    clone.lastHitAt = now;
+    clone.hits += 1;
+    for (const e of room.entries) {
+        sendJson(e.ws, {
+            type: "clone_hit",
+            match_id: room.matchId,
+            clone_id: cloneId,
+            hits: clone.hits,
+            hits_left: Math.max(0, CLONE_MAX_HITS - clone.hits)
+        });
+    }
+    if (clone.hits >= CLONE_MAX_HITS) destroyMummyClones(room, [cloneId]);
+    return true;
+}
+
+// The closest hologram within reach, and only if it really is closer than the
+// Human the swing was aimed at - that gap is the entire distraction.
+function cloneAbsorbing(room, fromPos, humanPos) {
+    const g = room.game;
+    const humanDistance = flatDistance(fromPos, humanPos);
+    let bestId = "";
+    let bestDistance = humanDistance;
+    for (const id of Object.keys(g.clones)) {
+        const d = flatDistance(fromPos, g.clones[id]);
+        if (d <= MUMMY_ATTACK_RANGE && d < bestDistance) {
+            bestDistance = d;
+            bestId = id;
+        }
+    }
+    return bestId;
+}
+
+// ---- Character 4: the green shield ----
+// One dome per caster, keyed by that caster, and it does not move: the centre was
+// recorded when the cast went off, so the shell stays where it was raised even if
+// the caster runs away from it.
+function shieldCenter(room, ownerId) {
+    const s = room.game.shields[ownerId];
+    return s ? { x: s.x, y: s.y, z: s.z } : null;
+}
+
+function shieldStage(hits) {
+    if (hits >= SHIELD_DESTROY_AT) return 3;
+    if (hits >= SHIELD_BREAK_AT) return 2;
+    if (hits >= SHIELD_CRACK_AT) return 1;
+    return 0;
+}
+
+function shieldPayload(room, now) {
+    const g = room.game;
+    return Object.keys(g.shields).map(owner => {
+        const s = g.shields[owner];
+        return {
+            owner: owner,
+            hits: s.hits,
+            stage: shieldStage(s.hits),
+            seconds_left: Math.max(0, Math.ceil((s.expiresAt - now) / 1000)),
+            x: s.x,
+            y: s.y,
+            z: s.z
+        };
+    });
+}
+
+function destroyMummyShields(room, owners) {
+    const g = room.game;
+    const live = owners.filter(o => !!g.shields[o]);
+    if (live.length === 0) return false;
+    for (const owner of live) {
+        delete g.shields[owner];
+        for (const e of room.entries) {
+            sendJson(e.ws, { type: "shield_destroy", match_id: room.matchId, owner_id: owner });
+        }
+    }
+    return true;
+}
+
+// A dome belongs to its caster's team while that caster is still standing in the
+// round. Whatever takes the caster out - the clock, a knockdown, a dropped socket -
+// takes the dome with it, exactly as it takes a Human's holograms.
+function tickMummyShields(room, now) {
+    const g = room.game;
+    const dead = [];
+    for (const owner of Object.keys(g.shields)) {
+        const s = g.shields[owner];
+        const state = g.combat[owner];
+        const stillHere = room.entries.some(e => mummyIdOf(e) === owner);
+        if (s.expiresAt <= now || !stillHere || !state
+            || state.downed || state.eliminated || g.roles[owner] !== "human") {
+            dead.push(owner);
+        }
+    }
+    return destroyMummyShields(room, dead);
+}
+
+// The blue body shield lasts exactly 20 seconds, and the server's clock is what
+// ends it so every phone drops the effect on the same tick.
+function tickMummyHpShields(room, now) {
+    const g = room.game;
+    let changed = false;
+    for (const id of Object.keys(g.combat)) {
+        const c = g.combat[id];
+        if (!c) continue;
+        if ((c.shield || 0) > 0 && c.shieldUntil > 0 && c.shieldUntil <= now) {
+            c.shield = 0;
+            c.shieldUntil = 0;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// The dome that covers `targetId`: it has to be the target's own team's shield, and
+// the target has to be inside its footprint. A catcher standing inside a dome is
+// not protected by it - the shell only ever guards the team that raised it.
+function shieldCovering(room, targetId) {
+    const g = room.game;
+    const target = room.entries.find(e => mummyIdOf(e) === targetId);
+    if (!target || !target.pos) return "";
+    for (const owner of Object.keys(g.shields)) {
+        const holder = room.entries.find(e => mummyIdOf(e) === owner);
+        if (!holder || holder.side !== target.side) continue;
+        const centre = shieldCenter(room, owner);
+        if (!centre) continue;
+        if (flatDistance(centre, target.pos) <= SHIELD_RADIUS) return owner;
+    }
+    return "";
+}
+
+// One swing landed on one shell. The count is the server's, and the stage it reports
+// is the only thing the cracks are drawn from, so all eight phones crack in step.
+function landShieldHit(room, ownerId, now) {
+    const g = room.game;
+    const s = g.shields[ownerId];
+    if (!s) return false;
+    if (now - (s.lastHitAt || 0) < SHIELD_HIT_GAP_MS) return false;
+    s.lastHitAt = now;
+    s.hits += 1;
+    for (const e of room.entries) {
+        sendJson(e.ws, {
+            type: "shield_hit",
+            match_id: room.matchId,
+            owner_id: ownerId,
+            hits: s.hits,
+            stage: shieldStage(s.hits),
+            hits_left: Math.max(0, SHIELD_DESTROY_AT - s.hits)
+        });
+    }
+    if (s.hits >= SHIELD_DESTROY_AT) destroyMummyShields(room, [ownerId]);
+    return true;
+}
+
+// ---- Knockdown state, all of it decided here ----
+function mummyHumanIds(room) {
+    const g = room.game;
+    return room.entries.map(mummyIdOf).filter(id => g.roles[id] === "human");
 }
 
 function mummyAlive(room, id) {
     const c = room.game.combat[id];
-    return !!c && !c.downed && !c.eliminated;
+    return !!c && !c.eliminated;
 }
 
-// A player the Mummy can meaningfully swing at: still on their feet and not a
-// hologram (clones are hit through the clone_hit path, never this one).
-function mummyTargetable(room, id) {
-    return room.game.roles[id] === "human" && mummyAlive(room, id);
-}
-
+// A downed Human is still in the round: the 30-second knockdown HP has to empty
+// before the elimination is real, and a teammate can still channel a revive.
 function downMummyPlayer(room, id) {
     const c = room.game.combat[id];
     if (!c || c.downed || c.eliminated) return false;
-    // A body that drops loses the armour it was wearing with it.
-    c.shield = 0;
-    c.shieldUntil = 0;
-    c.hp = 0;
     c.downed = true;
-    c.eliminated = false;
     c.downedSince = Date.now();
+    c.hp = MUMMY_HP;
     c.reviveMs = 0;
     c.reviveAt = 0;
     c.revivers = {};
@@ -1038,10 +1904,11 @@ function downMummyPlayer(room, id) {
 
 function reviveMummyPlayer(room, id) {
     const c = room.game.combat[id];
-    if (!c || !c.downed || c.eliminated) return false;
-    c.hp = MUMMY_HP;
+    if (!c || !c.downed) return false;
     c.downed = false;
     c.downedSince = 0;
+    // A revived player stands back up at half health, not a fresh full bar.
+    c.hp = Math.floor(MUMMY_HP / 2);
     c.reviveMs = 0;
     c.reviveAt = 0;
     c.revivers = {};
@@ -1051,454 +1918,77 @@ function reviveMummyPlayer(room, id) {
 function eliminateMummyPlayer(room, id) {
     const c = room.game.combat[id];
     if (!c || c.eliminated) return false;
-    c.shield = 0;
-    c.shieldUntil = 0;
-    c.hp = 0;
     c.downed = false;
+    c.downedSince = 0;
     c.eliminated = true;
+    c.hp = 0;
     c.reviveMs = 0;
     c.reviveAt = 0;
     c.revivers = {};
-    // The Human is out, so the point lands on the other side right here and the
-    // board updates the same tick they fall - there is no separate "round won"
-    // award, because a point is an elimination, counted once.
-    const side = (room.entries.find(e => mummyIdOf(e) === id) || {}).side;
-    if (side === 0 || side === 1) awardMummyPoint(room, 1 - side);
+    // The elimination is the point: whoever went out hands a point to the team on
+    // the other side of the arena, which is the team that put them there.
+    awardMummyPoint(room, id);
     return true;
 }
 
-function awardMummyPoint(room, winningSide) {
+// ---- Points, and only ever one per elimination ----
+// A team is a side, so the hunting side and the hunted side are always opposed:
+// a point can never be paid to the eliminated player's own team, and a point can
+// never be paid twice for the same body.
+function awardMummyPoint(room, victimId) {
     const g = room.game;
-    if (g.phase === "finished" || winningSide < 0 || winningSide > 1) return;
-    g.sideScore[winningSide] = (g.sideScore[winningSide] || 0) + 1;
-    // A side that has banked five has won the match. This is the only place the
-    // match can end, so it does not matter whether the fifth came mid-round, on
-    // the final bleed-out, or at the bell - it is always decided here.
-    if (g.sideScore[winningSide] >= MUMMY_WIN_POINTS) {
-        endMummyMatch(room, winningSide);
-    }
-}
+    // Only a live round pays. A drop-out during the countdown between rounds is
+    // still an exit from that round, but it must not buy a point nobody fought for.
+    if (!g || g.phase !== "playing") return false;
 
-// Flat ground distance: XZ only, because the catcher's reach is measured along
-// the floor and a jump must not buy or lose a hit.
-function flatDistance(a, b) {
-    const dx = (Number(a && a.x) || 0) - (Number(b && b.x) || 0);
-    const dz = (Number(a && a.z) || 0) - (Number(b && b.z) || 0);
-    return Math.sqrt(dx * dx + dz * dz);
-}
+    const c = g.combat[victimId];
+    if (c && c.scored) return false;
 
-// A body is "inside" a dome only while it stands within the shell's ring on the
-// ground; the Mummy can never be under a Human's dome, so the cover belongs to
-// the caster's own side and to nobody else.
-function shieldCovers(room, ownerId, targetId) {
-    if (ownerId === targetId) return false;
-    const g = room.game;
-    if (!g.shields[ownerId]) return false;
-    const owner = room.entries.find(e => mummyIdOf(e) === ownerId);
-    const target = room.entries.find(e => mummyIdOf(e) === targetId);
-    if (!owner || !target) return false;
-    // Same side only - a catcher standing on the spot still hits the body.
-    if (owner.side !== target.side) return false;
-    const centre = shieldCenter(room, ownerId);
-    return !!centre && flatDistance(target.pos, centre) <= SHIELD_RADIUS;
-}
+    const entry = room.entries.find(e => mummyIdOf(e) === victimId);
+    if (!entry) return false;
 
-// The first living dome that is actually over this Human right now, or "" when
-// no teammate is shielding them. One swing is one hit on one shell, so the
-// server picks a single guard rather than letting a stack drink several blows.
-function shieldCovering(room, targetId) {
-    const g = room.game;
-    if (!g.shields) return "";
-    for (const ownerId of Object.keys(g.shields)) {
-        if (shieldCovers(room, ownerId, targetId)) return ownerId;
-    }
-    return "";
-}
+    if (c) c.scored = true;
+    const scorer = 1 - entry.side;
+    g.sideScore[scorer] += 1;
+    console.log(`[MUMMY] ${MUMMY_TEAM_NAMES[scorer]} +1 (${victimId} out) -> TIGER ${g.sideScore[0]} - LION ${g.sideScore[1]}`);
 
-function hpShieldActive(c) {
-    return !!c && (c.shield || 0) > 0 && (c.shieldUntil || 0) > Date.now();
-}
-
-// A 20-second blue bar over the Human's own HP. It spends before the body does
-// and falls off the moment the clock runs out, never carrying into the next round.
-function activateHpShield(room, casterId, now) {
-    const g = room.game;
-    const c = g.combat[casterId];
-    if (!c || c.downed || c.eliminated) return null;
-    c.shield = HP_SHIELD_AMOUNT;
-    c.shieldUntil = now + HP_SHIELD_LIFETIME_MS;
-    g.abilities[casterId].cooldownUntil = now + ABILITY_COOLDOWN_MS;
-    console.log(`[ABILITY] ${casterId} raised a ${HP_SHIELD_AMOUNT} HP shield in ${room.matchId}`);
-    return casterId;
-}
-
-function tickMummyHpShields(room, now) {
-    const g = room.game;
-    let changed = false;
-    for (const id of Object.keys(g.combat)) {
-        const c = g.combat[id];
-        if ((c.shield || 0) > 0 && c.shieldUntil > 0 && now >= c.shieldUntil) {
-            c.shield = 0;
-            c.shieldUntil = 0;
-            console.log(`[ABILITY] ${id}'s shadow shield expired in ${room.matchId}`);
-            changed = true;
-        }
-    }
-    if (changed) broadcastMummyState(room, true);
-}
-
-// A clone that stood between the Mummy's swing and the Human it was aimed at,
-// close enough to the line from the catcher to that body to count as "in the
-// way". Ties go to the nearest decoy to the catcher, so a wall of two fakes
-// still burns one at a time.
-function cloneAbsorbing(room, attackerPos, targetPos) {
-    const g = room.game;
-    if (!g.clones || !targetPos) return "";
-    const ax = Number(attackerPos && attackerPos.x) || 0;
-    const az = Number(attackerPos && attackerPos.z) || 0;
-    const tx = Number(targetPos.x) || 0;
-    const tz = Number(targetPos.z) || 0;
-    const vx = tx - ax;
-    const vz = tz - az;
-    const len2 = vx * vx + vz * vz;
-    if (len2 < 0.0001) return "";
-
-    let bestId = "";
-    let bestDist = Infinity;
-    for (const [id, clone] of Object.entries(g.clones)) {
-        const cx = Number(clone.x) || 0;
-        const cz = Number(clone.z) || 0;
-        // Project the decoy onto the attacker->target line and keep only the
-        // part that actually lies between them, not behind either body.
-        let t = ((cx - ax) * vx + (cz - az) * vz) / len2;
-        if (t < 0) t = 0;
-        else if (t > 1) t = 1;
-        const nx = ax + vx * t;
-        const nz = az + vz * t;
-        const off = Math.sqrt((cx - nx) * (cx - nx) + (cz - nz) * (cz - nz));
-        if (off > 1.0) continue;
-        const d = Math.sqrt((cx - ax) * (cx - ax) + (cz - az) * (cz - az));
-        if (d < bestDist) {
-            bestDist = d;
-            bestId = id;
-        }
-    }
-    return bestId;
-}
-
-function clonePayload(g, now) {
-    const list = [];
-    for (const [id, clone] of Object.entries(g.clones)) {
-        const age = Math.max(0, (now - clone.spawnedAt) / 1000);
-        const walked = Math.min(CLONE_WALK_CAP_METRES, age * CLONE_WALK_SPEED);
-        const fx = Number(clone.fdx) || 0;
-        const fz = Number(clone.fdz) || 0;
-        list.push({
-            id: id,
-            caster_id: clone.casterId,
-            // Born at (x, z) and still marching along (fdx, fdz), so every screen
-            // and the hit test read the same body at the same distance.
-            x: (Number(clone.x) || 0) + fx * walked,
-            y: Number(clone.y) || 0,
-            z: (Number(clone.z) || 0) + fz * walked,
-            yaw: Number(clone.yaw) || 0,
-            hits: clone.hits || 0,
-            hits_left: Math.max(0, CLONE_MAX_HITS - (clone.hits || 0)),
-            left_ms: Math.max(0, clone.expiresAt - now)
-        });
-    }
-    return list;
-}
-
-function spawnClones(room, caster, now) {
-    const g = room.game;
-    // Drop any earlier set from this same caster so the table never carries stale
-    // bodies a new press was meant to replace.
-    for (const [id, clone] of Object.entries(g.clones)) {
-        if (clone.casterId === mummyIdOf(caster)) delete g.clones[id];
-    }
-    const x = Number(caster.pos && caster.pos.x) || 0;
-    const y = Number(caster.pos && caster.pos.y) || 0;
-    const z = Number(caster.pos && caster.pos.z) || 0;
-    const yaw = Number(caster.pos && caster.pos.yaw) || 0;
-    const fx = -Math.sin(yaw);
-    const fz = -Math.cos(yaw);
-    // The same direction every screen will walk them along.
-    const rx = Math.cos(yaw);
-    const rz = -Math.sin(yaw);
-    for (let i = 0; i < CLONE_COUNT; i++) {
-        const side = i === 0 ? -1 : 1;
-        const id = "clone-" + String(g.nextCloneNum++);
-        g.clones[id] = {
-            casterId: mummyIdOf(caster),
-            x: x + fx * CLONE_FRONT_METRES + rx * CLONE_SPREAD_METRES * side,
-            y: y,
-            z: z + fz * CLONE_FRONT_METRES + rz * CLONE_SPREAD_METRES * side,
-            yaw: yaw,
-            // The line the server and every client both advance this body along.
-            fdx: fx,
-            fdz: fz,
-            hits: 0,
-            spawnedAt: now,
-            expiresAt: now + CLONE_LIFETIME_MS
-        };
-    }
-    console.log(`[ABILITY] ${mummyIdOf(caster)} spawned ${CLONE_COUNT} clones in ${room.matchId}`);
-}
-
-function activateMummyAbility(room, caster, now) {
-    const kind = abilityFor(caster);
-    if (kind === "") return null;
-    const id = mummyIdOf(caster);
-    if (!room.game.abilities[id]) room.game.abilities[id] = { cooldownUntil: 0, healAt: 0, healUntil: 0 };
-    const ability = room.game.abilities[id];
-    if (ability.cooldownUntil > now) return "cooldown";
-
-    if (kind === "clone") {
-        spawnClones(room, caster, now);
-        ability.cooldownUntil = now + ABILITY_COOLDOWN_MS;
-    } else if (kind === "shield") {
-        // A dome belongs to one caster at a time, so recasting replaces the old
-        // shell instead of stacking a second one on the same body.
-        room.game.shields[id] = { hits: 0, expiresAt: now + SHIELD_LIFETIME_MS };
-        ability.cooldownUntil = now + ABILITY_COOLDOWN_MS;
-        console.log(`[ABILITY] ${id} raised a shield in ${room.matchId}`);
-    } else if (kind === "aura") {
-        // Mark the window the heal runs over; the tick itself drains it second by
-        // second so nobody gets the whole bar in a single frame.
-        ability.healAt = now;
-        ability.healUntil = now + AURA_LIFETIME_MS;
-        ability.cooldownUntil = now + AURA_COOLDOWN_MS;
-        console.log(`[ABILITY] ${id} cast a healing aura in ${room.matchId}`);
-    } else if (kind === "hp_shield") {
-        activateHpShield(room, id, now);
+    if (g.sideScore[scorer] >= MUMMY_WIN_POINTS) {
+        endMummyMatch(room, scorer);
     } else {
-        // A character that owns an ability the server does not yet implement still
-        // gets a clean cooldown, so the button is never a free infinite press.
-        ability.cooldownUntil = now + ABILITY_COOLDOWN_MS;
-    }
-
-    broadcastMummyState(room, true);
-    return kind;
-}
-
-function destroyClone(room, cloneId, reason) {
-    const g = room.game;
-    if (!g.clones[cloneId]) return false;
-    delete g.clones[cloneId];
-    console.log(`[ABILITY] clone ${cloneId} removed (${reason}) in ${room.matchId}`);
-    broadcastMummyState(room, true);
-    return true;
-}
-
-function landCloneHit(room, cloneId, now) {
-    const g = room.game;
-    const clone = g.clones[cloneId];
-    if (!clone) return false;
-    // A decoy can be felled by the clock and by a swing on the very same tick; the
-    // one that lands first wins and the second call becomes a harmless no-op.
-    if (now >= clone.expiresAt) {
-        destroyClone(room, cloneId, "expired");
-        return false;
-    }
-    clone.hits = (clone.hits || 0) + 1;
-    if (clone.hits >= CLONE_MAX_HITS) {
-        destroyClone(room, cloneId, "hits");
-    } else {
+        // Instant: every phone gets the new score on the same tick it happened.
         broadcastMummyState(room, true);
     }
     return true;
 }
 
-function tickMummyClones(room, now) {
-    const g = room.game;
-    let changed = false;
-    for (const [id, clone] of Object.entries(g.clones)) {
-        if (now >= clone.expiresAt) {
-            delete g.clones[id];
-            console.log(`[ABILITY] clone ${id} expired in ${room.matchId}`);
-            changed = true;
-        }
+// The match stops where it is: no clock, no further scoring, and the sockets are
+// released so the same players can queue a new match without clearing anything.
+// The grace window for a dropped player just closed. If any entry is still
+// marked gone the match cannot wait for it any longer; the other side takes it
+// outright, the same as a walk-out.
+function forfeitGone(room) {
+    if (!matches.has(room.matchId)) return;
+    clearTimeout(room.graceTimer);
+    for (const e of room.entries) {
+        if (!e.gone) continue;
+        if (room.game.kind === "zombie") endZombieMatch(room, 1 - e.side);
+        else endMummyMatch(room, 1 - e.side);
+        return;
     }
-    if (changed) broadcastMummyState(room, true);
 }
 
-// The centre of the dome is the caster's current body, so the shell follows them
-// for its whole life instead of staying nailed to the spot they raised it on.
-function shieldCenter(room, ownerId) {
-    const owner = room.entries.find(e => mummyIdOf(e) === ownerId);
-    if (!owner || !owner.pos) return null;
-    return {
-        x: Number(owner.pos.x) || 0,
-        y: (Number(owner.pos.y) || 0) + SHIELD_HEIGHT * 0.5,
-        z: Number(owner.pos.z) || 0
-    };
-}
-
-function shieldPayload(room, now) {
-    const g = room.game;
-    const list = [];
-    for (const [id, shield] of Object.entries(g.shields)) {
-        const centre = shieldCenter(room, id);
-        if (!centre) continue;
-        const hits = shield.hits || 0;
-        list.push({
-            id: id,
-            caster_id: id,
-            x: centre.x,
-            y: centre.y,
-            z: centre.z,
-            radius: SHIELD_RADIUS,
-            height: SHIELD_HEIGHT,
-            hits: hits,
-            hits_left: Math.max(0, SHIELD_DESTROY_AT - hits),
-            left_ms: Math.max(0, shield.expiresAt - now)
-        });
-    }
-    return list;
-}
-
-function destroyShield(room, ownerId, reason) {
-    const g = room.game;
-    if (!g.shields[ownerId]) return false;
-    delete g.shields[ownerId];
-    console.log(`[ABILITY] shield ${ownerId} removed (${reason}) in ${room.matchId}`);
-    broadcastMummyState(room, true);
-    return true;
-}
-
-function landShieldHit(room, ownerId, now) {
-    const g = room.game;
-    const shield = g.shields[ownerId];
-    if (!shield) return false;
-    // A swing that lands on the very tick the shell times out is thrown away,
-    // exactly the way a late hit on a faded clone is.
-    if (now >= shield.expiresAt) {
-        destroyShield(room, ownerId, "expired");
-        return false;
-    }
-    shield.hits = (shield.hits || 0) + 1;
-    if (shield.hits >= SHIELD_DESTROY_AT) {
-        destroyShield(room, ownerId, "hits");
-    } else {
-        broadcastMummyState(room, true);
-    }
-    return true;
-}
-
-function tickMummyShields(room, now) {
-    const g = room.game;
-    let changed = false;
-    for (const [id, shield] of Object.entries(g.shields)) {
-        if (now >= shield.expiresAt) {
-            delete g.shields[id];
-            console.log(`[ABILITY] shield ${id} expired in ${room.matchId}`);
-            changed = true;
-        }
-    }
-    if (changed) broadcastMummyState(room, true);
-}
-
-// ---- collision / separation ----
-// The bodies in the arena cannot occupy the same patch of floor. The server
-// is the only place that knows every position, so it enforces a minimum
-// horizontal distance between any two standing players and rejects a move that
-// would push one body through another. A clone or a shield is a prop, not a
-// body, so it never blocks.
-const PLAYER_RADIUS = 0.55;
-
-function collidesInRoom(room, mover) {
-    if (!room || !room.entries) return false;
-    const id = mummyIdOf(mover);
-    for (const other of room.entries) {
-        if (other === mover) continue;
-        const oid = mummyIdOf(other);
-        // Eliminated bodies are gone from the floor; downed ones still occupy
-        // space, but a downed player cannot be the mover (input is gated).
-        if (room.game && room.game.combat && room.game.combat[oid] && room.game.combat[oid].eliminated) continue;
-        if (room.game && room.game.combat && room.game.combat[id] && room.game.combat[id].eliminated) continue;
-        // A solid ability shell blocks passage the way another body does.
-        if (room.game && shieldBlocksPassage(room.game, oid)) {
-            // the dome sits on the floor at the owner's position
-        }
-        const d = flatDistance(mover.pos, other.pos);
-        if (d < PLAYER_RADIUS * 2) return true;
-    }
-    return false;
-}
-
-function separateFromRoom(room, mover, x, z) {
-    // Resolve overlaps by pushing the mover out along the shortest axis of each
-    // collision, iterated a few times so a squeeze between two bodies settles.
-    let nx = x, nz = z;
-    for (let pass = 0; pass < 4; pass++) {
-        let moved = false;
-        for (const other of room.entries) {
-            if (other === mover) continue;
-            const oid = mummyIdOf(other);
-            if (room.game && room.game.combat && room.game.combat[oid] && room.game.combat[oid].eliminated) continue;
-            const dx = nx - (Number(other.pos && other.pos.x) || 0);
-            const dz = nz - (Number(other.pos && other.pos.z) || 0);
-            const d = Math.sqrt(dx * dx + dz * dz);
-            const minD = PLAYER_RADIUS * 2;
-            if (d < minD) {
-                moved = true;
-                if (d < 0.0001) { nx += minD; }
-                else {
-                    const push = (minD - d);
-                    nx += (dx / d) * push;
-                    nz += (dz / d) * push;
-                }
-            }
-        }
-        if (!moved) break;
-    }
-    return { x: nx, z: nz };
-}
-
-const matches = new Map();         // matchId -> room
-
-// Voice rooms are a relay-local concern: which sockets sit in which group, so
-// a player list can be fanned out without the hub needing to know.
-const voiceGroups = new Map();     // voiceKey -> Set<ws>
-const clientsByUid = new Map();    // uid -> ws (latest socket for that player)
-
-function sanitizeVoiceKey(v) {
-    const s = String(v || "").trim();
-    if (!s) return "";
-    return s.slice(0, 80);
-}
-
-function leaveVoice(ws) {
-    const key = ws && ws.voiceKey;
-    if (!key) return;
-    const group = voiceGroups.get(key);
-    if (group) {
-        group.delete(ws);
-        if (group.size === 0) voiceGroups.delete(key);
-        else sendVoiceList(key);
-    }
-    ws.voiceKey = "";
-}
-
-function sendVoiceList(key) {
-    const group = voiceGroups.get(key);
-    if (!group) return;
-    const members = [];
-    for (const peer of group) {
-        const uid = uidKey(peer.uid);
-        if (uid) members.push(uid);
-    }
-    const txt = JSON.stringify({ type: "voice_members", voice_key: key, members: members });
-    for (const peer of group) {
-        if (peer.readyState === WebSocket.OPEN) {
-            try { peer.send(txt); } catch (_e) {}
-        }
+// One timer per room, not per dropper: it re-arms whenever a socket closes so
+// every still-gone entry is covered, and a rejoin only cancels it once no entry
+// is gone any more (a returning player must not wipe a teammate's window).
+function armGraceTimer(room) {
+    clearTimeout(room.graceTimer);
+    room.graceTimer = null;
+    if (room.entries.some(e => e.gone)) {
+        room.graceTimer = setTimeout(() => forfeitGone(room), RECONNECT_GRACE_MS);
     }
 }
 
 function endMummyMatch(room, winningSide) {
-    if (!room || !room.game) return;
     const g = room.game;
     g.phase = "finished";
     g.settled = true;
@@ -1773,28 +2263,6 @@ function cancelMummyWaiting(room) {
     matches.delete(room.matchId);
 }
 
-function forfeitGone(room) {
-    if (!matches.has(room.matchId)) return;
-    clearTimeout(room.graceTimer);
-    for (const e of room.entries) {
-        if (!e.gone) continue;
-        if (room.game.kind === "zombie") endZombieMatch(room, 1 - e.side);
-        else endMummyMatch(room, 1 - e.side);
-        return;
-    }
-}
-
-// One timer per room, not per dropper: it re-arms whenever a socket closes so
-// every still-gone entry is covered, and a rejoin only cancels it once no entry
-// is gone any more (a returning player must not wipe a teammate's window).
-function armGraceTimer(room) {
-    clearTimeout(room.graceTimer);
-    room.graceTimer = null;
-    if (room.entries.some(e => e.gone)) {
-        room.graceTimer = setTimeout(() => forfeitGone(room), RECONNECT_GRACE_MS);
-    }
-}
-
 // --------------------------------------------------------------------- zombie --
 // The infection mode's room: two four-player teams, one freshly woken zombie on
 // each side, and every caught human joining the catcher's count the same tick.
@@ -1821,13 +2289,6 @@ function initZombieMatch(room) {
     };
     broadcastZombieState(room, true);
 }
-
-const ZOMBIE_ROUNDS = parseInt(process.env.ZOMBIE_ROUNDS, 10) || 8;
-const ZOMBIE_ROUND_MS = (parseInt(process.env.ZOMBIE_ROUND_SECONDS, 10) || 120) * 1000;
-const ZOMBIE_BREAK_MS = (parseInt(process.env.ZOMBIE_BREAK_SECONDS, 10) || 5) * 1000;
-// Mirrors ATTACK_RANGE in zombie_match.gd: the reach a zombie actually swings.
-const ZOMBIE_ATTACK_RANGE = parseFloat(process.env.ZOMBIE_ATTACK_RANGE) || 2.6;
-const ZOMBIE_TEAM_NAMES = ["TEAM TIGER", "TEAM LION"];
 
 function beginZombieRound(room, roundNumber) {
     const g = room.game;
@@ -2280,12 +2741,11 @@ function handleClientMessage(ws, data) {
 
         // A lobby celebration is an event, not state: it does not belong in
         // anybody's team_update and must not be stored, because a late joiner
-        // should not watch an emote that already happened. The party is the only
-        // audience the lobby has, so the relay stops there.
+        // should not watch an emote that already happened. Broadcast to every
+        // connected lobby client so emotes sync globally, not just within a party.
         case 'lobby_emote': {
             const uid = bindUid(ws, data);
-            const team = teamOf(ws);
-            if (!team || !uid) break;
+            if (!uid) break;
             const emote = Number(data.emote);
             if (!Number.isInteger(emote) || emote < 1 || emote > 16) break;
             const txt = JSON.stringify({
@@ -2294,9 +2754,9 @@ function handleClientMessage(ws, data) {
                 player_uid: uid,
                 username: String(data.username || "").slice(0, 24)
             });
-            for (const m of team.members) {
-                if (m.uid !== uid && m.ws.readyState === WebSocket.OPEN) {
-                    m.ws.send(txt);
+            for (const client of wss.clients) {
+                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                    client.send(txt);
                 }
             }
             break;
@@ -2694,131 +3154,6 @@ function handleClientMessage(ws, data) {
             console.log('[WS] Unknown message type:', type);
     }
 }
-
-wss.on('connection', (ws) => {
-    ws.isAlive = true;
-    ws.uid = "";
-    ws.teamId = null;
-    ws.matchId = null;
-    ws.matchUid = "";
-    ws.matchSpawnIndex = -1;
-    ws.queued = false;
-    ws.teamRemote = null;
-    ws.voiceKey = "";
-
-    ws.on('pong', () => { ws.isAlive = true; });
-
-    ws.on('message', (raw) => {
-        const data = safeJsonParse(raw);
-        if (!data || typeof data !== "object") return;
-
-        // Track the latest socket per authenticated uid (for invites/presence/team ops).
-        const uid = bindUid(ws, data);
-        if (uid) {
-            const prev = clientsByUid.get(uid);
-            if (prev && prev !== ws && prev.readyState === WebSocket.OPEN) {
-                // Keep the newer socket as the reachable one for presence/invites.
-                // Do not forcibly close the previous socket here.
-            }
-            clientsByUid.set(uid, ws);
-        }
-
-        // Hub <-> relay/peer control messages (only meaningful on hub/relay links).
-        if (HUB_URL === "" && data.type === "relay_hello") {
-            const region = String(data.region || "relay");
-            relays.set(ws, {
-                id: "relay-" + String(nextRelayId++),
-                region: region,
-                state: { games: new Map(), teams: new Map(), clients: new Map() }
-            });
-            console.log(`[HUB] relay connected (${region})`);
-            return;
-        }
-
-        // A relay forwarding a client event to the hub.
-        if (HUB_URL === "" && data._kind === "from_client") {
-            const relayInfo = relays.get(ws);
-            if (!relayInfo) return;
-            const remoteId = String(data.remote || "");
-            let seat = relayInfo.state.clients.get(remoteId);
-            if (!seat) {
-                seat = makeProxy(ws, remoteId, relayInfo.region);
-                relayInfo.state.clients.set(remoteId, seat);
-            }
-            seat.readyState = WebSocket.OPEN;
-            seat._relay = ws;
-            handleClientMessage(seat, data.payload || {});
-            return;
-        }
-
-        // Relay mode: forward global actions to hub; handle local-only actions locally.
-        if (HUB_URL !== "" && hubReady) {
-            const forwardTypes = new Set([
-                'team_get','team_invite','team_join','team_decline','team_leave','team_kick','lobby_emote',
-                'quick_match','quick_match_cancel',
-                'match_ready','swing_start','mummy_attack','zombie_swing','zombie_attack',
-                'ability_activate','clone_hit','shield_hit','revive_begin','revive_end','match_rejoin'
-            ]);
-            if (forwardTypes.has(data.type)) {
-                if (!ws._remoteId) {
-                    ws._remoteId = "c-" + String(nextRemoteId++);
-                    remoteClients.set(ws._remoteId, ws);
-                }
-                relaySend({ _kind: "from_client", remote: ws._remoteId, payload: data });
-                return;
-            }
-        }
-
-        // Local handling (hub, or relay-local concerns like voice/presence/move relay in-room).
-        handleClientMessage(ws, data);
-    });
-
-    ws.on('close', () => {
-        // Presence map cleanup (only if this socket is the latest).
-        const uid = uidKey(ws.uid);
-        if (uid && clientsByUid.get(uid) === ws) clientsByUid.delete(uid);
-
-        leaveVoice(ws);
-
-        // Hub: relay link dropped.
-        if (HUB_URL === "" && relays.has(ws)) {
-            dropRelay(ws);
-            return;
-        }
-
-        // Relay: tell hub this client is gone (if it had a remote seat).
-        if (HUB_URL !== "" && ws._remoteId && hubReady) {
-            relaySend({ _kind: "from_client", remote: ws._remoteId, payload: { type: "client_gone", uid: uidKey(ws.uid) } });
-            remoteClients.delete(ws._remoteId);
-        }
-
-        removeFromAllQueues(ws);
-        leaveTeam(ws);
-
-        const room = ws.matchId && matches.get(ws.matchId);
-        if (room) {
-            room.players = room.players.filter(p => p !== ws);
-            const entry = room.entries.find(e => e.ws === ws || uidKey(e.uid) === uid);
-            if (entry && room.game && room.game.phase !== "finished") {
-                entry.gone = true;
-                entry.ws = ws; // keep ref; will be replaced on rejoin
-            }
-            if (!room.game || room.game.phase === "finished") {
-                // Nothing to preserve.
-            } else if (room.game.phase === "waiting") {
-                cancelMummyWaiting(room);
-            } else {
-                armGraceTimer(room);
-            }
-        }
-
-        broadcastAllPools();
-    });
-
-    ws.on('error', () => {
-        try { ws.terminate(); } catch (_e) {}
-    });
-});
 
 const mummyTick = setInterval(tickMummyMatches, 250);
 const zombieTick = setInterval(tickZombieMatches, 250);
