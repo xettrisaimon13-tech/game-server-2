@@ -1417,11 +1417,13 @@ function initMummyMatch(room) {
         hunterSide: 0,             // the team hunting this round; it flips every round
         winnerSide: -1,            // -1 while the match is still live
         roles: {},                 // id -> "mummy" | "human"
-        combat: {},                // id -> { hp, downed, downedSince, eliminated, scored, reviveMs, revivers }
+        combat: {},                // id -> { hp, downed, downedSince, eliminated, scored, reviveMs, revivers, lastAttacker }
+        killEvents: [],            // { killerId, killerName, victimId, victimName, time, type }
         settled: false,            // one result per round, however it ends
         roundOutcome: "",
         abilities: {},             // id -> { cooldownUntil } for the equipped character's ability
         swingSeq: {},              // mummy id -> swings so far, so sword/jab alternate on every screen
+        lastSwingAt: {},           // mummy id -> ms of the last attack_anim, so a hit does not draw twice
         clones: {},                // clone id -> { owner, x, y, z, hits, expiresAt }
         cloneSeq: 0,
         shields: {},               // owner id -> { hits, x, y, z, expiresAt, lastHitAt }
@@ -1429,6 +1431,7 @@ function initMummyMatch(room) {
     };
     resetMummyCombat(room);
     resetMummyAbilities(room);
+    room.game.killEvents = [];
     broadcastMummyState(room, true);
 }
 
@@ -1451,7 +1454,8 @@ function resetMummyCombat(room) {
             scored: false,
             reviveMs: 0,
             reviveAt: 0,
-            revivers: {}
+            revivers: {},
+            lastAttacker: null
         };
     }
 }
@@ -1915,7 +1919,7 @@ function reviveMummyPlayer(room, id) {
     return true;
 }
 
-function eliminateMummyPlayer(room, id) {
+function eliminateMummyPlayer(room, id, killerId) {
     const c = room.game.combat[id];
     if (!c || c.eliminated) return false;
     c.downed = false;
@@ -1925,6 +1929,21 @@ function eliminateMummyPlayer(room, id) {
     c.reviveMs = 0;
     c.reviveAt = 0;
     c.revivers = {};
+    // Record kill event for the kill feed
+    const killer = killerId || c.lastAttacker || null;
+    const victimEntry = room.entries.find(e => mummyIdOf(e) === id);
+    const killerEntry = killer ? room.entries.find(e => mummyIdOf(e) === killer) : null;
+    room.game.killEvents.push({
+        killerId: killer,
+        killerName: killerEntry ? killerEntry.username : null,
+        victimId: id,
+        victimName: victimEntry ? victimEntry.username : id,
+        time: Date.now(),
+        type: killer ? "kill" : "eliminated",
+        is_streamer: false
+    });
+    // Keep only recent (last 10)
+    if (room.game.killEvents.length > 10) room.game.killEvents.shift();
     // The elimination is the point: whoever went out hands a point to the team on
     // the other side of the arena, which is the team that put them there.
     awardMummyPoint(room, id);
@@ -2081,7 +2100,7 @@ function tickMummyCombat(room, now) {
         const bled = now - c.downedSince;
         c.hp = Math.max(0, Math.ceil(MUMMY_HP * (1 - bled / MUMMY_DOWN_MS)));
         if (bled >= MUMMY_DOWN_MS) {
-            eliminateMummyPlayer(room, id);
+            eliminateMummyPlayer(room, id, null);
             console.log(`[MUMMY] ${id} bled out in ${room.matchId}`);
         }
     }
@@ -2202,7 +2221,16 @@ function mummyStatePayload(room, self) {
                 revive_seconds_left: c.downed ? Math.max(0, Math.ceil((MUMMY_REVIVE_MS - c.reviveMs) / 1000)) : 0,
                 reviving: c.downed && Object.keys(c.revivers).length > 0
             };
-        })
+        }),
+        kill_events: (room.game.killEvents || []).map(k => ({
+            killer_id: k.killerId,
+            killer_name: k.killerName,
+            victim_id: k.victimId,
+            victim_name: k.victimName,
+            time: k.time,
+            type: k.type,
+            is_streamer: !!k.is_streamer
+        }))
     };
 }
 
@@ -2282,6 +2310,7 @@ function initZombieMatch(room) {
         roles: {},                 // id -> "zombie" | "human"
         infected: {},              // id -> true once turned this round (duplicate guard)
         swingSeq: {},              // zombie id -> swings so far, so the punch clips alternate
+        lastSwingAt: {},           // zombie id -> ms of the last attack_anim, so a touch does not draw twice
         settled: false,
         roundOutcome: "",
         winnerSide: -1,
@@ -2455,15 +2484,14 @@ function tickZombieMatches() {
 // Every `swing_start` a phone sends calls exactly these four
 // functions, so one set of rules - role, alive check, shield, clone, range,
 // damage - decides every hit in the game no matter who proposed it.
-function performMummySwing(room, attacker) {
+// One swing on every phone, from one counter, so sword and jab alternate in the
+// same order on all eight screens. The stamp is what lets the hit path below
+// skip a re-broadcast when the phone already announced the swing.
+function broadcastAttackAnim(room, attackerId) {
     const g = room.game;
-    if (g.phase !== "playing" || g.settled) return false;
-    const attackerId = mummyIdOf(attacker);
-    if (g.roles[attackerId] !== "mummy") return false;
-    if (!mummyAlive(room, attackerId)) return false;
-
     const swing = (g.swingSeq[attackerId] = (g.swingSeq[attackerId] || 0) + 1);
     const clip = swing % 2 === 1 ? "Sword_Attack" : "Fighting_Left_Jab";
+    g.lastSwingAt[attackerId] = Date.now();
     for (const e of room.entries) {
         sendJson(e.ws, {
             type: "attack_anim",
@@ -2472,6 +2500,25 @@ function performMummySwing(room, attacker) {
             clip: clip
         });
     }
+}
+
+// A hit must be visible even when the phone only reports the damage and never
+// sends swing_start: without this the catcher's body swings on its own screen
+// and stands still on everybody else's.
+function ensureAttackAnim(room, attackerId) {
+    const last = room.game.lastSwingAt[attackerId] || 0;
+    if (Date.now() - last < 700) return;
+    broadcastAttackAnim(room, attackerId);
+}
+
+function performMummySwing(room, attacker) {
+    const g = room.game;
+    if (g.phase !== "playing" || g.settled) return false;
+    const attackerId = mummyIdOf(attacker);
+    if (g.roles[attackerId] !== "mummy") return false;
+    if (!mummyAlive(room, attackerId)) return false;
+
+    broadcastAttackAnim(room, attackerId);
     return true;
 }
 
@@ -2488,6 +2535,10 @@ function performMummyAttack(room, attacker, targetId) {
 
     const target = g.combat[targetId];
     if (!target || target.downed || target.eliminated) return false;
+
+    // The claw has to read on every phone: a hit reported without its swing
+    // still gets one drawn here.
+    ensureAttackAnim(room, attackerId);
 
     // A dome standing over the body takes the swing first. However many
     // teammates are inside it, one press is one hit on the shell.
@@ -2523,13 +2574,14 @@ function performMummyAttack(room, attacker, targetId) {
         console.log(`[MUMMY] ${targetId}'s shadow shield absorbed ${absorbed}, ${target.shield} left`);
     }
     target.hp = Math.max(0, target.hp - incoming);
+    target.lastAttacker = attackerId;
     console.log(`[MUMMY] ${attackerId} hit ${targetId} for ${incoming} damage, HP now ${target.hp}`);
 
     // Check if HP reached zero
     if (target.hp <= 0) {
         if (g.sideSize <= 1) {
             // 1v1: HP=0 ends the round immediately
-            if (!eliminateMummyPlayer(room, targetId)) return true;
+            if (!eliminateMummyPlayer(room, targetId, attackerId)) return true;
             console.log(`[MUMMY] ${attackerId} caught ${targetId} out in ${room.matchId}`);
             if (g.phase !== "finished") settleMummyRound(room, "mummy");
         } else {
@@ -2553,6 +2605,7 @@ function performZombieSwing(room, attacker) {
 
     const swing = (g.swingSeq[attackerId] = (g.swingSeq[attackerId] || 0) + 1);
     const clip = swing % 2 === 1 ? "Sword_Attack" : "Fighting_Left_Jab";
+    g.lastSwingAt[attackerId] = Date.now();
     for (const e of room.entries) {
         sendJson(e.ws, {
             type: "attack_anim",
@@ -2581,6 +2634,7 @@ function performZombieAttack(room, attacker, targetId) {
         return true;
     }
 
+    ensureAttackAnim(room, attackerId);
     if (infectZombie(room, attackerId, targetId)) {
         broadcastZombieState(room, true);
     }
