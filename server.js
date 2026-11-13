@@ -1353,12 +1353,12 @@ const MUMMY_ATTACK_RANGE = parseFloat(process.env.MUMMY_ATTACK_RANGE) || 2.6;
 // appearing at their shoulder. A small side offset keeps the two of them apart.
 const CLONE_FRONT_METRES = 1.8;
 const CLONE_SPREAD_METRES = 0.55;
-// Clones then walk straight ahead from where they appeared.
-// Both ends use these two numbers: the phone draws the body on this line, and
-// the server moves its own copy down the same line, so a swing at what a player
-// sees is a swing on the body the server is counting.
-const CLONE_WALK_SPEED = 5.0;      // metres per second, straight ahead (a player walks at 5.5)
-const CLONE_WALK_LIMIT = 20.0;     // metres from where the clone appeared
+// Clones move like bots (wander around) to distract.
+// Both ends keep movement in sync conceptually; client may do extra local wall avoidance.
+const CLONE_WALK_SPEED = 4.8;      // metres per second, bot-like wandering
+const CLONE_WALK_LIMIT = 30.0;     // total distance it can travel over its lifetime
+const CLONE_TURN_MIN_MS = 500;     // wander: change direction every 0.5-1.8s
+const CLONE_TURN_MAX_MS = 1800;
 // A hologram can only be knocked once this often, however many reports arrive. A
 // Mummy standing in a crowd of four Humans used to be able to spend a whole swing
 // on one clone per target it reached.
@@ -1577,10 +1577,25 @@ function tickMummyClones(room, now) {
             dead.push(id);
             continue;
         }
-        // Straight ahead, on the heading the clone was placed with - the phone
-        // draws the same step, so the two stay on one line.
+        // Bot-like wandering: move around (yeta-uti) with periodic random direction changes.
         const dt = Math.min(0.5, Math.max(0, (now - c.movedAt) / 1000));
         c.movedAt = now;
+        if (now >= (c.nextTurnAt || 0)) {
+            // Pick a new random direction (sometimes small turn, sometimes big turn)
+            const turn = (Math.random() * Math.PI * 1.4) - (Math.PI * 0.7);
+            c.targetYaw = (typeof c.yaw === "number" ? c.yaw : 0) + turn;
+            c.nextTurnAt = now + CLONE_TURN_MIN_MS + Math.floor(Math.random() * (CLONE_TURN_MAX_MS - CLONE_TURN_MIN_MS));
+        }
+        // Smoothly turn toward target yaw
+        const currentYaw = typeof c.yaw === "number" ? c.yaw : 0;
+        const targetYaw = typeof c.targetYaw === "number" ? c.targetYaw : currentYaw;
+        let deltaYaw = targetYaw - currentYaw;
+        // normalize to [-PI, PI]
+        while (deltaYaw > Math.PI) deltaYaw -= Math.PI * 2;
+        while (deltaYaw < -Math.PI) deltaYaw += Math.PI * 2;
+        const maxTurn = dt * 3.5; // turn speed (rad/s)
+        c.yaw = currentYaw + Math.max(-maxTurn, Math.min(maxTurn, deltaYaw));
+
         const step = Math.min(CLONE_WALK_SPEED * dt, CLONE_WALK_LIMIT - c.walked);
         if (step > 0) {
             // +Z is the way the model faces at yaw 0, so this walks it forwards.
@@ -1694,12 +1709,15 @@ function activateMummyAbility(room, entry, now) {
     for (let i = 0; i < CLONE_COUNT; i++) {
         const side = i === 0 ? 1 : -1;
         const id = `${self}#${g.cloneSeq++}`;
+        const startYaw = yaw + (Math.random() * 1.2 - 0.6); // slight random initial spread
         const clone = {
             owner: self,
             x: Number(at.x) + forward.x * CLONE_FRONT_METRES + right.x * CLONE_SPREAD_METRES * side,
             y: Number(at.y),
             z: Number(at.z) + forward.z * CLONE_FRONT_METRES + right.z * CLONE_SPREAD_METRES * side,
-            yaw: yaw,
+            yaw: startYaw,
+            targetYaw: startYaw,
+            nextTurnAt: now + CLONE_TURN_MIN_MS + Math.floor(Math.random() * (CLONE_TURN_MAX_MS - CLONE_TURN_MIN_MS)),
             hits: 0,
             lastHitAt: 0,
             walked: 0,
@@ -1707,7 +1725,7 @@ function activateMummyAbility(room, entry, now) {
             expiresAt: now + CLONE_LIFETIME_MS
         };
         g.clones[id] = clone;
-        created.push({ id: id, owner: self, x: clone.x, y: clone.y, z: clone.z, yaw: yaw });
+        created.push({ id: id, owner: self, x: clone.x, y: clone.y, z: clone.z, yaw: clone.yaw });
     }
     mine.cooldownUntil = now + ABILITY_COOLDOWN_MS;
     for (const e of room.entries) {
@@ -2567,10 +2585,24 @@ function performMummyAttack(room, attacker, targetId) {
             if (!eliminateMummyPlayer(room, targetId, attackerId)) return true;
             console.log(`[MUMMY] ${attackerId} caught ${targetId} out in ${room.matchId}`);
         } else {
-            // 2v2+: HP=0 knocks down instead of eliminating
-            if (!downMummyPlayer(room, targetId)) return true;
-            console.log(`[MUMMY] ${attackerId} knocked ${targetId} down in ${room.matchId}`);
-            broadcastMummyState(room, true);
+            // 2v2+/team: knock down only if at least one teammate can still revive (alive, not downed/eliminated).
+            // If all other teammates are downed/eliminated, eliminate directly (no useless knock).
+            const targetEntry = room.entries.find(e => mummyIdOf(e) === targetId);
+            const hasReviveHelp = room.entries.some(e => {
+                if (e === targetEntry) return false;
+                if (g.roles[mummyIdOf(e)] !== "human") return false;
+                if (e.side !== (targetEntry ? targetEntry.side : -1)) return false;
+                const st = g.combat[mummyIdOf(e)];
+                return st && !st.downed && !st.eliminated;
+            });
+            if (hasReviveHelp) {
+                if (!downMummyPlayer(room, targetId)) return true;
+                console.log(`[MUMMY] ${attackerId} knocked ${targetId} down in ${room.matchId}`);
+                broadcastMummyState(room, true);
+            } else {
+                if (!eliminateMummyPlayer(room, targetId, attackerId)) return true;
+                console.log(`[MUMMY] ${attackerId} eliminated ${targetId} directly (no revive help) in ${room.matchId}`);
+            }
         }
     } else {
         // Just damage, HP still > 0
