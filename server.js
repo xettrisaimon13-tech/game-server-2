@@ -1397,12 +1397,12 @@ function abilityCooldownMs(kind) {
     return kind === "hp_shield" ? HP_SHIELD_COOLDOWN_MS : ABILITY_COOLDOWN_MS;
 }
 
-// 1v1 runs three minutes, every team size runs five.
+// 1v1 runs two minutes, every team size (2v2/3v3/4v4) runs three minutes.
 function mummyRoundMs(sideSize) {
     const forced = parseInt(process.env.MUMMY_ROUND_SECONDS, 10) || 0;
     if (forced > 0) return forced * 1000;
     const fromEnv = parseInt(sideSize <= 1 ? process.env.MUMMY_SOLO_ROUND_SECONDS : process.env.MUMMY_TEAM_ROUND_SECONDS, 10) || 0;
-    return (fromEnv > 0 ? fromEnv : sideSize <= 1 ? 180 : 300) * 1000;
+    return (fromEnv > 0 ? fromEnv : sideSize <= 1 ? 120 : 180) * 1000;
 }
 
 // Rooms are keyed on the profile UID, but a player whose profile has not bound
@@ -1947,10 +1947,15 @@ function eliminateMummyPlayer(room, id, killerId) {
     });
     // Keep only recent (last 10)
     if (g.killEvents.length > 10) g.killEvents.shift();
-    // The kill ends the round for the victim's team: the team on the other side
-    // of the arena takes the round's single point. Only the round's end pays,
-    // so however many bodies this tick touches, the score moves by one.
-    settleMummyRound(room, victimEntry ? 1 - victimEntry.side : g.hunterSide);
+    // Round point is awarded only when ALL humans (opposing team this round) are eliminated.
+    // If any human survives, the round continues and survivors can win on timeout.
+    const anyHumanAlive = room.entries.some(e => {
+        const eid = mummyIdOf(e);
+        return g.roles[eid] === "human" && mummyAlive(room, eid);
+    });
+    if (!anyHumanAlive) {
+        settleMummyRound(room, g.hunterSide);
+    }
     return true;
 }
 
