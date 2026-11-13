@@ -423,6 +423,28 @@ function teamPayload(team) {
     };
 }
 
+function openTeamPayload() {
+    return Array.from(teams.values())
+        .filter(team => team.members.length >= 2 && team.members.length < team.maxSize)
+        .map(team => {
+            const leader = team.members.find(member => member.uid === team.leaderUid) || team.members[0];
+            return {
+                team_id: team.id,
+                leader_uid: team.leaderUid,
+                leader_name: leader ? leader.username : "Player",
+                player_count: team.members.length,
+                max_size: team.maxSize
+            };
+        });
+}
+
+function broadcastOpenTeams() {
+    const payload = JSON.stringify({ type: "open_teams", teams: openTeamPayload() });
+    for (const client of wss.clients) {
+        if (client.readyState === WebSocket.OPEN) client.send(payload);
+    }
+}
+
 // The "you have no team" message doubles as the lobby-clear signal client-side.
 const NO_TEAM = { type: "team_update", team_id: "", leader_uid: "", max_size: 1, members: [] };
 
@@ -433,6 +455,7 @@ function teamError(ws, reason) {
 function broadcastTeam(team) {
     const payload = teamPayload(team);
     for (const m of team.members) sendJson(m.ws, payload);
+    broadcastOpenTeams();
 }
 
 function createTeam(ws, uid, username, characterId, bundleId, maxSize) {
@@ -442,6 +465,7 @@ function createTeam(ws, uid, username, characterId, bundleId, maxSize) {
         leaderUid: uid,
         maxSize: maxSize,
         inviters: {},
+        joinRequests: {},
         members: [{ ws: ws, uid: uid, username: username, characterId: characterId, bundleId: bundleId }]
     };
     teams.set(id, team);
@@ -456,11 +480,17 @@ function removeFromTeamQueue(teamId) {
 }
 
 function forgetTeam(team) {
+    for (const request of Object.values(team.joinRequests || {})) {
+        if (request && request.ws && request.ws.readyState === WebSocket.OPEN) {
+            sendJson(request.ws, { type: "group_join_result", team_id: team.id, success: false, reason: "That group is no longer available." });
+        }
+    }
     teams.delete(team.id);
     removeFromTeamQueue(team.id);
     for (const m of team.members) {
         if (m.ws.teamId === team.id) m.ws.teamId = null;
     }
+    broadcastOpenTeams();
 }
 
 function disbandTeam(team) {
@@ -2700,6 +2730,13 @@ function handleClientMessage(ws, data) {
             const team = teamOf(ws);
             if (team && uid) broadcastTeam(team);
             else sendJson(ws, NO_TEAM);
+            sendJson(ws, { type: "open_teams", teams: openTeamPayload() });
+            break;
+        }
+
+        case 'open_teams_get': {
+            bindUid(ws, data);
+            sendJson(ws, { type: "open_teams", teams: openTeamPayload() });
             break;
         }
 
@@ -2784,6 +2821,8 @@ function handleClientMessage(ws, data) {
                 team_id: team.id,
                 from_uid: uid,
                 from_name: data.username || "Player",
+                team_name: (team.members.find(m => m.uid === team.leaderUid) || team.members[0]).username,
+                player_count: team.members.length,
                 max_size: team.maxSize
             });
             sendJson(ws, { type: "team_invite_sent", to_uid: targetUid });
@@ -2814,6 +2853,86 @@ function handleClientMessage(ws, data) {
             });
             console.log(`[TEAM] ${uid} joined ${team.id} (${team.members.length}/${team.maxSize})`);
             if (team.inviters) delete team.inviters[String(uid)];
+            broadcastTeam(team);
+            break;
+        }
+
+        case 'group_join_request': {
+            const uid = bindUid(ws, data);
+            const team = teams.get(String(data.team_id || ""));
+            if (!uid) { teamError(ws, "Profile is still syncing"); break; }
+            if (teamOf(ws)) { teamError(ws, "Leave your current team before requesting to join another"); break; }
+            if (!team || team.members.length >= team.maxSize) {
+            sendJson(ws, { type: "group_join_result", team_id: String(data.team_id || ""), success: false, reason: "That group is full or no longer available." });
+                sendJson(ws, { type: "open_teams", teams: openTeamPayload() });
+                break;
+            }
+            if (team.members.some(member => member.uid === uid)) {
+                teamError(ws, "You are already in that group"); break;
+            }
+            team.joinRequests = team.joinRequests || {};
+            if (team.joinRequests[uid]) {
+                sendJson(ws, { type: "group_join_request_sent", team_id: team.id });
+                break;
+            }
+            const request = {
+                ws,
+                uid,
+                username: String(data.username || "Player"),
+                characterId: parseInt(data.character_id, 10) || 1,
+                bundleId: bundleIdOf(data)
+            };
+            team.joinRequests[uid] = request;
+            for (const member of team.members) {
+                sendJson(member.ws, {
+                    type: "group_join_request",
+                    team_id: team.id,
+                    requester_uid: uid,
+                    requester_name: request.username,
+                    player_count: team.members.length,
+                    max_size: team.maxSize
+                });
+            }
+            sendJson(ws, { type: "group_join_request_sent", team_id: team.id });
+            break;
+        }
+
+        case 'group_join_response': {
+            const uid = bindUid(ws, data);
+            const team = teams.get(String(data.team_id || ""));
+            const requesterUid = uidKey(data.requester_uid);
+            const request = team && team.joinRequests ? team.joinRequests[requesterUid] : null;
+            if (!uid || !team || !request || !team.members.some(member => member.uid === uid)) {
+                teamError(ws, "That join request is no longer available"); break;
+            }
+            const requesterWs = request.ws;
+            if (requesterWs.readyState !== WebSocket.OPEN || teamOf(requesterWs)) {
+                delete team.joinRequests[requesterUid];
+                teamError(ws, "That player is no longer available");
+                break;
+            }
+            if (String(data.action || "") !== "accept") {
+                delete team.joinRequests[requesterUid];
+                sendJson(requesterWs, { type: "group_join_result", team_id: team.id, success: false, reason: "The group could not accept your request." });
+                break;
+            }
+            if (team.members.length >= team.maxSize) {
+                delete team.joinRequests[requesterUid];
+                sendJson(requesterWs, { type: "group_join_result", team_id: team.id, success: false, reason: "That group is full." });
+                sendJson(ws, { type: "group_join_result", team_id: team.id, success: false, reason: "That group is full." });
+                broadcastOpenTeams();
+                break;
+            }
+            delete team.joinRequests[requesterUid];
+            requesterWs.teamId = team.id;
+            team.members.push({
+                ws: requesterWs,
+                uid: requesterUid,
+                username: request.username,
+                characterId: request.characterId,
+                bundleId: request.bundleId
+            });
+            sendJson(requesterWs, { type: "group_join_result", success: true, team_id: team.id });
             broadcastTeam(team);
             break;
         }
