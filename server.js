@@ -628,6 +628,7 @@ function connectToHub() {
     }
     hubWs.on('open', () => {
         console.log(`[RELAY] linked to hub ${HUB_URL} as ${REGION_ID}`);
+        if (hubWs._socket) hubWs._socket.setNoDelay(true);
         hubWs.send(JSON.stringify({ type: "hub_register", region_id: REGION_ID }));
         // Players who joined while the link was down are announced again.
         for (const ws of wss.clients) {
@@ -830,6 +831,11 @@ function makeVoiceRelay(connId, frame) {
 
 wss.on('connection', (ws) => {
     console.log('[WS] New connection');
+    // Voice frames are tiny and leave every 50 ms. Nagle would hold a frame back
+    // waiting for the previous ACK, so it lands late and bunched with the next
+    // one — it is the delay heard as "not at the same time" and the jitter the
+    // receiver then has to smooth. Every socket here is latency-bound, so off.
+    if (ws._socket) ws._socket.setNoDelay(true);
     ws.isAlive = true;
     ws.isRegion = false;
     ws.regionId = "";
