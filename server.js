@@ -425,7 +425,7 @@ function teamPayload(team) {
 
 function openTeamPayload() {
     return Array.from(teams.values())
-        .filter(team => team.members.length >= 2 && team.members.length < team.maxSize)
+        .filter(team => team.members.length >= 2 && team.members.length < team.maxSize && !teamIsQueued(team.id))
         .map(team => {
             const leader = team.members.find(member => member.uid === team.leaderUid) || team.members[0];
             return {
@@ -436,6 +436,10 @@ function openTeamPayload() {
                 max_size: team.maxSize
             };
         });
+}
+
+function teamIsQueued(teamId) {
+    return Object.values(teamQueues).some(queue => queue.some(group => group.teamId === teamId));
 }
 
 function broadcastOpenTeams() {
@@ -2862,6 +2866,10 @@ function handleClientMessage(ws, data) {
             const team = teams.get(String(data.team_id || ""));
             if (!uid) { teamError(ws, "Profile is still syncing"); break; }
             if (teamOf(ws)) { teamError(ws, "Leave your current team before requesting to join another"); break; }
+            if (team && teamIsQueued(team.id)) {
+                sendJson(ws, { type: "group_join_result", team_id: team.id, success: false, reason: "That group is already matchmaking." });
+                break;
+            }
             if (!team || team.members.length >= team.maxSize) {
             sendJson(ws, { type: "group_join_result", team_id: String(data.team_id || ""), success: false, reason: "That group is full or no longer available." });
                 sendJson(ws, { type: "open_teams", teams: openTeamPayload() });
@@ -2911,6 +2919,12 @@ function handleClientMessage(ws, data) {
                 teamError(ws, "That player is no longer available");
                 break;
             }
+            if (teamIsQueued(team.id)) {
+                delete team.joinRequests[requesterUid];
+                sendJson(requesterWs, { type: "group_join_result", team_id: team.id, success: false, reason: "That group is already matchmaking." });
+                sendJson(ws, { type: "group_join_result", team_id: team.id, success: false, reason: "That group is already matchmaking." });
+                break;
+            }
             if (String(data.action || "") !== "accept") {
                 delete team.joinRequests[requesterUid];
                 sendJson(requesterWs, { type: "group_join_result", team_id: team.id, success: false, reason: "The group could not accept your request." });
@@ -2932,8 +2946,8 @@ function handleClientMessage(ws, data) {
                 characterId: request.characterId,
                 bundleId: request.bundleId
             });
-            sendJson(requesterWs, { type: "group_join_result", success: true, team_id: team.id });
             broadcastTeam(team);
+            sendJson(requesterWs, { type: "group_join_result", success: true, team_id: team.id });
             break;
         }
 
