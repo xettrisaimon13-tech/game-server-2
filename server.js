@@ -2863,6 +2863,31 @@ function handleClientMessage(ws, data) {
             break;
         }
 
+        case 'mummy_scan': {
+            const room = ws.matchId && matches.get(ws.matchId);
+            if (!room || !room.game) break;
+            const g = room.game;
+            if (g.phase !== "playing" || g.settled) break;
+            const caster = room.entries.find(e => e.ws === ws);
+            if (!caster) break;
+            const casterId = mummyIdOf(caster);
+            if (g.roles[casterId] !== "mummy") break;
+            if (!mummyAlive(room, casterId)) break;
+            // Broadcast scan to all clients so humans see "Mummy detected your location"
+            for (const e of room.entries) {
+                if (e.ws.readyState === WebSocket.OPEN) {
+                    e.ws.send(JSON.stringify({
+                        type: "mummy_scan",
+                        match_id: room.matchId,
+                        scanner_id: casterId,
+                        scanner_name: caster.username || "Mummy"
+                    }));
+                }
+            }
+            console.log(`[MUMMY] ${casterId} scanned in ${room.matchId}`);
+            break;
+        }
+
         case 'quick_match_cancel': {
             const uid = bindUid(ws, data);
             const team = teamOf(ws);
