@@ -1963,10 +1963,45 @@ function eliminateMummyPlayer(room, id, killerId) {
         type: killer ? "kill" : "eliminated",
         is_streamer: false
     });
-    // Keep only recent (last 10)
-    if (g.killEvents.length > 10) g.killEvents.shift();
-    // Round point is awarded only when ALL humans (opposing team this round) are eliminated.
-    // If any human survives, the round continues and survivors can win on timeout.
+    // If the human side has no standing (alive, not downed, not eliminated) players left,
+    // nobody can revive the knocked ones: eliminate the whole team immediately and start
+    // the next round/settle. Never wait for bleed-out or revive in this state.
+    if (g.roles[id] === "human") {
+        const anyStandingHuman = room.entries.some(e => {
+            const eid = mummyIdOf(e);
+            if (g.roles[eid] !== "human") return false;
+            const st = g.combat[eid];
+            return !!st && !st.eliminated && !st.downed;
+        });
+        if (!anyStandingHuman) {
+            for (const e of room.entries) {
+                const eid = mummyIdOf(e);
+                if (g.roles[eid] !== "human" || eid === id) continue;
+                const st = g.combat[eid];
+                if (!st || st.eliminated) continue;
+                st.downed = false;
+                st.downedSince = 0;
+                st.eliminated = true;
+                st.hp = 0;
+                st.reviveMs = 0;
+                st.reviveAt = 0;
+                st.revivers = {};
+                g.killEvents.push({
+                    killerId: killer,
+                    killerName: killerEntry ? killerEntry.username : null,
+                    victimId: eid,
+                    victimName: e.username || eid,
+                    time: Date.now(),
+                    type: "eliminated",
+                    is_streamer: false
+                });
+            }
+            if (g.killEvents.length > 10) g.killEvents = g.killEvents.slice(-10);
+            settleMummyRound(room, g.hunterSide);
+            return true;
+        }
+    }
+    // Fallback: round point only when ALL humans are eliminated.
     const anyHumanAlive = room.entries.some(e => {
         const eid = mummyIdOf(e);
         return g.roles[eid] === "human" && mummyAlive(room, eid);
@@ -2704,31 +2739,41 @@ function handleClientMessage(ws, data) {
             if (!targetUid) { teamError(ws, "That player UID is not valid"); break; }
             if (targetUid === uid) { teamError(ws, "You cannot invite yourself"); break; }
 
-            if (!team) {
-                const maxSize = Math.min(4, Math.max(1, parseInt(data.max_size, 10) || 1));
-                if (maxSize < 2) { teamError(ws, "Pick team size 2, 3 or 4 before inviting"); break; }
-                team = createTeam(ws, uid, data.username || "Player", data.character_id || 1, bundleIdOf(data), maxSize);
+            const createForInvite = !team;
+            const requestedMaxSize = Math.min(4, Math.max(1, parseInt(data.max_size, 10) || 1));
+            if (createForInvite && requestedMaxSize < 2) {
+                teamError(ws, "Pick team size 2, 3 or 4 before inviting"); break;
             }
             // Inviting is not a leader power: every member may bring their own
             // friends into the same group. Only the kick and the search stay the
             // leader's, and the shared seat ceiling below is what caps the party.
 
-            if (team.members.some(m => m.uid === targetUid)) {
+            if (team && team.members.some(m => m.uid === targetUid)) {
                 broadcastTeam(team);
                 teamError(ws, "That player is already in your team"); break;
             }
-            if (team.members.length >= team.maxSize) { teamError(ws, "Your team is full"); break; }
+            if (team && team.members.length >= team.maxSize) { teamError(ws, "Your team is full"); break; }
 
             const targetWs = clientsByUid.get(targetUid);
             if (!targetWs || targetWs.readyState !== WebSocket.OPEN) {
                 sendJson(ws, { type: "team_invite_failed", to_uid: targetUid, reason: "is not online" });
+                if (createForInvite) sendJson(ws, NO_TEAM);
                 break;
             }
 
             const targetTeam = teamOf(targetWs);
             if (targetTeam) {
                 sendJson(ws, { type: "team_invite_failed", to_uid: targetUid, reason: "is already in a team" });
+                if (createForInvite) sendJson(ws, NO_TEAM);
                 break;
+            }
+
+            if (createForInvite) {
+                team = createTeam(ws, uid, data.username || "Player", data.character_id || 1,
+                    bundleIdOf(data), requestedMaxSize);
+                // Make the new four-seat squad visible to its leader immediately,
+                // so the lobby slot and roster reflect the invite before acceptance.
+                broadcastTeam(team);
             }
 
             // Remember who asked, so a "no thanks" answers that member and not the
@@ -2789,6 +2834,14 @@ function handleClientMessage(ws, data) {
                         player_uid: uid,
                         username: data.username || "Player"
                     });
+                }
+                // A declined invite should not leave a hidden one-person party
+                // holding the inviter's slot. Keep it only if another invite is
+                // still pending or a teammate has already joined.
+                if (team.members.length === 1 && Object.keys(team.inviters || {}).length === 0) {
+                    const loneMember = team.members[0];
+                    forgetTeam(team);
+                    if (loneMember) sendJson(loneMember.ws, NO_TEAM);
                 }
             }
             break;
