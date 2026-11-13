@@ -1304,9 +1304,10 @@ function broadcastAllPools() {
 // The clients only report proximity; every role, timer tick, knockdown, revive,
 // elimination, point and the final result is decided here so all screens agree.
 const MUMMY_MODE = "MUMMY_VS_HUMAN";
-// The two teams are the two sides of the arena. A team wins the match, not a
-// round, so the point table is indexed by side and every client draws the same
-// two names from it.
+// The two teams are the two sides of the arena. Clash Squad rules: every round
+// is worth exactly one point, and the first team to reach the win line takes the
+// match. Because no round can end without a winner, the score can never tie, and
+// the match is over by round 2 * MUMMY_WIN_POINTS - 1 at the latest (4-3).
 const MUMMY_TEAM_NAMES = ["TEAM TIGER", "TEAM LION"];
 const MUMMY_WIN_POINTS = parseInt(process.env.MUMMY_WIN_POINTS, 10) || 4;
 // The knockdown bar: once downed, a Human bleeds this whole HP away over
@@ -1419,11 +1420,12 @@ function initMummyMatch(room) {
         sideSize: sideSize,
         roundMs: mummyRoundMs(sideSize),
         // One score per team, indexed by side: 0 = TEAM TIGER, 1 = TEAM LION.
+        // It counts rounds taken, never kills: one point, and only one, per round.
         sideScore: [0, 0],
         hunterSide: 0,             // the team hunting this round; it flips every round
         winnerSide: -1,            // -1 while the match is still live
         roles: {},                 // id -> "mummy" | "human"
-        combat: {},                // id -> { hp, downed, downedSince, eliminated, scored, reviveMs, revivers, lastAttacker }
+        combat: {},                // id -> { hp, downed, downedSince, eliminated, reviveMs, revivers, lastAttacker }
         killEvents: [],            // { killerId, killerName, victimId, victimName, time, type }
         settled: false,            // one result per round, however it ends
         roundOutcome: "",
@@ -1454,10 +1456,6 @@ function resetMummyCombat(room) {
             downed: false,
             downedSince: 0,
             eliminated: false,
-            // One player can only ever be paid out once per round, however many
-            // times the bleed-out tick, a duplicate report or a reconnect lands
-            // on the same elimination.
-            scored: false,
             reviveMs: 0,
             reviveAt: 0,
             revivers: {},
@@ -1888,11 +1886,6 @@ function landShieldHit(room, ownerId, now) {
 }
 
 // ---- Knockdown state, all of it decided here ----
-function mummyHumanIds(room) {
-    const g = room.game;
-    return room.entries.map(mummyIdOf).filter(id => g.roles[id] === "human");
-}
-
 function mummyAlive(room, id) {
     const c = room.game.combat[id];
     return !!c && !c.eliminated;
@@ -1926,7 +1919,11 @@ function reviveMummyPlayer(room, id) {
 }
 
 function eliminateMummyPlayer(room, id, killerId) {
-    const c = room.game.combat[id];
+    const g = room.game;
+    // Only the live part of a round can kill. Once the round has settled, a
+    // second bleed-out tick or a late hit report must not touch anything.
+    if (!g || g.phase !== "playing" || g.settled) return false;
+    const c = g.combat[id];
     if (!c || c.eliminated) return false;
     c.downed = false;
     c.downedSince = 0;
@@ -1939,7 +1936,7 @@ function eliminateMummyPlayer(room, id, killerId) {
     const killer = killerId || c.lastAttacker || null;
     const victimEntry = room.entries.find(e => mummyIdOf(e) === id);
     const killerEntry = killer ? room.entries.find(e => mummyIdOf(e) === killer) : null;
-    room.game.killEvents.push({
+    g.killEvents.push({
         killerId: killer,
         killerName: killerEntry ? killerEntry.username : null,
         victimId: id,
@@ -1949,40 +1946,11 @@ function eliminateMummyPlayer(room, id, killerId) {
         is_streamer: false
     });
     // Keep only recent (last 10)
-    if (room.game.killEvents.length > 10) room.game.killEvents.shift();
-    // The elimination is the point: whoever went out hands a point to the team on
-    // the other side of the arena, which is the team that put them there.
-    awardMummyPoint(room, id);
-    return true;
-}
-
-// ---- Points, and only ever one per elimination ----
-// A team is a side, so the hunting side and the hunted side are always opposed:
-// a point can never be paid to the eliminated player's own team, and a point can
-// never be paid twice for the same body.
-function awardMummyPoint(room, victimId) {
-    const g = room.game;
-    // Only a live round pays. A drop-out during the countdown between rounds is
-    // still an exit from that round, but it must not buy a point nobody fought for.
-    if (!g || g.phase !== "playing") return false;
-
-    const c = g.combat[victimId];
-    if (c && c.scored) return false;
-
-    const entry = room.entries.find(e => mummyIdOf(e) === victimId);
-    if (!entry) return false;
-
-    if (c) c.scored = true;
-    const scorer = 1 - entry.side;
-    g.sideScore[scorer] += 1;
-    console.log(`[MUMMY] ${MUMMY_TEAM_NAMES[scorer]} +1 (${victimId} out) -> TIGER ${g.sideScore[0]} - LION ${g.sideScore[1]}`);
-
-    if (g.sideScore[scorer] >= MUMMY_WIN_POINTS) {
-        endMummyMatch(room, scorer);
-    } else {
-        // Instant: every phone gets the new score on the same tick it happened.
-        broadcastMummyState(room, true);
-    }
+    if (g.killEvents.length > 10) g.killEvents.shift();
+    // The kill ends the round for the victim's team: the team on the other side
+    // of the arena takes the round's single point. Only the round's end pays,
+    // so however many bodies this tick touches, the score moves by one.
+    settleMummyRound(room, victimEntry ? 1 - victimEntry.side : g.hunterSide);
     return true;
 }
 
@@ -2026,13 +1994,6 @@ function endMummyMatch(room, winningSide) {
     // these sockets are free to queue again.
     for (const e of room.entries) e.ws.matchId = null;
     matches.delete(room.matchId);
-}
-
-// The Mummy side only wins once every Human is out. Downed-but-still-bleeding
-// Humans count as alive, so the round never advances while one of them remains.
-function mummyHumansWiped(room) {
-    const humans = mummyHumanIds(room);
-    return humans.length > 0 && humans.every(id => room.game.combat[id].eliminated);
 }
 
 // The aura's heal runs on wall-clock deltas rather than a fixed step, so a slow
@@ -2124,33 +2085,47 @@ function beginMummyRound(room, roundNumber) {
     resetMummyAbilities(room);
 
     // One team hunts per round, and the teams are the arena sides, so a Mummy can
-    // only ever knock out a player from the other team - which is what makes
-    // "elimination = +1 for the other side" true every time. Round 1's hunters are
+    // only ever kill a player from the other team - which is what makes "a kill
+    // hands the round to the hunting team" true every time. Round 1's hunters are
     // a coin flip; every following round hands the hunt to the other team, so both
-    // sides get the same number of turns at scoring.
+    // sides get the same number of turns at scoring and 4-3 is possible.
     g.hunterSide = roundNumber === 1 ? (Math.random() < 0.5 ? 0 : 1) : 1 - g.hunterSide;
     g.roles = {};
     for (const e of room.entries) {
         g.roles[mummyIdOf(e)] = e.side === g.hunterSide ? "mummy" : "human";
     }
 
-    console.log(`[MUMMY] ${room.mode} round ${roundNumber}: ${Object.entries(g.roles).map(([id, r]) => `${id}=${r}`).join(" ")}`);
+    console.log(`[MUMMY] ${room.mode} round ${roundNumber} (${MUMMY_TEAM_NAMES[g.hunterSide]} hunts, score ${g.sideScore[0]}-${g.sideScore[1]}): ${Object.entries(g.roles).map(([id, r]) => `${id}=${r}`).join(" ")}`);
     broadcastMummyState(room, true);
 }
 
-// A round only ever *stops*: the points were already paid by the eliminations
-// that ended it, and the match itself ends in awardMummyPoint the moment a team
-// reaches the win line. Nothing is awarded here, so a wipe can never be counted
-// once per body and then once again as a round point.
-function settleMummyRound(room, winner) {
+// The only place a point is ever paid.
+// A round has exactly two endings, and both name a winner: a Human is eliminated
+// (the hunting team takes the round) or the clock runs out with a Human still
+// standing (the surviving team takes it). Whichever reaches here first sets
+// `settled`, so a second elimination, a bleeded-out body and the clock all can
+// never score the same round again - and no round can end level.
+// The first team to MUMMY_WIN_POINTS takes the match; until then the room goes
+// into its short break, and beginMummyRound rebuilds the next round from scratch.
+function settleMummyRound(room, winnerSide) {
     const g = room.game;
-    if (g.settled || g.phase === "finished") return;
+    if (!g || g.phase !== "playing" || g.settled) return false;
+    if (winnerSide !== 0 && winnerSide !== 1) return false;
+
     g.settled = true;
-    g.roundOutcome = winner;
+    g.roundOutcome = winnerSide === g.hunterSide ? "mummy" : "human";
+    g.sideScore[winnerSide] += 1;
+    console.log(`[MUMMY] round ${g.round} to ${MUMMY_TEAM_NAMES[winnerSide]} (${g.roundOutcome}) -> TIGER ${g.sideScore[0]} - LION ${g.sideScore[1]}`);
+
+    if (g.sideScore[winnerSide] >= MUMMY_WIN_POINTS) {
+        endMummyMatch(room, winnerSide);
+        return true;
+    }
 
     g.phase = "round_break";
     g.endsAt = Date.now() + MUMMY_BREAK_MS;
     broadcastMummyState(room, true);
+    return true;
 }
 
 function mummyStatePayload(room, self) {
@@ -2268,16 +2243,13 @@ function tickMummyMatches() {
         if (g.phase !== "finished") tickMummyHpShields(room, now);
 
         if (g.phase === "playing" && !g.settled) {
+            // A bleed-out here eliminates its Human and settles the round in the
+            // same call, so the tick never needs a separate wipe check.
             tickMummyCombat(room, now);
-            // The round only confirms once the whole Human side is actually out -
-            // a downed Human still bleeding, or still being revived, holds it open.
-            if (mummyHumansWiped(room)) {
-                settleMummyRound(room, "mummy");
-                continue;
-            }
-            if (now >= g.endsAt) {
-                // The clock ran out with at least one Human still in the round.
-                settleMummyRound(room, "human");
+            if (!g.settled && now >= g.endsAt) {
+                // The clock ran out with at least one Human still in the round -
+                // a downed Human is still standing, so the survivors take it.
+                settleMummyRound(room, 1 - g.hunterSide);
                 continue;
             }
         }
@@ -2586,10 +2558,9 @@ function performMummyAttack(room, attacker, targetId) {
     // Check if HP reached zero
     if (target.hp <= 0) {
         if (g.sideSize <= 1) {
-            // 1v1: HP=0 ends the round immediately
+            // 1v1: the elimination ends the round itself, and pays its one point.
             if (!eliminateMummyPlayer(room, targetId, attackerId)) return true;
             console.log(`[MUMMY] ${attackerId} caught ${targetId} out in ${room.matchId}`);
-            if (g.phase !== "finished") settleMummyRound(room, "mummy");
         } else {
             // 2v2+: HP=0 knocks down instead of eliminating
             if (!downMummyPlayer(room, targetId)) return true;
