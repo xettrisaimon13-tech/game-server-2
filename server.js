@@ -3161,6 +3161,19 @@ function handleClientMessage(ws, data) {
             if (!target || !target.downed || targetId === reviverId || g.roles[targetId] !== "human") break;
 
             target.revivers[reviverId] = Date.now();
+            // Broadcast revive to all clients so remote players see the animation
+            for (const e of room.entries) {
+                if (e.ws.readyState === WebSocket.OPEN) {
+                    e.ws.send(JSON.stringify({
+                        type: "revive_anim",
+                        match_id: room.matchId,
+                        reviver_id: reviverId,
+                        reviver_name: reviver.username || "Player",
+                        target_id: targetId,
+                        active: true
+                    }));
+                }
+            }
             broadcastMummyState(room, false);
             break;
         }
@@ -3176,6 +3189,19 @@ function handleClientMessage(ws, data) {
             if (target && target.revivers[reviverId]) {
                 delete target.revivers[reviverId];
                 target.reviveAt = 0;
+                // Broadcast revive end to all clients
+                for (const e of room.entries) {
+                    if (e.ws.readyState === WebSocket.OPEN) {
+                        e.ws.send(JSON.stringify({
+                            type: "revive_anim",
+                            match_id: room.matchId,
+                            reviver_id: reviverId,
+                            reviver_name: reviver.username || "Player",
+                            target_id: String(data.target_id || ""),
+                            active: false
+                        }));
+                    }
+                }
                 broadcastMummyState(room, true);
             }
             break;
