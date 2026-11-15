@@ -438,6 +438,15 @@ function openTeamPayload() {
         });
 }
 
+function cleanTeamChatMessage(raw) {
+    const text = String(raw || '')
+        .replace(/[\u0000-\u001f\u007f]/g, ' ')
+        .trim()
+        .slice(0, 120);
+    // Keep team chat readable while masking common English and Romanized Nepali slurs.
+    return text.replace(/\b(?:fuck|fuk|lado|laudo|puti|pudi|mugi|madarchut|madarchod|maderchod)\b/gi, '****');
+}
+
 function teamIsQueued(teamId) {
     return Object.values(teamQueues).some(queue => queue.some(group => group.teamId === teamId));
 }
@@ -2736,7 +2745,7 @@ function handleClientMessage(ws, data) {
             const uid = bindUid(ws, data);
             const team = teamOf(ws);
             const sender = team && team.members.find(member => member.ws === ws && member.uid === uid);
-            const message = String(data.message || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120);
+            const message = cleanTeamChatMessage(data.message);
             if (!team || !sender || !message) break;
             const now = Date.now();
             if (now - (ws.lastTeamChatAt || 0) < 400) break;
