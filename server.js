@@ -1397,11 +1397,10 @@ const CLONE_TURN_MAX_MS = 1800;
 // Mummy standing in a crowd of four Humans used to be able to spend a whole swing
 // on one clone per target it reached.
 const CLONE_HIT_GAP_MS = 300;
-// The green aura also patches its caster up: HP is server-owned, so the trickle is
-// counted here over the same 10 seconds the client draws the aura for. 120 of the
-// 400 HP bar is roughly two swings' worth, slow enough to read as a heal.
-const AURA_HEAL_MS = 10000;
-const AURA_HEAL_TOTAL = 120;
+// The green aura heals over the same 20 seconds the client draws it for. The server
+// owns HP, so every player sees the same 40 point maximum gain.
+const AURA_HEAL_MS = 20000;
+const AURA_HEAL_TOTAL = 40;
 // Mirrors aura_radius in green_aura.gd: a teammate standing inside the drawn
 // circle gains the same HP trickle (HP only - the speed buff stays on the caster).
 const AURA_RADIUS = 4.0;
@@ -1680,6 +1679,8 @@ function activateMummyAbility(room, entry, now) {
         // inventing its own.
         mine.healUntil = now + AURA_HEAL_MS;
         mine.healAt = now;
+        mine.healStartAt = now;
+        mine.healGiven = 0;
         for (const e of room.entries) {
             sendJson(e.ws, {
                 type: "ability_spawn",
@@ -2098,15 +2099,17 @@ function tickMummyAuraHeal(room, now) {
         if (!a || !(a.healUntil > 0)) continue;
 
         const until = Math.min(a.healUntil, now);
-        const dt = (until - a.healAt) / 1000;
-        a.healAt = until;
         if (now >= a.healUntil) a.healUntil = 0;
-        if (dt <= 0) continue;
+        const elapsed = Math.max(0, Math.min(AURA_HEAL_MS, until - (a.healStartAt || a.healAt)));
+        const targetGiven = Math.floor(AURA_HEAL_TOTAL * elapsed / AURA_HEAL_MS);
+        const heal = Math.max(0, targetGiven - (a.healGiven || 0));
+        a.healGiven = targetGiven;
+        a.healAt = until;
+        if (heal <= 0) continue;
 
         const caster = room.entries.find(e => mummyIdOf(e) === id);
         if (!caster) continue;
 
-        const heal = Math.max(1, Math.round((AURA_HEAL_TOTAL / (AURA_HEAL_MS / 1000)) * dt));
         for (const e of room.entries) {
             const target = mummyIdOf(e);
             if (g.roles[target] !== "human") continue;
@@ -2259,7 +2262,8 @@ function mummyStatePayload(room, self) {
             cooldown_ms: abilityCooldownMs(abilityFor(self)),
             // How long this character's cast stands for, and what it takes to end it.
             duration_ms: abilityFor(self) === "hp_shield" ? HP_SHIELD_LIFETIME_MS
-                : abilityFor(self) === "shield" ? SHIELD_LIFETIME_MS : CLONE_LIFETIME_MS,
+                : abilityFor(self) === "shield" ? SHIELD_LIFETIME_MS
+                : abilityFor(self) === "aura" ? AURA_HEAL_MS : CLONE_LIFETIME_MS,
             hits_to_destroy: abilityFor(self) === "shield" ? SHIELD_DESTROY_AT : CLONE_MAX_HITS,
             shield_hp: abilityFor(self) === "hp_shield" ? HP_SHIELD_AMOUNT : 0
         },
@@ -2728,6 +2732,27 @@ function handleClientMessage(ws, data) {
     const type = data.type;
 
     switch (type) {
+        case 'team_chat': {
+            const uid = bindUid(ws, data);
+            const team = teamOf(ws);
+            const sender = team && team.members.find(member => member.ws === ws && member.uid === uid);
+            const message = String(data.message || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, 120);
+            if (!team || !sender || !message) break;
+            const now = Date.now();
+            if (now - (ws.lastTeamChatAt || 0) < 400) break;
+            ws.lastTeamChatAt = now;
+            const payload = {
+                type: 'team_chat',
+                player_uid: sender.uid,
+                username: String(sender.username || 'Player').slice(0, 24),
+                message,
+                team_id: team.id,
+            };
+            // Team size is capped at four; never relay this message outside the party.
+            for (const member of team.members.slice(0, 4)) sendJson(member.ws, payload);
+            break;
+        }
+
         case 'team_get': {
             const uid = bindUid(ws, data);
             refreshIdentity(uid, data);
