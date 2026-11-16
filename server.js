@@ -419,7 +419,8 @@ function teamPayload(team) {
         team_id: team.id,
         leader_uid: team.leaderUid,
         max_size: team.maxSize,
-        members: team.members.map(memberInfo)
+        members: team.members.map(memberInfo),
+        chat_history: teamChatHistory.get(team.id) || []
     };
 }
 
@@ -442,7 +443,7 @@ function cleanTeamChatMessage(raw) {
     const text = String(raw || '')
         .replace(/[\u0000-\u001f\u007f]/g, ' ')
         .trim()
-        .slice(0, 120);
+        .slice(0, 40);
     // Keep team chat readable while masking common English and Romanized Nepali slurs.
     return text.replace(/\b(?:fuck|fuk|lado|laudo|puti|pudi|mugi|madarchut|madarchod|maderchod)\b/gi, '****');
 }
@@ -820,6 +821,7 @@ function dropRegionLink(ws) {
 
 const voiceGroups = new Map(); // voiceKey -> Set of member bodies (socket or peer)
 const VOICE_FRAME_MAX = 4096;
+const teamChatHistory = new Map(); // team id -> last 40 messages for active/rejoining teammates
 
 // Lobby and match keys are short ids, so a whitelist is the whole sanitizer.
 function sanitizeVoiceKey(raw) {
@@ -2741,6 +2743,19 @@ function handleClientMessage(ws, data) {
     const type = data.type;
 
     switch (type) {
+        case 'team_chat_get': {
+            const uid = bindUid(ws, data);
+            const team = teamOf(ws);
+            const member = team && team.members.find(row => row.ws === ws && row.uid === uid);
+            if (!team || !member) break;
+            sendJson(ws, {
+                type: 'team_chat_history',
+                team_id: team.id,
+                messages: teamChatHistory.get(team.id) || [],
+            });
+            break;
+        }
+
         case 'team_chat': {
             const uid = bindUid(ws, data);
             const team = teamOf(ws);
@@ -2757,6 +2772,18 @@ function handleClientMessage(ws, data) {
                 message,
                 team_id: team.id,
             };
+            const history = teamChatHistory.get(team.id) || [];
+            history.push({
+                player_uid: payload.player_uid,
+                username: payload.username,
+                message: payload.message,
+            });
+            if (history.length > 40) history.splice(0, history.length - 40);
+            teamChatHistory.set(team.id, history);
+            // Bound memory if many short-lived groups are created.
+            if (teamChatHistory.size > 2000) {
+                teamChatHistory.delete(teamChatHistory.keys().next().value);
+            }
             // Team size is capped at four; never relay this message outside the party.
             for (const member of team.members.slice(0, 4)) sendJson(member.ws, payload);
             break;
