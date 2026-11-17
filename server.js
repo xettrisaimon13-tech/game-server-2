@@ -479,6 +479,7 @@ function createTeam(ws, uid, username, characterId, bundleId, maxSize) {
         leaderUid: uid,
         maxSize: maxSize,
         inviters: {},
+        inviteTimes: {},
         joinRequests: {},
         members: [{ ws: ws, uid: uid, username: username, characterId: characterId, bundleId: bundleId }]
     };
@@ -2881,6 +2882,7 @@ function handleClientMessage(ws, data) {
             // Remember who asked, so a "no thanks" answers that member and not the
             // leader's phone.
             team.inviters[targetUid] = uid;
+            team.inviteTimes[targetUid] = Date.now();
             sendJson(targetWs, {
                 type: "team_invite",
                 team_id: team.id,
@@ -2908,6 +2910,18 @@ function handleClientMessage(ws, data) {
             if (team.members.length >= team.maxSize) { teamError(ws, "That team is full"); break; }
             if (team.members.some(m => m.uid === uid)) { teamError(ws, "Already a member of that team"); break; }
 
+            const invitedAt = team.inviteTimes && team.inviteTimes[String(uid)];
+            if (invitedAt && Date.now() - invitedAt > 20000) {
+                if (team.inviters) delete team.inviters[String(uid)];
+                if (team.inviteTimes) delete team.inviteTimes[String(uid)];
+                sendJson(ws, { type: "team_invite_expired", team_id: team.id });
+                break;
+            }
+            if (teamIsQueued(team.id)) {
+                sendJson(ws, { type: "team_join_failed", team_id: team.id, reason: "Player has started matchmaking" });
+                break;
+            }
+
             ws.teamId = team.id;
             team.members.push({
                 ws: ws,
@@ -2918,6 +2932,7 @@ function handleClientMessage(ws, data) {
             });
             console.log(`[TEAM] ${uid} joined ${team.id} (${team.members.length}/${team.maxSize})`);
             if (team.inviters) delete team.inviters[String(uid)];
+            if (team.inviteTimes) delete team.inviteTimes[String(uid)];
             broadcastTeam(team);
             break;
         }
@@ -3020,6 +3035,7 @@ function handleClientMessage(ws, data) {
                 // it; a group that lost that phone still tells the leader.
                 const inviterUid = (team.inviters || {})[String(uid)];
                 if (team.inviters) delete team.inviters[String(uid)];
+                if (team.inviteTimes) delete team.inviteTimes[String(uid)];
                 const hearer = team.members.find(m => m.uid === inviterUid)
                     || team.members.find(m => m.uid === team.leaderUid);
                 if (hearer) {
@@ -3062,7 +3078,7 @@ function handleClientMessage(ws, data) {
             const uid = bindUid(ws, data);
             if (!uid) break;
             const emote = Number(data.emote);
-            if (!Number.isInteger(emote) || emote < 1 || emote > 16) break;
+            if (!Number.isInteger(emote) || emote < 1 || emote > 22) break;
             const txt = JSON.stringify({
                 type: "lobby_emote",
                 emote: emote,
